@@ -187,7 +187,7 @@ for pkg in "${CORE_PKGS[@]}"; do
 done
 
 if [[ ${#MISSING_PKGS[@]} -gt 0 ]]; then
-    apt-get update -q
+    apt-get -o DPkg::Lock::Timeout=120 update -q
     apt-get upgrade "${APT_FLAGS[@]}"
     apt-get install "${APT_FLAGS[@]}" "${MISSING_PKGS[@]}"
     apt-get install "${APT_FLAGS[@]}" "linux-tools-$(uname -r)" 2>/dev/null || true
@@ -513,7 +513,7 @@ deb-src [signed-by=${PGDG_KEY}] https://apt.postgresql.org/pub/repos/apt ${CODEN
 if [[ ! -f "$PGDG_LIST" ]] || [[ "$(cat "$PGDG_LIST")" != "$EXPECTED_REPO" ]]; then
     echo "$EXPECTED_REPO" > "$PGDG_LIST"
     rm -f "$LOCAL_LIST" 2>/dev/null || true
-    apt-get update -q
+    apt-get -o DPkg::Lock::Timeout=120 update -q
     log_ok "Configured PGDG binary + deb-src repositories for ${CODENAME}-pgdg"
 else
     log_skip "PGDG repository already configured"
@@ -522,7 +522,7 @@ fi
 update_local_pgdg_repo() {
     (cd "$LOCAL_REPO_DIR" && dpkg-scanpackages . /dev/null > Packages 2>/dev/null)
     echo "deb [trusted=yes] file://${LOCAL_REPO_DIR} ./" > "$LOCAL_LIST"
-    apt-get update -o Acquire::GzipIndexes=false -q
+    apt-get -o DPkg::Lock::Timeout=120 update -o Acquire::GzipIndexes=false -q
 }
 
 if dpkg -s "postgresql-${PG_VERSION}" >/dev/null 2>&1 && [[ "$FORCE_REBUILD_PG" == "false" ]]; then
@@ -534,7 +534,7 @@ else
         systemctl stop postgresql 2>/dev/null || true
         apt-get purge "${APT_FLAGS[@]}" "postgresql-${PG_VERSION}" "postgresql-client-${PG_VERSION}" 2>/dev/null || true
         rm -rf "${LOCAL_REPO_DIR:?}"/postgresql-${PG_VERSION}_*.deb "${LOCAL_REPO_DIR:?}"/postgresql-client-${PG_VERSION}_*.deb "${NVME_CACHE_DIR:?}" "${BUILD_DIR:?}" "$LOCAL_LIST" 2>/dev/null || true
-        apt-get update -q
+        apt-get -o DPkg::Lock::Timeout=120 update -q
     elif [[ "$USE_PKG_CACHE" == "true" ]]; then
         mkdir -p "$NVME_CACHE_DIR"
         if ! ls "${LOCAL_REPO_DIR}"/postgresql-${PG_VERSION}_*.deb >/dev/null 2>&1 && \

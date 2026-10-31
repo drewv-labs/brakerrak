@@ -30,8 +30,12 @@ echo ">>> [STAGE 0A] Running Ubuntu & SiFive P550 BSP Day-0 Bootstraps (riscv-da
 sudo "${DATAKIT_ROOT}/os/bootstrap-ubuntu.sh" --user drew --hostname brakerbox-p550 --nopasswd
 sudo "${DATAKIT_ROOT}/sifive/hifive-premier-p550/bootstrap.sh"
 
-echo ">>> [STAGE 0B] Capturing Day-0 Pre-Forge Clean-Room ORT Snapshot..."
-sudo "${SCRIPT_DIR}/ort-snapshot.py" --stage day0-pre-forge --out-dir "$SNAP_DIR"
+echo ">>> [STAGE 0B] Checking Day-0 Pre-Forge Clean-Room ORT Snapshot..."
+if mountpoint -q /mnt/nvme_pgdata && ls "${SNAP_DIR}"/*day0-pre-forge*.json >/dev/null 2>&1; then
+    echo "[SKIP] Resuming interrupted forge; preserving existing Clean-Room Day-0 snapshot in ${SNAP_DIR}"
+else
+    sudo "${SCRIPT_DIR}/ort-snapshot.py" --stage day0-pre-forge --out-dir "$SNAP_DIR"
+fi
 
 echo ">>> [STAGE 1] Executing Cold Convergence Forge (NVMe 4Kn + Btrfs RAID10 + PG18)..."
 sudo "${SCRIPT_DIR}/forge.sh" --role prod --with-raid "${FORGE_EXTRA_ARGS[@]}"
