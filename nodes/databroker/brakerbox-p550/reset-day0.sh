@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # DREW-V Labs // Option A In-Place Day-0 Factory State Rollback (BrakerBox-P550)
-# Path: drewv-labs/brakerrak/nodes/databrokers/brakerbox-p550/reset-day0.sh
-# Description: Tears down PostgreSQL 18, resets WD_BLACK SN850X to factory 512e
-#              (512-byte) LBA sectors, wipes USB RAID superblocks, and reverts
-#              eMMC OS configuration back to pre-forge Day-0 state.
-#
-# Usage:
-#   sudo ./reset-day0.sh --confirm-destroy                  # Full zero-cache rollback
-#   sudo ./reset-day0.sh --confirm-destroy --keep-pg-cache  # Fast-loop (preserves PG18 .debs)
-#   sudo ./reset-day0.sh --confirm-destroy --skip-raid-wipe # Keep BigRed/LilBlu intact
+# Path: brakerrak/nodes/databroker/brakerbox-p550/reset-day0.sh
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -36,7 +28,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: sudo $0 --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--hostname ubuntu]"
             exit 1
             ;;
     esac
@@ -44,14 +35,13 @@ done
 
 if [[ "$CONFIRM_DESTROY" != "true" ]]; then
     printf "\033[1;31m[ABORT] Destructive Day-0 rollback requires --confirm-destroy flag.\033[0m\n" >&2
-    echo "Example: sudo $0 --confirm-destroy [--keep-pg-cache]" >&2
     exit 1
 fi
 
 export DEBIAN_FRONTEND=noninteractive
 
 echo "=== 1. Stopping PostgreSQL & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
-systemctl stop postgresql 2>/dev/null || true
+systemctl stop postgresql "postgresql@*" 2>/dev/null || true
 pkill -9 -u postgres 2>/dev/null || true
 
 if [[ "$KEEP_CACHE" == "true" ]]; then
@@ -63,7 +53,13 @@ else
 fi
 
 echo "=== 2. Unmounting Storage Tiers & Handling USB RAID Disks ==="
-umount -f /mnt/nvme_pgdata /mnt/bigred_wdr48 /mnt/lilblu_wdr48 /mnt/lilblu_wdb24 2>/dev/null || true
+for mp in /mnt/nvme_pgdata /mnt/bigred_wdr48 /mnt/lilblu_wdb24; do
+    if mountpoint -q "$mp" 2>/dev/null; then
+        fuser -km "$mp" 2>/dev/null || true
+        umount "$mp" 2>/dev/null || umount -l "$mp" 2>/dev/null || true
+        echo "  [OK] Unmounted $mp"
+    fi
+done
 
 if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
     for d in $(lsblk -b -dn -o NAME,ROTA,TYPE | awk '$3=="disk" && $2=="1" {print "/dev/"$1}'); do
@@ -75,11 +71,17 @@ else
 fi
 
 echo "=== 3. Tearing Down LVM (vg_braker) & Resetting SN850X to Factory 512e (512B) ==="
+umount /dev/mapper/vg_braker-* 2>/dev/null || umount -l /dev/mapper/vg_braker-* 2>/dev/null || true
 if vgs vg_braker >/dev/null 2>&1; then
     lvchange -an vg_braker 2>/dev/null || true
+    vgchange -an vg_braker 2>/dev/null || true
     vgremove -ff -y vg_braker 2>/dev/null || true
 fi
+dmsetup remove vg_braker-lv_pgdata 2>/dev/null || true
 pvremove -ff -y /dev/nvme0n1* 2>/dev/null || true
+udevadm settle
+sleep 1
+
 wipefs -a /dev/nvme0n1
 
 LBA_512_INDEX="$(nvme id-ns /dev/nvme0n1 | awk '/^lbaf.*lbads:9/ {print $2}' | tr -d ':' | head -n1)"
