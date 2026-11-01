@@ -345,7 +345,7 @@ def main() -> None:
     node_env = load_node_env(args.config)
     raid_arrays_cfg = get_raid_arrays_config(node_env)
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_utc = datetime.datetime.now(datetime.UTC)
     epoch_sec = int(now_utc.timestamp())
     iso_compact = now_utc.strftime("%Y%m%dT%H%M%SZ")
     iso_full = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
