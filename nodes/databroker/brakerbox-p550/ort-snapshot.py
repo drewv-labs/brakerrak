@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 DREW-V Labs // Operational Readiness Test (ORT) & CTD Provenance Snapshot
-Path: drewv-labs/brakerrak/nodes/databrokers/brakerbox-p550/ort-snapshot.py
+Path: drewv-labs/brakerrak/nodes/databroker/brakerbox-p550/ort-snapshot.py
 Strictly Read-Only System Inspector & Quiescent Baseline Profiler.
 
-Usage:
-  ./ort-snapshot.py                                  # Defaults to --stage day0-pre-forge
-  ./ort-snapshot.py --stage day1-post-forge          # Run after forge.sh completes
-  ./ort-snapshot.py --out-dir /home/drew --window 5  # Custom output dir & polling window
+Emits:
+  1. Unredacted CTD Snapshot : brakerbox-snapshot-<stage>-<ts>-<epoch>.json
+  2. Redacted Public Snapshot: brakerbox-snapshot-<stage>-<ts>-<epoch>.public.json
 """
 import argparse
+import copy
 import datetime
 import glob
 import grp
@@ -23,6 +23,7 @@ import socket
 import statistics
 import subprocess
 import time
+from typing import Any
 
 # ANSI Colors for Console ORT Summary
 C_CYAN = "\033[1;36m"
@@ -32,17 +33,17 @@ C_RED = "\033[1;31m"
 C_RESET = "\033[0m"
 
 
-def run_cmd(cmd, use_sudo=False):
+def run_cmd(cmd: list[str], use_sudo: bool = False) -> str:
     if use_sudo and os.geteuid() != 0:
         cmd = ["sudo", "-n"] + cmd
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         return res.stdout.strip()
     except Exception as e:
         return f"ERROR: {e}"
 
 
-def read_sysfs(path):
+def read_sysfs(path: str) -> str | None:
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read().strip()
@@ -50,14 +51,14 @@ def read_sysfs(path):
         return None
 
 
-def sample_quiescent_metrics(duration_sec=5.0, interval_sec=0.5):
+def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.5) -> dict[str, Any]:
     """Samples clocks, thermals, fan RPM, loadavg, and memory over a time window."""
     samples = max(1, int(duration_sec / interval_sec))
-    cpu_freqs = {}
-    thermals = {}
-    fan_rpms = []
-    load_1m = []
-    mem_avail_kb = []
+    cpu_freqs: dict[str, list[float]] = {}
+    thermals: dict[str, list[float]] = {}
+    fan_rpms: list[int] = []
+    load_1m: list[float] = []
+    mem_avail_kb: list[int] = []
 
     freq_paths = sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq"))
     if not freq_paths:
@@ -67,36 +68,23 @@ def sample_quiescent_metrics(duration_sec=5.0, interval_sec=0.5):
     fan_paths = sorted(glob.glob("/sys/class/hwmon/hwmon*/fan*_input"))
 
     for _ in range(samples):
-        # 1. Per-Hart CPU Frequencies (kHz -> MHz)
         for fp in freq_paths:
             cpu_id = fp.split("/")[5]
             val = read_sysfs(fp)
             if val and val.isdigit():
                 cpu_freqs.setdefault(cpu_id, []).append(round(int(val) / 1000.0, 2))
 
-        # 2. Thermal Zones (millidegrees -> Celsius)
         for tz in tz_paths:
             tz_name = read_sysfs(f"{tz}/type") or os.path.basename(tz)
             t_val = read_sysfs(f"{tz}/temp")
             if t_val and t_val.lstrip("-").isdigit():
                 thermals.setdefault(tz_name, []).append(round(int(t_val) / 1000.0, 2))
 
-        # Also read /sys/class/hwmon/hwmon*/temp*_input when thermal_zone* is empty/absent
-        for hp in sorted(glob.glob("/sys/class/hwmon/hwmon*/temp*_input")):
-            hw_dir = os.path.dirname(hp)
-            hw_name = read_sysfs(f"{hw_dir}/name") or os.path.basename(hw_dir)
-            lbl = read_sysfs(hp.replace("_input", "_label")) or os.path.basename(hp).replace("_input", "")
-            t_val = read_sysfs(hp)
-            if t_val and t_val.lstrip("-").isdigit():
-                thermals.setdefault(f"{hw_name}:{lbl}", []).append(round(int(t_val) / 1000.0, 2))
-
-        # 3. Fan Tachometer RPM
         for fp in fan_paths:
             f_val = read_sysfs(fp)
             if f_val and f_val.isdigit():
                 fan_rpms.append(int(f_val))
 
-        # 4. Load Average & Memory Available
         try:
             load_1m.append(round(os.getloadavg()[0], 4))
         except Exception:
@@ -111,7 +99,7 @@ def sample_quiescent_metrics(duration_sec=5.0, interval_sec=0.5):
 
         time.sleep(interval_sec)
 
-    def summarize(arr, unit=""):
+    def summarize(arr: list[int | float], unit: str = "") -> dict[str, Any]:
         if not arr:
             return {"min": None, "mean": None, "max": None, "samples": 0, "unit": unit}
         return {
@@ -133,11 +121,11 @@ def sample_quiescent_metrics(duration_sec=5.0, interval_sec=0.5):
     }
 
 
-def inspect_postgres_state():
+def inspect_postgres_state() -> dict[str, Any]:
     """Read-only check of PostgreSQL state (populated on post-forge runs)."""
     psql_ver = run_cmd(["psql", "--version"])
     service_active = run_cmd(["systemctl", "is-active", "postgresql"]) == "active"
-    pg_settings = {}
+    pg_settings: dict[str, str] = {}
     if service_active:
         for param in [
             "server_version",
@@ -161,7 +149,74 @@ def inspect_postgres_state():
     }
 
 
-def main():
+def redact_block_tree(devices: list[dict[str, Any]]) -> None:
+    """Recursively redacts serial numbers and UUIDs across block devices and child partitions."""
+    for dev in devices:
+        if dev.get("serial") is not None:
+            dev["serial"] = "REDACTED"
+        if dev.get("uuid") is not None:
+            dev["uuid"] = "REDACTED"
+        children = dev.get("children")
+        if isinstance(children, list):
+            redact_block_tree(children)
+
+
+def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up: bool) -> dict[str, Any]:
+    """Constructs a GitHub-safe redacted copy of the CTD snapshot payload."""
+    pub = copy.deepcopy(raw_payload)
+    pub.pop("provenance_signature", None)
+
+    hw = pub.get("hardware_inventory", {})
+    if isinstance(hw.get("nvme_primary"), dict) and hw["nvme_primary"].get("serial") is not None:
+        hw["nvme_primary"]["serial"] = "REDACTED"
+
+    raid = hw.get("usb_raid_candidates", {})
+    for key in ("bigred_wdr48_12tb_disks", "lilblu_wdb24_6tb_disks"):
+        for disk in raid.get(key, []):
+            if disk.get("serial") is not None:
+                disk["serial"] = "REDACTED"
+
+    if isinstance(hw.get("block_devices"), list):
+        redact_block_tree(hw["block_devices"])
+
+    pub["network_topology"] = {
+        "hostname": raw_payload.get("network_topology", {}).get("hostname"),
+        "primary_nic_end0_operstate": "UP" if end0_up else "DOWN",
+    }
+
+    pub.pop("security_and_users", None)
+
+    proc_count = raw_payload.get("runtime_processes", {}).get("total_process_count", 0)
+    pub["runtime_processes"] = {"total_process_count": proc_count}
+
+    if isinstance(pub.get("software_provenance"), dict):
+        pub["software_provenance"].pop("installed_apt_packages", None)
+
+    pub_bytes = json.dumps(pub, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    pub_sha256 = hashlib.sha256(pub_bytes).hexdigest()
+    pub["provenance_signature"] = {
+        "algorithm": "SHA-256",
+        "canonical_payload_sha256": pub_sha256,
+        "unredacted_vault_sha256": raw_sha256,
+        "redacted_for_public_repo": True,
+    }
+    return pub
+
+
+def ensure_snapshots_gitignore(out_dir: str) -> None:
+    """Ensures snapshots/.gitignore protects raw JSON files while allowing *.public.json."""
+    if os.path.basename(os.path.abspath(out_dir)) == "snapshots":
+        gitignore_path = os.path.join(out_dir, ".gitignore")
+        if not os.path.exists(gitignore_path):
+            with open(gitignore_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "# Ignore unredacted CTD snapshots containing hardware serials and network topology\n"
+                    "brakerbox-snapshot-*.json\n"
+                    "!brakerbox-snapshot-*.public.json\n"
+                )
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="DREW-V Labs Read-Only ORT & CTD Snapshot Generator")
     parser.add_argument(
         "--stage",
@@ -179,18 +234,25 @@ def main():
         default=5.0,
         help="Quiescent profiling window in seconds (default: 5.0)",
     )
+    parser.add_argument(
+        "--no-public",
+        action="store_true",
+        help="Skip generating the redacted .public.json companion manifest",
+    )
     args = parser.parse_args()
 
-    now_utc = datetime.datetime.now(datetime.UTC)
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
     epoch_sec = int(now_utc.timestamp())
     iso_compact = now_utc.strftime("%Y%m%dT%H%M%SZ")
     iso_full = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     safe_stage = re.sub(r"[^a-zA-Z0-9_-]", "-", args.stage)
     os.makedirs(args.out_dir, exist_ok=True)
-    out_file = os.path.join(
-        args.out_dir, f"brakerbox-snapshot-{safe_stage}-{iso_compact}-{epoch_sec}.json"
-    )
+    ensure_snapshots_gitignore(args.out_dir)
+
+    base_stem = f"brakerbox-snapshot-{safe_stage}-{iso_compact}-{epoch_sec}"
+    out_file = os.path.join(args.out_dir, f"{base_stem}.json")
+    public_out_file = os.path.join(args.out_dir, f"{base_stem}.public.json")
 
     print(f"{C_CYAN}======================================================================{C_RESET}")
     print(f"{C_CYAN} DREW-V Labs // Operational Readiness Test (ORT) & CTD Snapshot{C_RESET}")
@@ -204,8 +266,8 @@ def main():
 
     # --- Silicon & Cache Topology ---
     cpuinfo_raw = read_sysfs("/proc/cpuinfo") or ""
-    harts = []
-    current_hart = {}
+    harts: list[dict[str, str]] = []
+    current_hart: dict[str, str] = {}
     for line in cpuinfo_raw.splitlines():
         if not line.strip():
             if current_hart:
@@ -300,7 +362,7 @@ def main():
     bus_errors = []
     if not dmesg_raw.startswith("ERROR:"):
         for line in dmesg_raw.splitlines():
-            if re.search(r"(pcieport.*error|AER:.*error|AER:.*Corrected|AER:.*Uncorrected|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
+            if re.search(r"(pcieport.*error|AER|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
                 bus_errors.append(line)
 
     # --- Users, Groups & Sudoers ---
@@ -438,7 +500,7 @@ def main():
     ]
 
     # --- Construct CarrierPigeons / HamStack CTD Artifact Envelope ---
-    snapshot_payload = {
+    snapshot_payload: dict[str, Any] = {
         "schema_version": "drewv-ctd-manifest/v1.0",
         "artifact": {
             "id": socket.gethostname(),
@@ -526,7 +588,7 @@ def main():
         },
     }
 
-    # Compute Canonical SHA-256 Signature of the Entire Snapshot
+    # Compute Canonical SHA-256 Signature of the Unredacted Snapshot
     canonical_bytes = json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
     snapshot_payload["provenance_signature"] = {
@@ -536,6 +598,14 @@ def main():
 
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(snapshot_payload, f, indent=2)
+
+    # Build and Write Redacted Public Snapshot
+    public_sha256 = None
+    if not args.no_public:
+        public_payload = build_public_snapshot(snapshot_payload, manifest_sha256, end0_up)
+        public_sha256 = public_payload["provenance_signature"]["canonical_payload_sha256"]
+        with open(public_out_file, "w", encoding="utf-8") as f:
+            json.dump(public_payload, f, indent=2)
 
     # Print Console ORT Report
     print(f"\n{C_CYAN}--- Operational Readiness Test (ORT) Assertions ---{C_RESET}")
@@ -553,9 +623,13 @@ def main():
         fstats = quiescent["som_fan_rpm"]
         print(f"  Cooler  (SOM Fan     ) : min={fstats['min']} RPM | mean={fstats['mean']} RPM | max={fstats['max']} RPM")
 
-    print(f"\n{C_GREEN}[OK] Wrote CTD Provenance Snapshot ({os.path.getsize(out_file) // 1024} KB):{C_RESET}")
+    print(f"\n{C_GREEN}[OK] Wrote Unredacted CTD Snapshot ({os.path.getsize(out_file) // 1024} KB):{C_RESET}")
     print(f"     Path   : {out_file}")
     print(f"     SHA256 : {manifest_sha256}")
+    if public_sha256:
+        print(f"{C_GREEN}[OK] Wrote Redacted Public Snapshot ({os.path.getsize(public_out_file) // 1024} KB):{C_RESET}")
+        print(f"     Path   : {public_out_file}")
+        print(f"     SHA256 : {public_sha256}")
     print(f"{C_CYAN}======================================================================{C_RESET}")
 
 

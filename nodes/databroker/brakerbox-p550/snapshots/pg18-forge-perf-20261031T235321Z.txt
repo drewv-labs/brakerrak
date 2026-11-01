@@ -1,0 +1,18 @@
+task-clock                   :         3139183.60 msec
+context-switches             :            1089675 
+cpu-migrations               :               5714 
+page-faults                  :           21667021 
+cycles                       :      4375201869757 
+instructions                 :      4541838763710 
+branches                     :       659071990457 
+branch-misses                :        28237804929 
+cache-references             :      1070472077196 
+cache-misses                 :       132248417389 
+L1-dcache-loads              :    <not supported> 
+L1-dcache-load-misses        :       132128755967 
+L1-icache-loads              :                  0 
+L1-icache-load-misses        :       138308099243 
+dTLB-loads                   :                  0 
+dTLB-load-misses             :        29292869415 
+iTLB-loads                   :                  0 
+iTLB-load-misses             :        13993905468 

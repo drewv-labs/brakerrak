@@ -1,0 +1,3 @@
+# Ignore unredacted CTD snapshots containing hardware serials and network topology
+brakerbox-snapshot-*.json
+!brakerbox-snapshot-*.public.json
