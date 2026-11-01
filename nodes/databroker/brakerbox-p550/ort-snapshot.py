@@ -75,7 +75,7 @@ def load_node_env(config_path: str | None = None) -> dict[str, str]:
                                 env_map[k] = v
                 break
             except Exception:
-                continue
+                pass
     return env_map
 
 
