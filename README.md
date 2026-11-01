@@ -30,7 +30,7 @@ U06 [                     ~BrakerBench-Titan                        ]
 U05 [                      ~BrakerBench-J2                          ]
 U04 [                      ~BrakerBench-J1                          ]
 U03 [                       BrakerBox-P550                          ]
-U02 [   LabWrt-R6S  |  VFerret-H8  |  VFerret-H8L  |  BBench-VF2    ]
+U02 [   RakWrt-R6S  |  VFerret-H8  |  VFerret-H8L  |  BBench-VF2    ]
 U01 [                        Sodola Switch                          ]
     -----------------------------------------------------------------
 ```
@@ -49,7 +49,7 @@ U01 [                        Sodola Switch                          ]
 | U02 | `BrakerBench-VF2` | StarFive JH7110 | 4x U74 2-Wide InO | In-Order Scalar Baseline Control |
 | U02 | `VisionFerret-H8` | JH7110 + Hailo-8 | 4x U74 + 26 TOPS | Full-SRAM Single-Context NPU Twin |
 | U02 | `VisionFerret-H8L` | JH7110 + Hailo-8L | 4x U74 + 13 TOPS | Multi-Context DMA Spill NPU Twin |
-| U01–U02 | `LabWrt` / `Switch` | RK3588S + Sodola | 2.5GbE / 10GbE SFP+ | `10.0.10.0/24` L2/L3 Lab Fabric |
+| U01–U02 | `RakWrt` / `Switch` | RK3588S + Sodola | 2.5GbE / 10GbE SFP+ | `10.0.10.0/24` L2/L3 Lab Fabric |
 
 *(Nodes prefixed with `~` denote backordered/planned expansion slots.)*
 
