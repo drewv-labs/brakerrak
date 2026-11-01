@@ -19,10 +19,12 @@ import os
 import platform
 import pwd
 import re
+import shlex
 import socket
 import statistics
 import subprocess
 import time
+from collections.abc import Sequence
 from typing import Any
 
 # ANSI Colors for Console ORT Summary
@@ -31,6 +33,65 @@ C_GREEN = "\033[1;32m"
 C_YELLOW = "\033[1;33m"
 C_RED = "\033[1;31m"
 C_RESET = "\033[0m"
+
+# Hardware-agnostic default: empty list unless populated via ~/.brakerrak/node.env
+DEFAULT_RAID_ARRAYS: list[dict[str, Any]] = []
+
+
+def resolve_real_user_home() -> str:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return pwd.getpwnam(sudo_user).pw_dir
+        except KeyError:
+            pass
+    if os.path.isdir("/home/drew"):
+        return "/home/drew"
+    return os.path.expanduser("~")
+
+
+def load_node_env(config_path: str | None = None) -> dict[str, str]:
+    """Parses bash-style KEY=VALUE and multiline JSON strings from node.env."""
+    candidates: list[str] = []
+    if config_path:
+        candidates.append(config_path)
+    real_home = resolve_real_user_home()
+    candidates.append(os.path.join(real_home, ".brakerrak", "node.env"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(script_dir, "node.env"))
+
+    env_map: dict[str, str] = {}
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    lexer = shlex.shlex(f.read(), posix=True)
+                    lexer.whitespace_split = True
+                    lexer.commenters = "#"
+                    for token in lexer:
+                        if "=" in token:
+                            k, v = token.split("=", 1)
+                            if k.isidentifier():
+                                env_map[k] = v
+                break
+            except Exception:
+                continue
+    return env_map
+
+
+def get_raid_arrays_config(env_map: dict[str, str]) -> list[dict[str, Any]]:
+    with_raid = (os.environ.get("WITH_RAID") or env_map.get("WITH_RAID") or "false").lower()
+    if with_raid != "true":
+        return []
+    raw_json = os.environ.get("RAID_ARRAYS_JSON") or env_map.get("RAID_ARRAYS_JSON")
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            pass
+    return DEFAULT_RAID_ARRAYS
 
 
 def run_cmd(cmd: list[str], use_sudo: bool = False) -> str:
@@ -87,7 +148,7 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
 
         try:
             load_1m.append(round(os.getloadavg()[0], 4))
-        except Exception:
+        except OSError:
             pass
 
         meminfo = read_sysfs("/proc/meminfo") or ""
@@ -99,12 +160,12 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
 
         time.sleep(interval_sec)
 
-    def summarize(arr: list[int | float], unit: str = "") -> dict[str, Any]:
+    def summarize(arr: Sequence[int | float], unit: str = "") -> dict[str, Any]:
         if not arr:
             return {"min": None, "mean": None, "max": None, "samples": 0, "unit": unit}
         return {
             "min": round(min(arr), 2),
-            "mean": round(statistics.mean(arr), 2),
+            "mean": round(float(statistics.mean(arr)), 2),
             "max": round(max(arr), 2),
             "samples": len(arr),
             "unit": unit,
@@ -122,10 +183,11 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
 
 
 def inspect_postgres_state() -> dict[str, Any]:
-    """Read-only check of PostgreSQL state (populated on post-forge runs)."""
+    """Read-only check of PostgreSQL state and custom tablespaces."""
     psql_ver = run_cmd(["psql", "--version"])
     service_active = run_cmd(["systemctl", "is-active", "postgresql"]) == "active"
     pg_settings: dict[str, str] = {}
+    tablespaces: list[str] = []
     if service_active:
         for param in [
             "server_version",
@@ -142,10 +204,42 @@ def inspect_postgres_state() -> dict[str, Any]:
             val = run_cmd(["sudo", "-n", "-u", "postgres", "psql", "-tAc", f"SHOW {param};"])
             if not val.startswith("ERROR:"):
                 pg_settings[param] = val
+
+        ts_raw = run_cmd([
+            "sudo", "-n", "-u", "postgres", "psql", "-tAc",
+            "SELECT spcname FROM pg_tablespace WHERE spcname NOT IN ('pg_default', 'pg_global') ORDER BY spcname;"
+        ])
+        if ts_raw and not ts_raw.startswith("ERROR:"):
+            tablespaces = [line.strip() for line in ts_raw.splitlines() if line.strip()]
+
     return {
         "psql_client_version": psql_ver if not psql_ver.startswith("ERROR:") else "not_installed",
         "systemd_service_active": service_active,
         "active_runtime_parameters": pg_settings,
+        "custom_tablespaces": tablespaces,
+    }
+
+
+def inspect_databroker_services(env_map: dict[str, str]) -> dict[str, Any]:
+    """Read-only check of Mosquitto MQTT broker and NFSv4 server state."""
+    mqtt_active = run_cmd(["systemctl", "is-active", "mosquitto"]) == "active"
+    mqtt_port = int(env_map.get("MQTT_PORT", "1883"))
+    nfs_active = run_cmd(["systemctl", "is-active", "nfs-kernel-server"]) == "active"
+    exports_raw = read_sysfs("/etc/exports") or ""
+    active_exports = [
+        line.strip()
+        for line in exports_raw.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    return {
+        "mosquitto_mqtt": {
+            "systemd_service_active": mqtt_active,
+            "configured_port": mqtt_port,
+        },
+        "nfs_v4_server": {
+            "systemd_service_active": nfs_active,
+            "configured_exports": active_exports,
+        },
     }
 
 
@@ -170,11 +264,13 @@ def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up:
     if isinstance(hw.get("nvme_primary"), dict) and hw["nvme_primary"].get("serial") is not None:
         hw["nvme_primary"]["serial"] = "REDACTED"
 
-    raid = hw.get("usb_raid_candidates", {})
-    for key in ("bigred_wdr48_12tb_disks", "lilblu_wdb24_6tb_disks"):
-        for disk in raid.get(key, []):
-            if disk.get("serial") is not None:
-                disk["serial"] = "REDACTED"
+    raid_arrays = hw.get("usb_raid_arrays", {})
+    if isinstance(raid_arrays, dict):
+        for arr_entry in raid_arrays.values():
+            if isinstance(arr_entry, dict):
+                for disk in arr_entry.get("detected_disks", []):
+                    if isinstance(disk, dict) and disk.get("serial") is not None:
+                        disk["serial"] = "REDACTED"
 
     if isinstance(hw.get("block_devices"), list):
         redact_block_tree(hw["block_devices"])
@@ -229,6 +325,11 @@ def main() -> None:
         help="Directory to write the output JSON snapshot",
     )
     parser.add_argument(
+        "--config",
+        default=None,
+        help="Optional path to node.env configuration file",
+    )
+    parser.add_argument(
         "--window",
         type=float,
         default=5.0,
@@ -240,6 +341,9 @@ def main() -> None:
         help="Skip generating the redacted .public.json companion manifest",
     )
     args = parser.parse_args()
+
+    node_env = load_node_env(args.config)
+    raid_arrays_cfg = get_raid_arrays_config(node_env)
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     epoch_sec = int(now_utc.timestamp())
@@ -293,22 +397,25 @@ def main() -> None:
         })
 
     # --- PCIe & NVMe Inspection ---
-    nvme_present = os.path.exists("/sys/block/nvme0n1")
+    nvme_dev = node_env.get("NVME_DEV", "/dev/nvme0n1")
+    nvme_short = os.path.basename(nvme_dev)
+    nvme_ctrl = re.sub(r"n[0-9]+$", "", nvme_short)
+    nvme_present = os.path.exists(f"/sys/block/{nvme_short}")
     nvme_info = {
-        "device": "/dev/nvme0n1" if nvme_present else None,
-        "model": read_sysfs("/sys/block/nvme0n1/device/model"),
-        "serial": read_sysfs("/sys/block/nvme0n1/device/serial"),
-        "firmware_rev": read_sysfs("/sys/block/nvme0n1/device/firmware_rev"),
-        "pcie_link_speed": read_sysfs("/sys/class/nvme/nvme0/device/current_link_speed"),
-        "pcie_link_width": read_sysfs("/sys/class/nvme/nvme0/device/current_link_width"),
-        "max_link_speed": read_sysfs("/sys/class/nvme/nvme0/device/max_link_speed"),
-        "max_link_width": read_sysfs("/sys/class/nvme/nvme0/device/max_link_width"),
-        "logical_block_size_bytes": read_sysfs("/sys/block/nvme0n1/queue/logical_block_size"),
-        "physical_block_size_bytes": read_sysfs("/sys/block/nvme0n1/queue/physical_block_size"),
-        "size_bytes": int(read_sysfs("/sys/block/nvme0n1/size") or 0) * 512 if nvme_present else 0,
+        "device": nvme_dev if nvme_present else None,
+        "model": read_sysfs(f"/sys/block/{nvme_short}/device/model"),
+        "serial": read_sysfs(f"/sys/block/{nvme_short}/device/serial"),
+        "firmware_rev": read_sysfs(f"/sys/block/{nvme_short}/device/firmware_rev"),
+        "pcie_link_speed": read_sysfs(f"/sys/class/nvme/{nvme_ctrl}/device/current_link_speed"),
+        "pcie_link_width": read_sysfs(f"/sys/class/nvme/{nvme_ctrl}/device/current_link_width"),
+        "max_link_speed": read_sysfs(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_speed"),
+        "max_link_width": read_sysfs(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_width"),
+        "logical_block_size_bytes": read_sysfs(f"/sys/block/{nvme_short}/queue/logical_block_size"),
+        "physical_block_size_bytes": read_sysfs(f"/sys/block/{nvme_short}/queue/physical_block_size"),
+        "size_bytes": int(read_sysfs(f"/sys/block/{nvme_short}/size") or 0) * 512 if nvme_present else 0,
     }
 
-    # --- Block Devices & USB RAID Enclosure Discovery ---
+    # --- Block Devices & Dynamic USB RAID Enclosure Discovery ---
     lsblk_raw = run_cmd([
         "lsblk", "-J", "-b", "-o",
         "NAME,PATH,SIZE,TYPE,TRAN,VENDOR,MODEL,SERIAL,REV,LOG-SEC,PHY-SEC,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT"
@@ -318,30 +425,63 @@ def main() -> None:
     except Exception:
         block_devices = []
 
-    bigred_disks = []
-    lilblu_disks = []
-    for bd in block_devices:
-        if bd.get("type") == "disk":
-            sz = int(bd.get("size") or 0)
-            if 11_000_000_000_000 <= sz <= 13_000_000_000_000:
-                bigred_disks.append({
-                    "path": bd.get("path"),
-                    "size_bytes": sz,
-                    "model": bd.get("model"),
-                    "serial": bd.get("serial"),
-                    "tran": bd.get("tran"),
-                })
-            elif 5_500_000_000_000 <= sz <= 6_500_000_000_000:
-                lilblu_disks.append({
-                    "path": bd.get("path"),
-                    "size_bytes": sz,
-                    "model": bd.get("model"),
-                    "serial": bd.get("serial"),
-                    "tran": bd.get("tran"),
-                })
+    usb_raid_arrays: dict[str, dict[str, Any]] = {}
+    raid_ort_checks: list[dict[str, Any]] = []
+
+    for idx, arr_cfg in enumerate(raid_arrays_cfg, start=4):
+        arr_name = str(arr_cfg.get("name", f"Array{idx}"))
+        arr_id = str(arr_cfg.get("id") or arr_name.lower())
+        arr_type = str(arr_cfg.get("type", "vault"))
+        arr_label = str(arr_cfg.get("label", ""))
+        arr_mount = str(arr_cfg.get("mount", ""))
+        expected_disks = int(arr_cfg.get("disks", 4))
+        min_b = int(arr_cfg.get("min_bytes", 0))
+        max_b = int(arr_cfg.get("max_bytes", 0))
+
+        matched_disks: list[dict[str, Any]] = []
+        for bd in block_devices:
+            if bd.get("type") == "disk":
+                sz = int(bd.get("size") or 0)
+                if min_b <= sz <= max_b:
+                    matched_disks.append({
+                        "path": bd.get("path"),
+                        "size_bytes": sz,
+                        "model": bd.get("model"),
+                        "serial": bd.get("serial"),
+                        "tran": bd.get("tran"),
+                    })
+
+        usb_raid_arrays[arr_id] = {
+            "name": arr_name,
+            "type": arr_type,
+            "label": arr_label,
+            "mount": arr_mount,
+            "expected_disks": expected_disks,
+            "detected_disks_count": len(matched_disks),
+            "mounted": os.path.ismount(arr_mount) if arr_mount else False,
+            "detected_disks": matched_disks,
+        }
+
+        chk_id = f"ORT-{idx:02d}_{re.sub(r'[^A-Z0-9]', '_', arr_name.upper())}_ARRAY_JBOD"
+        raid_ort_checks.append({
+            "id": chk_id,
+            "description": f"{arr_name} ({arr_type}): {expected_disks}x Rotational Disks Enumerated ({arr_label})",
+            "expected": expected_disks,
+            "actual": len(matched_disks),
+            "status": "PASS" if len(matched_disks) == expected_disks else "WARN",
+        })
 
     lsusb_tree = run_cmd(["lsusb", "-t"])
     usb_superspeed_5000m = "5000M" in lsusb_tree
+    if len(raid_arrays_cfg) > 0:
+        usb_ort_idx = 4 + len(raid_ort_checks)
+        raid_ort_checks.append({
+            "id": f"ORT-{usb_ort_idx:02d}_USB3_SUPERSPEED",
+            "description": "Rear Teal USB 3.2 Gen1 Ports Negotiated at 5000M SuperSpeed",
+            "expected": "5000M SuperSpeed present",
+            "actual": "5000M detected" if usb_superspeed_5000m else "No 5000M devices detected",
+            "status": "PASS" if usb_superspeed_5000m else "WARN",
+        })
 
     # --- Network State ---
     ip_addr_raw = run_cmd(["ip", "-j", "addr", "show"])
@@ -418,6 +558,7 @@ def main() -> None:
 
     # --- Key Toolchain, Storage & Database State ---
     postgres_state = inspect_postgres_state()
+    broker_services_state = inspect_databroker_services(node_env)
     toolchains = {
         "linux_kernel": platform.release(),
         "glibc_ldd": (run_cmd(["ldd", "--version"]).splitlines() or [""])[0],
@@ -433,6 +574,7 @@ def main() -> None:
     }
 
     # --- Automated Operational Readiness Test (ORT) Assertions ---
+    next_ort_idx = 4 + len(raid_ort_checks)
     ort_checks = [
         {
             "id": "ORT-01_CPU_HARTS",
@@ -450,48 +592,28 @@ def main() -> None:
         },
         {
             "id": "ORT-03_PCIE_NVME_LINK",
-            "description": "WD_BLACK SN850X 2TB Seated at PCIe Gen3 x4 (8.0 GT/s, Width x4)",
+            "description": "Primary NVMe Seated at PCIe Gen3 x4 (8.0 GT/s, Width x4)",
             "expected": "8.0 GT/s PCIe | x4",
             "actual": f"{nvme_info['pcie_link_speed']} | x{nvme_info['pcie_link_width']}",
             "status": "PASS" if (nvme_present and "8.0" in str(nvme_info["pcie_link_speed"]) and str(nvme_info["pcie_link_width"]) == "4") else "FAIL",
         },
+        *raid_ort_checks,
         {
-            "id": "ORT-04_BIGRED_ARRAY_JBOD",
-            "description": "BigRed-WDR48: 4x 12TB WD Red Plus CMR Disks Enumerated in Clear RAID Mode",
-            "expected": 4,
-            "actual": len(bigred_disks),
-            "status": "PASS" if len(bigred_disks) == 4 else "WARN",
-        },
-        {
-            "id": "ORT-05_LILBLU_ARRAY_JBOD",
-            "description": "LilBlu-WDB24: 4x 6TB WD Blue Disks Enumerated in Clear RAID Mode",
-            "expected": 4,
-            "actual": len(lilblu_disks),
-            "status": "PASS" if len(lilblu_disks) == 4 else "WARN",
-        },
-        {
-            "id": "ORT-06_USB3_SUPERSPEED",
-            "description": "Rear Teal USB 3.2 Gen1 Ports Negotiated at 5000M SuperSpeed",
-            "expected": "5000M SuperSpeed present",
-            "actual": "5000M detected" if usb_superspeed_5000m else "No 5000M devices detected",
-            "status": "PASS" if usb_superspeed_5000m else "WARN",
-        },
-        {
-            "id": "ORT-07_PRIMARY_NIC_END0",
+            "id": f"ORT-{next_ort_idx:02d}_PRIMARY_NIC_END0",
             "description": "Primary SoC NIC (end0) Carrier UP with IPv4 Lease",
             "expected": "UP",
             "actual": "UP" if end0_up else "DOWN",
             "status": "PASS" if end0_up else "FAIL",
         },
         {
-            "id": "ORT-08_THERMAL_IDLE_FLOOR",
+            "id": f"ORT-{next_ort_idx + 1:02d}_THERMAL_IDLE_FLOOR",
             "description": "Quiescent SoC Thermal Ceiling Below 55.0 C",
             "expected": "< 55.0 C",
             "actual": f"{max([v['max'] for v in quiescent['thermal_zones_celsius'].values() if v['max'] is not None], default=0.0)} C",
             "status": "PASS" if max([v["max"] for v in quiescent["thermal_zones_celsius"].values() if v["max"] is not None], default=0.0) < 55.0 else "WARN",
         },
         {
-            "id": "ORT-09_KERNEL_BUS_HEALTH",
+            "id": f"ORT-{next_ort_idx + 2:02d}_KERNEL_BUS_HEALTH",
             "description": "Zero PCIe AER, NVMe I/O, or USB Bus Reset Errors in dmesg",
             "expected": 0,
             "actual": len(bus_errors),
@@ -501,7 +623,7 @@ def main() -> None:
 
     # --- Construct CarrierPigeons / HamStack CTD Artifact Envelope ---
     snapshot_payload: dict[str, Any] = {
-        "schema_version": "drewv-ctd-manifest/v1.0",
+        "schema_version": "drewv-ctd-manifest/v1.1",
         "artifact": {
             "id": socket.gethostname(),
             "node_group": "brakerrak-databrokers",
@@ -529,10 +651,7 @@ def main() -> None:
             "cpu_harts": harts,
             "cache_hierarchy": caches,
             "nvme_primary": nvme_info,
-            "usb_raid_candidates": {
-                "bigred_wdr48_12tb_disks": bigred_disks,
-                "lilblu_wdb24_6tb_disks": lilblu_disks,
-            },
+            "usb_raid_arrays": usb_raid_arrays,
             "usb_topology_tree": lsusb_tree.splitlines(),
             "pci_devices": run_cmd(["lspci", "-nn"]).splitlines(),
             "block_devices": block_devices,
@@ -553,16 +672,16 @@ def main() -> None:
                     "kernel.perf_event_paranoid",
                     "kernel.kptr_restrict",
                     "kernel.io_uring_disabled",
+                    "vm.nr_hugepages",
                     "vm.swappiness",
-                    "vm.dirty_background_ratio",
-                    "vm.dirty_ratio",
-                    "net.core.rmem_max",
-                    "net.core.wmem_max",
+                    "vm.dirty_background_bytes",
+                    "vm.dirty_bytes",
                 ]
             },
             "dmesg_bus_events": bus_errors[-25:],
         },
         "postgresql_broker_state": postgres_state,
+        "databroker_services_state": broker_services_state,
         "network_topology": {
             "hostname": socket.gethostname(),
             "fqdn": socket.getfqdn(),
@@ -612,7 +731,7 @@ def main() -> None:
     for chk in ort_checks:
         st = chk["status"]
         color = C_GREEN if st == "PASS" else (C_YELLOW if st == "WARN" else C_RED)
-        print(f"  [{color}{st:4s}{C_RESET}] {chk['id']:24s} : {chk['actual']} (Expected: {chk['expected']})")
+        print(f"  [{color}{st:4s}{C_RESET}] {chk['id']:26s} : {chk['actual']} (Expected: {chk['expected']})")
 
     print(f"\n{C_CYAN}--- {args.window:.0f}-Second Quiescent Hardware Baseline Summary ---{C_RESET}")
     for tz_name, stats in quiescent["thermal_zones_celsius"].items():
