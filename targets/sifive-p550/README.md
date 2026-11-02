@@ -58,7 +58,7 @@ Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sec
 
 ## 4. Installation  
 
-*See [BrakerRak README](https://github.com/drewv-labs/brakerrak/README.md) for full instructions.*  
+*See [BrakerRak README](https://github.com/drewv-labs/brakerrak) for full instructions.*  
 
 Cheatsheet
 ~~~bash
