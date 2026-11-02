@@ -16,7 +16,7 @@ DREW-V Labs presents this `brakerbox-p550` build as a 1U rackmount RISC-V high t
 
 By switching to io_uring, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead.  
 
-The BrakerBox-P550 also offers support for custom RAID storage tiers, MQTT brokering, & NFS hosting to cover all data brokering needs.
+The BrakerBox-P550 also offers support for `custom RAID storage tiers`, `Mosquitto MQTT` brokering, & `NFSv4` hosting to cover all data brokering needs.
 
 ---
 
