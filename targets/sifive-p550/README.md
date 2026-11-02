@@ -12,8 +12,11 @@
 
 ## 1. Architectural Overview
 
-DREW-V Labs presents this `brakerbox-p550` build as a 1U rackmount RISC-V data broker built around the **SiFive HiFive Premier P550** (`HF106-001`) Mini-DTX platform.
+DREW-V Labs presents this `brakerbox-p550` build as a 1U rackmount RISC-V high throughput data broker built around the **[SiFive HiFive Premier P550](https://www.sifive.com/development-platforms/hifive-premier-p550)** (`HF106-001`) Mini-DTX platform paired with a NVMe SSD (tested w/ WD_Black SN850X). Built on the latest PostgreSQL 18.6 `io_uring` functionality supporting up to 200 concurrent asynchronous NVMe disk I/O prefetch operations, 250 connected clients, and 4 parallel workers.
 
+By switching to io_uring, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead.  
+
+The BrakerBox-P550 also offers support for custom RAID storage tiers, MQTT brokering, & NFS hosting to cover all data brokering needs.
 
 ---
 

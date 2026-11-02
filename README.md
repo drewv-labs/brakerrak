@@ -12,7 +12,7 @@ Continuous Telemetric Documentation (CTD)
 
 ---
 
-`BrakerRak` (named in tribute to database pioneer Michael Stonebraker) is a declarative, hardware-agnostic provisioning and benchmarking engine designed to converge, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) RISC-V silicon** across high-throughput relational data brokering and heterogeneous Edge ML workloads.
+`BrakerRak` (named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker)) is a declarative, hardware-agnostic provisioning and benchmarking engine designed to converge, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) RISC-V silicon** across high-throughput relational data brokering and heterogeneous Edge ML workloads.
 
 Rather than coupling provisioning logic to hardcoded hostnames or fixed disk topologies, `BrakerRak` operates as a **Two-Axis State Machine (`Targets` × `Roles`)** paired with [RVDK (riscv-data-kit)](https://github.com/drewv-labs/riscv-data-kit) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons):
 
