@@ -158,26 +158,6 @@ When `WITH_RAID="true"`, `BrakerRak` dynamically iterates through `RAID_ARRAYS_J
 4. **Stage 2 — Idempotency Verification Pass (`brakerrak forge`):** Re-executes the forge against the live node, asserting `100% [SKIP]` across all stages in ~2 seconds with zero service restarts or destructive storage mutations.
 5. **Stage 3 — Post-Forge CTD Provenance (`brakerrak ort --stage day1-post-forge`):** Emits a SHA-256 signed JSON manifest (`.json` + redacted `.public.json`) to `~/.brakerrak/snapshots/` verifying `4Kn` block alignment, active `io_uring` backend configuration, HugePage consumption, and tablespace/NFS routing.
 
----
-
-## SiFive P550 Reference Telemetry (`targets/sifive-p550`)
-
-### 1. Zero-Cache PostgreSQL 18.6 Source Compilation (`perf stat`)
-* **Target Silicon:** ESWIN EIC7700X (`4x SiFive P550` 3-Wide Out-of-Order harts @ `1.4 GHz`, `32GB LPDDR5`)
-* **Compiler Flags:** `-O3 -pipe -march=rv64gc_zba_zbb -mcpu=sifive-p550 -mtune=sifive-p550`
-* **Sustained IPC (`1.038`):** Retired **`4.54 trillion` instructions** across **`4.38 trillion` cycles** in `2,961.55s` (`49m 21.5s`).
-* **Branch Predictor Accuracy (`95.72%`):** `659.07 billion` branches executed with only `28.24 billion` mispredictions (`4.28%` miss rate).
-
-### 2. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Preliminary Baseline)
-Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN850X` (`PCIe Gen3 x4`, `shared_buffers = 8GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
-
-| Workload & Metric | `sync` | `worker` | `io_uring` | `io_uring` + `O_DIRECT` |
-| :--- | :--- | :--- | :--- | :--- |
-| **Seq Scan Wall Time** | 15022 ms | 12776 ms | 13174 ms | — |
-| **Seq Scan Backend I/O Wait** | 4017 ms | 112 ms | 32 ms | — |
-| **Bitmap Scan Wall Time** | 54698 ms | 28530 ms | 35011 ms | 62482 ms |
-| **Bitmap Scan Context Switches** | 24854 | 611038 | 508370 | 32189 |
-| **Bitmap Scan L1d Cache Misses** | 4.75 B | 4.97 B | 4.93 B | 3.03 B |
 
 ---
 
