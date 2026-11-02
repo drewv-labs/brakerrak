@@ -2,114 +2,174 @@
 
 # BrakerRak
 
-**Bare-Metal RISC-V Data Engineering & Edge ML Research Rack: PostgreSQL 18 `io_uring` Data Brokers, `4Kn` NVMe + Btrfs RAID 10 Storage Tiers, and Continuous Telemetric Documentation (CTD).**
+**Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML Deployment Engine**  
+PostgreSQL 18 `io_uring`  
+Isolated Silicon Testbeds  
+`4Kn` NVMe + Dynamic RAID Tiering  
+Continuous Telemetric Documentation (CTD)  
 
 </div>
 
 ---
 
-`BrakerRak` (named in tribute to database pioneer Michael Stonebraker) is a 15U bare-metal research rack engineered to benchmark, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) RISC-V silicon** across high-throughput relational data brokering and heterogeneous Edge ML workloads.
+`BrakerRak` (named in tribute to database pioneer Michael Stonebraker) is a declarative, hardware-agnostic provisioning and benchmarking engine designed to converge, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) RISC-V silicon** across high-throughput relational data brokering and heterogeneous Edge ML workloads.
 
-Every node in the rack is provisioned as a deterministic, self-contained state machine—combining **native `4096B` (`4Kn`) NVMe sector formatting**, **`2MB` `Sv39` HugePage pinning**, **source-compiled PostgreSQL 18.6 (`-O3 -march=rv64gc_zba_zbb` with `liburing`)**, **multi-tier Btrfs RAID 10 vaults**, and **cycle-accurate PMU hardware counter telemetry** (`perf stat` + `ort-snapshot.py`).
+Rather than coupling provisioning logic to hardcoded hostnames or fixed disk topologies, `BrakerRak` operates as a **Two-Axis State Machine (`Targets` × `Roles`)** paired with [RVDK (riscv-data-kit)](https://github.com/drewv-labs/riscv-data-kit) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons):
+
+* **Native Silicon & Storage Alignment:** Hardware-formats NVMe namespaces to native **`4096B` (`4Kn`)** LBA sectors, provisions LVM (`85%VG` with instant rollback snapshot reserve) + XFS, pins **`2MB` `Sv39` HugePages**, and compiles **PostgreSQL 18.6** from source (`-O3` with silicon-specific ISA extensions and `liburing`).
+* **Declarative Role Personas (`databroker` vs. `databench`):** Toggles any supported RISC-V board between a full **`BrakerBox` (`databroker`)** relational/messaging/NFS hub and an isolated **`BrakerBench` (`databench`)** microarchitectural testbed via `~/.brakerrak/node.env` or `--role`.
+* **Stateless & Agnostic by Default:** Runs out-of-the-box on single-NVMe boards (`WITH_RAID="false"`), while supporting arbitrary multi-enclosure USB/SATA RAID 10 topologies (`mdadm` XFS or native kernel Btrfs RAID 10 `zstd:1`) defined via an iterable `RAID_ARRAYS_JSON` manifest in `~/.brakerrak/node.env`.
 
 ---
 
-## 15U Rack Elevation Topology
+## Two-Axis Architecture: `Targets` × `Roles`
 
-```text
-U15 |---------------------------------------------------------------|
-U14 |                                                               |
-U13 |                       BabbageBox-RTX                          |
-U12 |                                                               |
-U11 |---------------------------------------------------------------|
-U10 [                        VentedSpacer                           ]
-U09 [                      ~BrakerBox-Titan                         ]
-U08 [                        LilBlu-WDB24                           ]
-U07 [                        BigRed-WDR48                           ]
-U06 [                     ~BrakerBench-Titan                        ]
-U05 [                      ~BrakerBench-J2                          ]
-U04 [                      ~BrakerBench-J1                          ]
-U03 [                       BrakerBox-P550                          ]
-U02 [   RakWrt-R6S  |  VFerret-H8  |  VFerret-H8L  |  BBench-VF2    ]
-U01 [                        Sodola Switch                          ]
-    -----------------------------------------------------------------
-```
+### 1. Role Personas (`roles/`)
 
-## Hardware Node Matrix
+| Role Persona | Node Designation | PostgreSQL 18 (`io_uring`) | Mosquitto MQTT (`:1883`) | NFSv4 Vault Server | `CarrierPigeons` Daemons |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **`databroker`** | `brakerbox-<tag>` | Active + Custom Warm/Cold Tablespaces | Enabled (Persisted on `4Kn` NVMe) | Exports RAID Vaults (or `/mnt/nvme_pgdata/nfs_vault` if `WITH_RAID=false`) | `PigeonCoop` + `Pigeoneer` |
+| **`databench`** | `brakerbench-<tag>` | Active (Locked Planner Cost Constants) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | `Pigeoneer` Only |
 
-| Unit | Node | Silicon | Core Complex | Primary Role |
+### 2. Silicon Targets (`targets/`)
+
+| Target Directory | SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| U11–U15 | `BabbageBox-RTX` | Intel i9-9900K | RTX 3090 + 3080 Ti | Tensor Forge & Hailo `.hef` Factory |
-| U09 | `~BrakerBox-Titan` | UltraRISC DP1000 | 8x CP100 4-Wide OoO | Target Production Data Broker |
-| U07–U08 | `BigRed` / `LilBlu` | 8x WD CMR Arrays | Btrfs RAID 10 | 43.6 TiB Warm + 21.8 TiB Cold Vaults |
-| U06 | `~BrakerBench-Titan` | UltraRISC DP1000 | 8x CP100 4-Wide OoO | PCIe Gen4 x4 NVMe & KVM Benchmark |
-| U05 | `~BrakerBench-J2` | SpacemiT K3 | 8x X100 4-Wide OoO | RVA23 + 1024-bit RVV 1.0 + 60 TOPS |
-| U04 | `~BrakerBench-J1` | SpacemiT M1 | 8x X60 2-Wide InO | RVA22 + 256-bit RVV 1.0 Benchmark |
-| U03 | `BrakerBench-P550` | ESWIN EIC7700X | 4x P550 3-Wide OoO | Active PG 18.6 `io_uring` Broker |
-| U02 | `BrakerBench-VF2` | StarFive JH7110 | 4x U74 2-Wide InO | In-Order Scalar Baseline Control |
-| U02 | `VisionFerret-H8` | JH7110 + Hailo-8 | 4x U74 + 26 TOPS | Full-SRAM Single-Context NPU Twin |
-| U02 | `VisionFerret-H8L` | JH7110 + Hailo-8L | 4x U74 + 13 TOPS | Multi-Context DMA Spill NPU Twin |
-| U01–U02 | `RakWrt` / `Switch` | RK3588S + Sodola | 2.5GbE / 10GbE SFP+ | `10.0.10.0/24` L2/L3 Lab Fabric |
+| **`targets/sifive-p550`** | ESWIN EIC7700X (HiFive Premier P550) | `4x SiFive P550` (`3-Wide OoO @ 1.4GHz`) | `RVA20` (`-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550`) | **Active / Verified** |
+| **`targets/starfive-jh7110`** | StarFive JH7110 (VisionFive 2) | `4x SiFive U74` (`2-Wide InO @ 1.5GHz`) | `RVA20` (`-O3 -march=rv64gc -mcpu=sifive-u74`) | **Active / In Progress** |
+| `targets/spacemit-k1` | SpacemiT K1/M1 (Milk-V Jupiter 1) | `8x X60` (`2-Wide InO @ 1.8GHz`) | `RVA22` + `256-bit RVV 1.0` | Planned |
+| `targets/spacemit-k3` | SpacemiT K3 (Milk-V Jupiter 2) | `8x X100` (`4-Wide OoO @ 2.4GHz` + `60 TOPS`) | `RVA23` + `1024-bit RVV 1.0` | Planned |
+| `targets/ultrarisc-dp1000` | UltraRISC UR-DP1000 (Milk-V Titan) | `8x UR-CP100` (`4-Wide OoO @ 2.0GHz`) | `RVA22` + `H-Ext 1.0` | Planned |
 
-*(Nodes prefixed with `~` denote backordered/planned expansion slots.)*
+---
 
 ## Repository Structure
 
-Each node directory operates as a blast-radius-isolated sandbox containing its own convergence script (`forge.sh`), read-only Continuous Telemetric Documentation (CTD) inspector (`ort-snapshot.py`), factory teardown harness (`reset-day0.sh`), and signed JSON provenance manifests (`snapshots/`):
+All user-specific configuration (`~/.brakerrak/node.env`) and generated hardware provenance manifests (`~/.brakerrak/snapshots/`) live outside the repository tree so the engine remains stateless:
 
 ```text
 brakerrak/
 ├── README.md
-└── nodes/
-    ├── databrokers/
-    │   ├── brakerbox-p550/
-    │   │   ├── README.md
-    │   │   ├── forge.sh                  # Stage 1 & 2: Idempotent convergence forge
-    │   │   ├── ort-snapshot.py           # Stage 0 & 3: Zero-dependency ORT & CTD manifest generator
-    │   │   ├── reset-day0.sh             # Option A: In-place 512e NVMe & OS factory rollback
-    │   │   ├── verify-convergence.sh     # One-shot 5-stage validation & idempotency harness
-    │   │   ├── benchmarks/               # PostgreSQL 18.6 io_uring + O_DIRECT torture suite
-    │   │   └── snapshots/                # SHA-256 signed Day-0 and Day-1 CTD JSON artifacts
-    │   └── brakerbox-titan/
-    ├── databench/
-    │   ├── brakerbench-j1/
-    │   ├── brakerbench-j2/
-    │   ├── brakerbench-p550/
-    │   ├── brakerbench-titan/
-    │   └── brakerbench-vf2/
-    └── npubench/
-        ├── visionferret-h8/
-        └── visionferret-h8l/
+├── forge.sh                             # Universal curl-to-forge auto-dispatcher & local CLI entrypoint
+├── roles/
+│   ├── databroker.env                   # BrakerBox persona: PG18 + Mosquitto + NFSv4 + PigeonCoop
+│   └── databench.env                    # BrakerBench persona: Locked PG18 planner + Pigeoneer only
+├── targets/
+│   ├── sifive-p550/                     # HiFive Premier P550 (ESWIN EIC7700X, RVA20 + Zba/Zbb)
+│   │   ├── forge.sh                     # Stage 1 & 2: Two-Pass idempotent convergence script
+│   │   ├── ort-snapshot.py              # Stage 0 & 3: Zero-dependency ORT & CTD manifest generator
+│   │   ├── reset-day0.sh                # Option A: In-place 512e NVMe & OS factory rollback
+│   │   └── verify-convergence.sh        # One-shot 5-stage validation & idempotency harness
+│   └── starfive-jh7110/                 # VisionFive 2 (StarFive JH7110, SiFive U74)
+└── examples/
+    ├── databroker-raid.env.example      # Reference multi-array databroker configuration
+    └── databench.env.example            # Reference isolated databench configuration
 ```
+
+---
+
+## Zero-Touch Quickstart (`curl | sudo bash` & `brakerrak` CLI)
+
+### 1. Remote One-Liner Bootstrap
+
+`BrakerRak`'s root `forge.sh` inspects `/proc/device-tree/model` to auto-detect the underlying RISC-V board, syncs the framework into `~/.brakerrak/engine`, installs the `/usr/local/bin/brakerrak` CLI symlink, and executes the target convergence pipeline:
+
+```bash
+# Converge node as an isolated benchmark target (default Pass 1 behavior: databench, NVMe-only)
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash
+
+# Converge node directly as a production DataBroker (PG18 + Mosquitto MQTT + NFSv4)
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker
+```
+
+### 2. Local `/usr/local/bin/brakerrak` CLI Usage
+
+Once bootstrapped, invoke `brakerrak` directly to toggle roles, capture CTD provenance snapshots, run the 5-stage idempotency harness, or roll the node back to factory Day-0 state:
+
+```bash
+# Re-converge node using ~/.brakerrak/node.env (Pass 2) or toggle role persona
+sudo brakerrak
+sudo brakerrak --role databench
+sudo brakerrak --role databroker
+
+# Capture a read-only Operational Readiness Test (ORT) & signed CTD snapshot in ~/.brakerrak/snapshots/
+sudo brakerrak ort --stage day1-post-forge
+
+# Execute the full 5-stage Day-0 -> Day-1 convergence & idempotency verification harness
+sudo brakerrak verify --use-pkg-cache
+
+# Roll back NVMe to factory 512e (512B) LBA sectors and scrub OS/PG18 state (preserving compiled .debs)
+sudo brakerrak reset --confirm-destroy --keep-pg-cache
+```
+
+---
+
+## Declarative Node Configuration (`~/.brakerrak/node.env`)
+
+On its first run (**Pass 1**), `forge.sh` converges the core OS, `4Kn` NVMe, and PostgreSQL 18 cluster using safe hardware-agnostic defaults (`WITH_RAID="false"`) and emits a template at `~/.brakerrak/node.env`.
+
+To attach external USB/SATA RAID 10 pools or customize network services for **Pass 2**, populate `RAID_ARRAYS_JSON` in `~/.brakerrak/node.env` and re-run `sudo brakerrak`:
+
+```bash
+NODE_ROLE="databroker"
+TARGET_HOSTNAME="brakerbox-p550"
+ADMIN_USER="ubuntu"
+LAB_SUBNET="10.0.10.0/24"
+
+NVME_DEV="/dev/nvme0n1"
+MOUNT_POINT="/mnt/nvme_pgdata"
+
+WITH_RAID="true"
+RAID_ARRAYS_JSON='[
+  {
+    "name": "WarmVault",
+    "id": "warmvault",
+    "type": "warm",
+    "label": "WARM_VAULT",
+    "mount": "/mnt/warm_vault",
+    "md_dev": "/dev/md/warmvault",
+    "disks": 4,
+    "min_bytes": 11000000000000,
+    "max_bytes": 13000000000000,
+    "tablespace": "ts_warm_vault",
+    "nfs_fsid": 10,
+    "nfs_dirs": ["models", "sigmf", "fits", "pg_backups", "ctd-vault"]
+  }
+]'
+
+ENABLE_MQTT_BROKER="true"
+MQTT_PORT="1883"
+ENABLE_NFS_SERVER="true"
+```
+
+When `WITH_RAID="true"`, `BrakerRak` dynamically iterates through `RAID_ARRAYS_JSON` to:
+1. Match rotational candidate disks by byte-capacity bounds and assemble 4-drive RAID 10 volumes (`mdadm` + XFS or native kernel Btrfs RAID 10 `zstd:1`).
+2. Mount each array with `nofail` protection in `/etc/fstab` and register its corresponding PostgreSQL tablespace (`ts_warm_vault`, etc.).
+3. Scaffold shared directories (`nfs_dirs`) and export each tier over NFSv4 (`fsid`), or automatically fall back to exporting `${MOUNT_POINT}/nfs_vault` on the NVMe when `WITH_RAID="false"`.
+4. Assert disk enumeration and mount health inside `ort-snapshot.py` while scrubbing physical drive serials to `"REDACTED"` in the companion `.public.json` manifest.
+
+---
 
 ## Deterministic 5-Stage Lifecycle State Machine
 
-`BrakerRak` treats bare-metal infrastructure as a verifiable state machine paired with [`riscv-data-kit`](https://github.com/drewv-labs/riscv-data-kit) as a sibling repository:
+1. **Stage 0A — Day-0 OS & Silicon Bootstrap (`RVDK`):** Strips desktop GUI/snap bloat, masks sleep/suspend targets, protects vendor U-Boot/DTB hooks, and unlocks hardware PMU counters (`kernel.perf_event_paranoid = -1`).
+2. **Stage 0B — Clean-Room ORT Baseline (`brakerrak ort --stage day0-pre-forge`):** Captures a zero-mutation JSON snapshot of factory PCIe link speeds, `512e` NVMe LBA formatting, rotational JBOD enumeration, and quiescent thermal/clock baselines.
+3. **Stage 1 — Cold Convergence Forge (`brakerrak forge`):** Reformats NVMe storage to native `4096B` (`4Kn`) sectors, provisions LVM + XFS and any configured `RAID_ARRAYS_JSON` pools, reserves `2MB` `Sv39` HugePages, compiles PostgreSQL 18.6 from source under `perf stat`, and converges role-specific `mosquitto` / `nfs-kernel-server` services.
+4. **Stage 2 — Idempotency Verification Pass (`brakerrak forge`):** Re-executes the forge against the live node, asserting `100% [SKIP]` across all stages in ~2 seconds with zero service restarts or destructive storage mutations.
+5. **Stage 3 — Post-Forge CTD Provenance (`brakerrak ort --stage day1-post-forge`):** Emits a SHA-256 signed JSON manifest (`.json` + redacted `.public.json`) to `~/.brakerrak/snapshots/` verifying `4Kn` block alignment, active `io_uring` backend configuration, HugePage consumption, and tablespace/NFS routing.
 
-1. **Stage 0A — Day-0 OS & Silicon Bootstrap (`riscv-data-kit`):** Strips desktop GUI/snap bloat, applies `CVE-2026-98432` raw `nftables` prerouting and MPTCP kernel guards, protects vendor U-Boot/DTB hooks, and unlocks hardware PMU counters (`kernel.perf_event_paranoid = -1`).
-2. **Stage 0B — Clean-Room ORT Baseline (`ort-snapshot.py --stage day0-pre-forge`):** Captures a zero-mutation JSON snapshot of factory PCIe link speeds, `512e` NVMe LBA formatting, USB JBOD enumeration, and quiescent thermal/power baselines.
-3. **Stage 1 — Cold Convergence Forge (`forge.sh`):** Reformats NVMe storage to native `4096B` (`4Kn`) sectors, provisions LVM + XFS (`HOT_NVME`) and native Btrfs RAID 10 (`zstd:1`) arrays (`WARM_VAULT` & `COLD_ARCH`), allocates `2MB` `Sv39` HugePages, and compiles PostgreSQL 18.6 from source with `-O3 -march=rv64gc_zba_zbb` and `liburing`.
-4. **Stage 2 — Idempotency Verification Pass (`forge.sh`):** Re-executes the forge against the live node, asserting `100% [SKIP]` across all stages with zero service restarts or destructive storage mutations.
-5. **Stage 3 — Post-Forge CTD Provenance (`ort-snapshot.py --stage day1-post-forge`):** Emits a SHA-256 signed JSON manifest proving `4Kn` block alignment, active `io_uring` backend configuration, HugePage reservation, and 3-tier tablespace routing.
+---
 
-## Quickstart: `BrakerBox-P550` End-to-End Verification
+## SiFive P550 Reference Telemetry (`targets/sifive-p550`)
 
-Assuming `brakerrak` and `riscv-data-kit` are checked out under `~/repo/[github.com/drewv-labs/](https://github.com/drewv-labs/)` (if `riscv-data-kit` is absent, `verify-convergence.sh` clones it automatically):
+### 1. Zero-Cache PostgreSQL 18.6 Source Compilation (`perf stat`)
+* **Target Silicon:** ESWIN EIC7700X (`4x SiFive P550` 3-Wide Out-of-Order harts @ `1.4 GHz`, `32GB LPDDR5`)
+* **Compiler Flags:** `-O3 -pipe -march=rv64gc_zba_zbb -mcpu=sifive-p550 -mtune=sifive-p550`
+* **Sustained IPC (`1.038`):** Retired **`4.54 trillion` instructions** across **`4.38 trillion` cycles** in `2,961.55s` (`49m 21.5s`).
+* **Branch Predictor Accuracy (`95.72%`):** `659.07 billion` branches executed with only `28.24 billion` mispredictions (`4.28%` miss rate).
 
-```bash
-cd ~/repo/github.com/drewv-labs/brakerrak/nodes/databrokers/brakerbox-p550
-
-# 1. Optional: Roll back a converged node to factory 512e NVMe & clean OS state
-sudo ./reset-day0.sh --confirm-destroy
-
-# 2. Execute the 5-stage Day-0 -> Day-1 convergence & idempotency verification harness
-# (Pass --use-pkg-cache for fast iteration, or omit for a full perf stat source build)
-sudo ./verify-convergence.sh --use-pkg-cache
-```
-
-## PostgreSQL 18.6 `io_uring` Benchmark Highlights (`BrakerBox-P550`)
-
-Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) dataset stored on a `4Kn`-formatted `WD_BLACK SN850X` (`PCIe Gen3 x4`) across `4x SiFive P550` Out-of-Order cores (`32GB LPDDR5`, `shared_buffers = 8GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
+### 2. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Preliminary Baseline)
+Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN850X` (`PCIe Gen3 x4`, `shared_buffers = 8GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
 
 | Workload & Metric | `sync` | `worker` | `io_uring` | `io_uring` + `O_DIRECT` |
 | :--- | :--- | :--- | :--- | :--- |
@@ -118,14 +178,6 @@ Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) dataset stored on a `
 | **Bitmap Scan Wall Time** | 54698 ms | 28530 ms | 35011 ms | 62482 ms |
 | **Bitmap Scan Context Switches** | 24854 | 611038 | 508370 | 32189 |
 | **Bitmap Scan L1d Cache Misses** | 4.75 B | 4.97 B | 4.93 B | 3.03 B |
-
-Reproduce the full hardware-counter benchmark suite using the scripts under `nodes/databrokers/brakerbox-p550/benchmarks/`:
-
-```bash
-cd ~/repo/github.com/drewv-labs/brakerrak/nodes/databrokers/brakerbox-p550/benchmarks
-sudo ./create-io-torture-table.sh
-sudo ./run-iouring-showdown.sh
-```
 
 ---
 

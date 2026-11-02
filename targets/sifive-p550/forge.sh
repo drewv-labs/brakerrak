@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // SiFive HiFive Premier P550 Data Broker Forge Script
-# Path: drewv-labs/brakerrak/nodes/databroker/brakerbox-p550/forge.sh
+# DREW-V Labs // SiFive HiFive Premier P550 Target Forge Script
+# Path: drewv-labs/brakerrak/targets/sifive-p550/forge.sh
 # Architecture: RVA20 (RV64GC + Zba/Zbb) | 4x P550 3-Wide OoO | 32GB LPDDR5
 #
 # Usage:
-#   ./forge.sh                                 # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
-#   ./forge.sh --config /path/to/node.env      # Explicitly load a specific declarative config file
-#   ./forge.sh --role bench                    # Override role/hostname to brakerbench-p550
-#   ./forge.sh --with-raid                     # Provision/mount arrays defined in RAID_ARRAYS_JSON
-#   ./forge.sh --with-mqtt                     # Enable Eclipse Mosquitto MQTT broker on NVMe
-#   ./forge.sh --with-nfs                      # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
-#   ./forge.sh --force-wipe-nvme               # Destructively 4Kn format NVMe & zero-cache rebuild PG18
-#   ./forge.sh --with-raid --force-wipe-raid   # Destructively rebuild USB RAID10 arrays
-#   ./forge.sh --force-rebuild-pg              # Force zero-cache PGDG deb-src recompile with perf stat
-#   ./forge.sh --use-pkg-cache                 # Restore/use cached P550 .deb packages on NVMe
+#   ./forge.sh                                    # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
+#   ./forge.sh --config /path/to/node.env         # Explicitly load a specific declarative config file
+#   ./forge.sh --role databroker|databench        # Select role persona (aliases: prod|bench)
+#   ./forge.sh --with-raid                        # Provision/mount arrays defined in RAID_ARRAYS_JSON
+#   ./forge.sh --with-mqtt                        # Enable Eclipse Mosquitto MQTT broker on NVMe
+#   ./forge.sh --with-nfs                         # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
+#   ./forge.sh --force-wipe-nvme                  # Destructively 4Kn format NVMe & zero-cache rebuild PG18
+#   ./forge.sh --with-raid --force-wipe-raid      # Destructively rebuild USB RAID10 arrays
+#   ./forge.sh --force-rebuild-pg                 # Force zero-cache PGDG deb-src recompile with perf stat
+#   ./forge.sh --use-pkg-cache                    # Restore/use cached P550 .deb packages on NVMe
 # ==============================================================================
 
 set -Eeuo pipefail
 
-# --- Fail-Fast Error Trap ---
 trap_err() {
     local exit_code=$?
     local line_no=$1
@@ -29,10 +28,14 @@ trap_err() {
 }
 trap 'trap_err ${LINENO}' ERR
 
-# Ensure script runs as root BEFORE resolving user home or shifting CLI arguments
 if [[ $EUID -ne 0 ]]; then
-    echo "Re-executing with sudo..."
-    exec sudo -E bash "$0" "$@"
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        echo "Re-executing with sudo..."
+        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    else
+        echo "[FATAL] When piping via curl, run with 'sudo bash': curl -fsSL ... | sudo bash" >&2
+        exit 1
+    fi
 fi
 
 # ==============================================================================
@@ -42,11 +45,16 @@ REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
 BRAKER_CONF_DIR="${REAL_HOME}/.brakerrak"
 USER_NODE_ENV="${BRAKER_CONF_DIR}/node.env"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    SCRIPT_DIR="$PWD"
+fi
 
 # 1. Hardware-Agnostic Defaults (Pass 1 Baseline — Overridden by node.env or CLI flags)
-NODE_ROLE="${NODE_ROLE:-bench}"
-TARGET_HOSTNAME="${TARGET_HOSTNAME:-brakerbox-p550}"
+TARGET_TAG="p550"
+NODE_ROLE="${NODE_ROLE:-databench}"
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-brakerbench-p550}"
 ADMIN_USER="${ADMIN_USER:-${REAL_USER}}"
 LAB_SUBNET="${LAB_SUBNET:-127.0.0.1/32}"
 
@@ -63,7 +71,6 @@ VG_NAME="${VG_NAME:-vg_braker}"
 LV_NAME="${LV_NAME:-lv_pgdata}"
 LV_PCT="${LV_PCT:-85%VG}"
 
-# Default to no external RAID arrays unless configured in node.env
 WITH_RAID="${WITH_RAID:-false}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 
@@ -91,25 +98,32 @@ FORCE_REBUILD_PG="false"
 USE_PKG_CACHE="false"
 
 # 2. Source ~/.brakerrak/node.env (Pass 2) or Repo node.env if present
+LOADED_ENV_FILE=""
 FORGE_PASS="1"
 if [[ -f "${USER_NODE_ENV}" ]]; then
     echo "[CONF] Pass 2 Detected: Loading user config from ${USER_NODE_ENV}"
     # shellcheck disable=SC1090
     source "${USER_NODE_ENV}"
+    LOADED_ENV_FILE="${USER_NODE_ENV}"
     FORGE_PASS="2"
 elif [[ -f "${SCRIPT_DIR}/node.env" ]]; then
     echo "[CONF] Loading repo config from ${SCRIPT_DIR}/node.env"
     # shellcheck disable=SC1091
     source "${SCRIPT_DIR}/node.env"
+    LOADED_ENV_FILE="${SCRIPT_DIR}/node.env"
 fi
 
 # 3. CLI Argument Overrides (Highest Precedence)
+CLI_WITH_RAID=""
+CLI_ENABLE_MQTT=""
+CLI_ENABLE_NFS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --config)
             if [[ -f "${2:-}" ]]; then
                 # shellcheck disable=SC1090
                 source "$2"
+                LOADED_ENV_FILE="$2"
                 FORGE_PASS="2"
             else
                 echo "Config file not found: ${2:-}" >&2
@@ -118,23 +132,18 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --role)
-            NODE_ROLE="${2:-prod}"
-            if [[ "$NODE_ROLE" == "bench" ]]; then
-                TARGET_HOSTNAME="brakerbench-p550"
-            else
-                TARGET_HOSTNAME="brakerbox-p550"
-            fi
+            NODE_ROLE="${2:-databroker}"
             shift 2
             ;;
-        --with-raid)        WITH_RAID="true"; shift ;;
-        --with-mqtt)        ENABLE_MQTT_BROKER="true"; shift ;;
-        --with-nfs)         ENABLE_NFS_SERVER="true"; shift ;;
+        --with-raid)        CLI_WITH_RAID="true"; shift ;;
+        --with-mqtt)        CLI_ENABLE_MQTT="true"; shift ;;
+        --with-nfs)         CLI_ENABLE_NFS="true"; shift ;;
         --force-wipe-nvme)  FORCE_WIPE_NVME="true"; FORCE_REBUILD_PG="true"; shift ;;
         --force-wipe-raid)  FORCE_WIPE_RAID="true"; shift ;;
         --force-rebuild-pg) FORCE_REBUILD_PG="true"; shift ;;
         --use-pkg-cache)    USE_PKG_CACHE="true"; shift ;;
         -h|--help)
-            echo "Usage: $0 [--config file.env] [--role prod|bench] [--with-raid] [--with-mqtt] [--with-nfs] [--force-wipe-nvme] [--force-wipe-raid] [--force-rebuild-pg] [--use-pkg-cache]"
+            echo "Usage: $0 [--config file.env] [--role databroker|databench] [--with-raid] [--with-mqtt] [--with-nfs] [--force-wipe-nvme] [--force-wipe-raid] [--force-rebuild-pg] [--use-pkg-cache]"
             exit 0
             ;;
         *)
@@ -144,12 +153,49 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Normalize NODE_ROLE aliases and load Role Persona defaults
+case "$NODE_ROLE" in
+    prod|broker|databroker)
+        NODE_ROLE="databroker"
+        TARGET_HOSTNAME="brakerbox-${TARGET_TAG}"
+        ENABLE_MQTT_BROKER="true"
+        ENABLE_NFS_SERVER="true"
+        ;;
+    bench|databench)
+        NODE_ROLE="databench"
+        TARGET_HOSTNAME="brakerbench-${TARGET_TAG}"
+        WITH_RAID="false"
+        ENABLE_MQTT_BROKER="false"
+        ENABLE_NFS_SERVER="false"
+        ;;
+    *)
+        echo "Unknown role: $NODE_ROLE (expected: databroker or databench)" >&2
+        exit 1
+        ;;
+esac
+
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." 2>/dev/null && pwd || echo "")"
+if [[ -n "$REPO_ROOT" && -f "${REPO_ROOT}/roles/${NODE_ROLE}.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${REPO_ROOT}/roles/${NODE_ROLE}.env"
+fi
+if [[ -n "$LOADED_ENV_FILE" && -f "$LOADED_ENV_FILE" ]]; then
+    # Re-apply explicit user config values on top of role defaults
+    # shellcheck disable=SC1090
+    source "$LOADED_ENV_FILE"
+    # Re-normalize NODE_ROLE if node.env used legacy prod/bench string
+    [[ "$NODE_ROLE" == "prod" || "$NODE_ROLE" == "broker" ]] && NODE_ROLE="databroker"
+    [[ "$NODE_ROLE" == "bench" ]] && NODE_ROLE="databench"
+fi
+[[ -n "$CLI_WITH_RAID" ]] && WITH_RAID="$CLI_WITH_RAID"
+[[ -n "$CLI_ENABLE_MQTT" ]] && ENABLE_MQTT_BROKER="$CLI_ENABLE_MQTT"
+[[ -n "$CLI_ENABLE_NFS" ]] && ENABLE_NFS_SERVER="$CLI_ENABLE_NFS"
+
 NVME_NFS_EXPORT="${NVME_NFS_EXPORT:-${MOUNT_POINT}/nfs_vault}"
 
 export DEBIAN_FRONTEND=noninteractive
 APT_FLAGS=(-y -o DPkg::Lock::Timeout=120 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
-# --- Logging Helpers ---
 log_step() { printf "\n\033[1;36m=== [%s] %s ===\033[0m\n" "$(date +%H:%M:%S)" "$1"; }
 log_ok()   { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip() { printf "\033[1;33m[SKIP]\033[0m %s (already configured)\n" "$1"; }
@@ -160,20 +206,18 @@ log_warn() { printf "\033[1;31m[WARN]\033[0m %s\n" "$1"; }
 # ==============================================================================
 log_step "0. Pregame: Hostname (${TARGET_HOSTNAME}), Power States, Headless Strip & Sysctls"
 
-# 0.1 Idempotent Hostname Check
 CURRENT_HOSTNAME="$(hostname)"
 if [[ "$CURRENT_HOSTNAME" != "$TARGET_HOSTNAME" ]]; then
     hostnamectl set-hostname "$TARGET_HOSTNAME"
-    if ! grep -qE "[[:space:]]${TARGET_HOSTNAME}([[:space:]]\vert{}$)" /etc/hosts; then
+    if ! grep -qE "[[:space:]]${TARGET_HOSTNAME}([[:space:]]|$)" /etc/hosts; then
         sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${TARGET_HOSTNAME}/g" /etc/hosts || true
-        grep -qE "[[:space:]]${TARGET_HOSTNAME}([[:space:]]|$)" /etc/hosts \vert{}\vert{} printf "127.0.1.1\t\%s\n" "$TARGET_HOSTNAME" >> /etc/hosts
+        grep -qE "[[:space:]]${TARGET_HOSTNAME}([[:space:]]|$)" /etc/hosts || printf "127.0.1.1\t%s\n" "$TARGET_HOSTNAME" >> /etc/hosts
     fi
-    log_ok "Hostname set to ${TARGET_HOSTNAME} (was${CURRENT_HOSTNAME})"
+    log_ok "Hostname set to ${TARGET_HOSTNAME} (was ${CURRENT_HOSTNAME})"
 else
     log_skip "Hostname is already ${TARGET_HOSTNAME}"
 fi
 
-# 0.2 Idempotent Sleep/Suspend Masking (Prevents EIC7700X SoC hangs)
 SLEEP_TARGETS=(sleep.target suspend.target hibernate.target hybrid-sleep.target)
 NEED_MASK="false"
 for tgt in "${SLEEP_TARGETS[@]}"; do
@@ -190,7 +234,6 @@ else
     log_skip "Sleep/suspend targets already masked"
 fi
 
-# 0.3 Set Default Boot Target to Headless Console
 if [[ "$(systemctl get-default)" != "multi-user.target" ]]; then
     systemctl set-default multi-user.target
     log_ok "Boot target set to headless multi-user.target"
@@ -198,7 +241,6 @@ else
     log_skip "Boot target is already multi-user.target"
 fi
 
-# 0.4 Idempotent Snap & Desktop GUI Bloat Purge
 if command -v snap >/dev/null 2>&1 || dpkg -l snapd 2>/dev/null | grep -q "^ii"; then
     for s in firefox snap-store gnome-42-2204 gtk-common-themes core22 bare snapd; do
         snap remove --purge "$s" 2>/dev/null || true
@@ -231,7 +273,6 @@ else
     log_skip "Desktop GUI & telemetry bloat already purged"
 fi
 
-# 0.5 Install Core Packages, Perf Tools & SiFive P550 PWM Fan Controller
 CORE_PKGS=(
     fancontrol-config-p550-premier
     mdadm lvm2 xfsprogs btrfs-progs parted smartmontools nvme-cli hdparm
@@ -255,7 +296,6 @@ else
     log_skip "All core P550 & storage packages already installed"
 fi
 
-# Validate RAID_ARRAYS_JSON syntax via jq
 if ! jq -e 'type == "array"' >/dev/null 2>&1 <<< "$RAID_ARRAYS_JSON"; then
     log_warn "RAID_ARRAYS_JSON is not a valid JSON array! Check your configuration."
     exit 1
@@ -266,13 +306,11 @@ if [[ "$WITH_RAID" == "true" && "$RAID_ARRAY_COUNT" -eq 0 ]]; then
     WITH_RAID="false"
 fi
 
-# Ensure postgres group exists early for hugetlb_shm_group sysctl
 if ! getent group postgres >/dev/null; then
     groupadd -r -g 26 postgres || groupadd -r postgres
 fi
 PG_GID="$(getent group postgres | cut -d: -f3)"
 
-# 0.6 Idempotent Sysctl Configuration (PMU Counters, 2MB Sv39 HugePages & Writeback)
 SYSCTL_FILE="/etc/sysctl.d/90-brakerbox-broker.conf"
 SYSCTL_CONTENT="# Allow non-root perf sampling of P550 L1/PL2/CCACHE hardware counters
 kernel.perf_event_paranoid = -1
@@ -292,7 +330,7 @@ vm.dirty_bytes = 536870912
 # Disable NMI watchdog interrupts if supported by kernel architecture
 -kernel.nmi_watchdog = 0"
 
-if [[ ! -f "$SYSCTL_FILE" ]] \vert{}\vert{} [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
+if [[ ! -f "$SYSCTL_FILE" ]] || [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
     echo "$SYSCTL_CONTENT" > "$SYSCTL_FILE"
     sysctl --system >/dev/null
     log_ok "Applied P550 PMU, 2MB HugePages & broker sysctl parameters ($SYSCTL_FILE)"
@@ -334,10 +372,10 @@ if [[ "$FORCE_WIPE_NVME" == "true" ]]; then
 fi
 
 if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE_NVME" == "false" ]]; then
-    log_skip "Existing filesystem labeled '$FS_LABEL' found on $EXISTING_FS_DEV (Logical sector size:${CURRENT_LBA_SIZE}B)"
+    log_skip "Existing filesystem labeled '$FS_LABEL' found on $EXISTING_FS_DEV (Logical sector size: ${CURRENT_LBA_SIZE}B)"
 else
     if [[ "$CURRENT_LBA_SIZE" == "$NVME_TARGET_LBA_BYTES" && "$FORCE_WIPE_NVME" == "false" ]]; then
-        log_skip "$NVME_DEV is already formatted to native${NVME_TARGET_LBA_BYTES}-byte (4Kn) sectors"
+        log_skip "$NVME_DEV is already formatted to native ${NVME_TARGET_LBA_BYTES}-byte (4Kn) sectors"
     else
         if lsblk -no MOUNTPOINT "$NVME_DEV" | grep -q "/"; then
             log_warn "$NVME_DEV has active mounts! Unmount before formatting."
@@ -346,15 +384,15 @@ else
 
         LBA_4K_INDEX="$(nvme id-ns "$NVME_DEV" | awk '/^lbaf.*lbads:12/ {print $2}' | tr -d ':' | head -n1)"
         if [[ -n "$LBA_4K_INDEX" ]]; then
-            echo "Formatting $NVME_DEV to 4096B native sectors (LBA Format Index:$LBA_4K_INDEX, SES=1)..."
+            echo "Formatting $NVME_DEV to 4096B native sectors (LBA Format Index: $LBA_4K_INDEX, SES=1)..."
             nvme format "$NVME_DEV" -l "$LBA_4K_INDEX" -s 1 --force || nvme format "$NVME_DEV" -l "$LBA_4K_INDEX" --force
             partprobe "$NVME_DEV" || true
             udevadm settle
             sleep 2
             NEW_LBA_SIZE="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
-            log_ok "$NVME_DEV hardware formatted to${NEW_LBA_SIZE}-byte native 4Kn sectors"
+            log_ok "$NVME_DEV hardware formatted to ${NEW_LBA_SIZE}-byte native 4Kn sectors"
         else
-            log_warn "Could not auto-detect 4K LBA index on $NVME_DEV; keeping${CURRENT_LBA_SIZE}B sectors"
+            log_warn "Could not auto-detect 4K LBA index on $NVME_DEV; keeping ${CURRENT_LBA_SIZE}B sectors"
         fi
     fi
 fi
@@ -397,12 +435,12 @@ else
     SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
     mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
     udevadm settle
-    log_ok "Formatted $TARGET_BLOCK_DEV as XFS (label: $FS_LABEL, sector:${SECTOR_SZ}B)"
+    log_ok "Formatted $TARGET_BLOCK_DEV as XFS (label: $FS_LABEL, sector: ${SECTOR_SZ}B)"
 fi
 
 mkdir -p "$MOUNT_POINT"
 
-FSTAB_ENTRY="LABEL=${FS_LABEL}${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
+FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
 if ! grep -q "LABEL=${FS_LABEL}" /etc/fstab && ! grep -q "[[:space:]]${MOUNT_POINT}[[:space:]]" /etc/fstab; then
     echo "$FSTAB_ENTRY" >> /etc/fstab
     systemctl daemon-reload
@@ -420,7 +458,6 @@ fi
 
 # ==============================================================================
 # STAGE 3B: Dynamic USB RAID 10 Provisioning (Driven by RAID_ARRAYS_JSON)
-# Runs only when WITH_RAID="true" and RAID_ARRAYS_JSON has >= 1 array defined
 # ==============================================================================
 HAS_MD_MOD="false"
 if modprobe md_mod 2>/dev/null || [[ -d /sys/module/md_mod ]]; then
@@ -736,7 +773,6 @@ PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
 
 rm -f "${CONF_DIR}/99-brackerbox-p550.conf"
 
-# 5.1 Idempotent Data Directory Migration
 if [[ -f "${NVME_PG_DATA}/PG_VERSION" && "$FORCE_WIPE_NVME" == "false" && "$FORCE_REBUILD_PG" == "false" ]]; then
     log_skip "PostgreSQL cluster already initialized on NVMe at ${NVME_PG_DATA}"
 else
@@ -752,7 +788,6 @@ else
     log_ok "Synced clean cluster from $DEFAULT_PG_DATA to $NVME_PG_DATA"
 fi
 
-# 5.2 Auto-verify io_uring support in PostgreSQL binary & kernel
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin/postgres"
 IO_METHOD="worker"
 if [[ -x "$PG_BIN" ]] && ldd "$PG_BIN" | grep -q "liburing"; then
@@ -762,7 +797,6 @@ if [[ -x "$PG_BIN" ]] && ldd "$PG_BIN" | grep -q "liburing"; then
 fi
 log_ok "Selected PostgreSQL 18 Async I/O method: io_method = ${IO_METHOD}"
 
-# 5.3 Idempotent Drop-In Tuning File & Lab Subnet pg_hba.conf Rule
 mkdir -p "$CONF_DIR"
 DESIRED_PG_CONF="# DREW-V Labs: SiFive HiFive Premier P550 (32GB LPDDR5 + WD_BLACK SN850X 4Kn)
 data_directory = '${NVME_PG_DATA}'
@@ -818,7 +852,6 @@ else
     log_skip "Lab subnet ($LAB_SUBNET) already authorized in $PG_HBA"
 fi
 
-# 5.4 Ensure Service is Running & Healthy
 if ! systemctl is-active --quiet postgresql || [[ "$NEED_PG_RESTART" == "true" ]]; then
     systemctl enable postgresql >/dev/null 2>&1 || true
     systemctl restart postgresql
@@ -827,7 +860,6 @@ else
     log_skip "PostgreSQL ${PG_VERSION} is already active and running current config"
 fi
 
-# 5.5 Dynamic Tablespace Provisioning (When WITH_RAID="true" and RAID_ARRAYS_JSON is populated)
 if [[ "$WITH_RAID" == "true" && "$RAID_ARRAY_COUNT" -gt 0 ]]; then
     while IFS= read -r arr_json; do
         arr_name="$(jq -r '.name' <<< "$arr_json")"
@@ -890,6 +922,9 @@ max_queued_messages 10000"
         log_skip "Mosquitto MQTT already configured and active on :${MQTT_PORT}"
     fi
     mosquitto_pub -h 127.0.0.1 -p "$MQTT_PORT" -t "brakerrak/${TARGET_HOSTNAME}/status" -m "ONLINE" -r || true
+elif systemctl is-active --quiet mosquitto 2>/dev/null; then
+    systemctl disable --now mosquitto 2>/dev/null || true
+    log_ok "Disabled Mosquitto MQTT broker for role=${NODE_ROLE}"
 fi
 
 NFS_EXPORT_SUMMARY="Disabled"
@@ -940,6 +975,9 @@ if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
         systemctl is-active --quiet nfs-kernel-server || systemctl restart nfs-kernel-server
         log_skip "NFSv4 exports in /etc/exports already up to date (${NFS_EXPORT_SUMMARY})"
     fi
+elif systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
+    systemctl disable --now nfs-kernel-server 2>/dev/null || true
+    log_ok "Disabled nfs-kernel-server for role=${NODE_ROLE}"
 fi
 
 # ==============================================================================
@@ -964,23 +1002,6 @@ MOUNT_POINT="${MOUNT_POINT}"
 # Optional USB/SATA RAID 10 Arrays (Default: false / empty array)
 WITH_RAID="false"
 RAID_ARRAYS_JSON='[]'
-# Example RAID_ARRAYS_JSON entry:
-# RAID_ARRAYS_JSON='[
-#   {
-#     "name": "WarmVault",
-#     "id": "warmvault",
-#     "type": "warm",
-#     "label": "WARM_VAULT",
-#     "mount": "/mnt/warm_vault",
-#     "md_dev": "/dev/md/warmvault",
-#     "disks": 4,
-#     "min_bytes": 11000000000000,
-#     "max_bytes": 13000000000000,
-#     "tablespace": "ts_warm_vault",
-#     "nfs_fsid": 10,
-#     "nfs_dirs": ["pg_backups", "ctd-vault", "models"]
-#   }
-# ]'
 
 # DataBroker Network Services (When ENABLE_NFS_SERVER=true and WITH_RAID=false, exports \${MOUNT_POINT}/nfs_vault)
 ENABLE_MQTT_BROKER="${ENABLE_MQTT_BROKER}"
@@ -1029,4 +1050,4 @@ printf "  • %-18s : %s (Port %s)\n" "Mosquitto MQTT" "$MQTT_STATE" "$MQTT_PORT
 printf "  • %-18s : %s (%s)\n" "NFSv4 Vault Server" "$NFS_STATE" "$NFS_EXPORT_SUMMARY"
 
 echo ""
-log_ok "${TARGET_HOSTNAME} PostgreSQL ${PG_VERSION} DataBroker Forge Complete!"
+log_ok "${TARGET_HOSTNAME} PostgreSQL ${PG_VERSION} (${NODE_ROLE}) Forge Complete!"

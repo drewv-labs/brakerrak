@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // Option A In-Place Day-0 Factory State Rollback (BrakerBox-P550)
-# Path: drewv-labs/brakerrak/nodes/databroker/brakerbox-p550/reset-day0.sh
-# Description: Tears down PostgreSQL 18, Mosquitto MQTT, and NFSv4 exports,
-#              resets primary NVMe to factory 512e (512-byte) LBA sectors,
-#              unmounts & wipes any RAID arrays configured in RAID_ARRAYS_JSON,
-#              and reverts eMMC OS configuration back to pre-forge Day-0 state.
-#
-# Usage:
-#   sudo ./reset-day0.sh --confirm-destroy                  # Full zero-cache rollback
-#   sudo ./reset-day0.sh --confirm-destroy --keep-pg-cache  # Fast-loop (preserves PG18 .debs)
-#   sudo ./reset-day0.sh --confirm-destroy --skip-raid-wipe # Keep RAID vaults intact
+# DREW-V Labs // Option A In-Place Day-0 Factory State Rollback (sifive-p550)
+# Path: drewv-labs/brakerrak/targets/sifive-p550/reset-day0.sh
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -23,7 +14,7 @@ fi
 REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6)"
 USER_NODE_ENV="${REAL_HOME}/.brakerrak/node.env"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 NVME_DEV="/dev/nvme0n1"
 MOUNT_POINT="/mnt/nvme_pgdata"

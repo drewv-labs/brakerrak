@@ -219,4 +219,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Ignore all local node configs and generated CTD/perf telemetry artifacts
 graphify-out/
+node.env
+*.local.env
+**/snapshots/
+brakerbox-snapshot-*.json
+brakerbench-snapshot-*.json
+pg*-forge-perf-*
+pg*-forge-meta-*
+.DS_Store

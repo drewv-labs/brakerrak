@@ -1,25 +1,19 @@
 <div align="center">
 
-# BrakerBox-P550 
+# DREW-V Labs BrakerBox-P550 
 
-*SiFive HiFive Premier P550 Data Broker*
+*Optimized SiFive HiFive Premier P550 Data Broker Build*
 
-![HiFive Premier P550](./assets/sifive-hifive-premier-p550-sn850x-server-layout.png)  
+<img src="./assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="600">
 
 </div>
-
-**Rack Location:** `BrackerRack U10; target=U04`   
-**Primary Role:** Interim Production Data Broker (`brakerbox-p550`) & 3-Wide Out-of-Order RVA20 Benchmark Target (`brakerbench-p550`)  
-**Ecosystem:** `DREW-V Labs` // `BrakerRak` & `HamStack` (`CarrierPigeons` Wrapper)
 
 ---
 
 ## 1. Architectural Overview
 
-`brakerbox-p550` is a 1U rackmount RISC-V data broker built around the **SiFive HiFive Premier P550** (`HF106-001`) Mini-DTX platform. Within the `BrakerRak` matrix, it serves two functions:
+DREW-V Labs presents this `brakerbox-p550` build as a 1U rackmount RISC-V data broker built around the **SiFive HiFive Premier P550** (`HF106-001`) Mini-DTX platform.
 
-1. **Interim Production Data Broker (`--role prod`):** Hosts **PostgreSQL 18** (`PigeonCoop` Continuous Telemetric Documentation ledger), MQTT ingestion, and tiered storage pools while `brakerbox-titan` is on backorder.
-2. **Microarchitectural Benchmark Target (`--role bench`):** Provides a **13-stage, triple-issue, Out-of-Order (OoO)** `RVA20` (`RV64GC` + `Zba`/`Zbb`) reference pipeline with 4MB of coherent L3 cache to benchmark against the 8-stage, dual-issue **In-Order** `SiFive U74` (`brakerbench-vf2`) and 4-wide OoO architectures.
 
 ---
 
@@ -36,7 +30,7 @@
 | **PCIe Riser Assembly** | StarTech `PEX4M2E1` + Folded Twin-Axial PCIe x4 Ribbon Riser | Anchored to chassis floor via ATX standoff + elastomer isolation bumpers |
 | **Tier 1 (Warm Vault)** | `BigRed-WDR48` (`U08`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (`mdadm` RAID 10, `/mnt/bigred_wdr48`) |
 | **Tier 2 (Cold Archive)** | `LilBlu-WDB24` (`U09`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (`mdadm` RAID 10, `/mnt/lilblu_wdb24`) |
-| **Chassis & Power** | SilverStone `SST-RM100` (1U) + PicoPSU / Internal 12V Brick | 40mm chassis fans disconnected; SOM active cooler idles at ~27°C (ΔT ≈ 7°C) |
+| **Chassis & Power** | SilverStone `SST-RM100` (1U) + PicoPSU / Internal 12V Brick | 40mm chassis fans controlled via Noctua NA-FC1; SOM active cooler idles at ~29°C @20°C ambient (ΔT ≈ 9°C) |
 
 ### USB Root Hub Topology Note
 All external USB 3.2 Gen 1 ports on the HF106 carrier board sit behind a single **Synopsys DesignWare USB 3.0 Root Hub (`5000M` / ~450 MB/s shared bandwidth)**. High-concurrency transactional workloads (`PGDATA` and WAL) are strictly pinned to the PCIe Gen3 x4 `WD_BLACK SN850X` (`nvme0n1`), while `BigRed-WDR48` and `LilBlu-WDB24` serve warm/cold tablespaces and bulk archives over the rear teal USB 3.2 Gen 1 ports.
@@ -59,54 +53,23 @@ Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sec
 
 ---
 
-## 4. Directory Structure
+## 4. Installation  
 
-```text
-brakerrak/nodes/databrokers/brakerbox-p550/
-├── README.md          # Node architecture, hardware topology, and convergence runbook
-├── forge.sh           # Idempotent bare-metal provisioning & PostgreSQL 18 forge script
-├── ort-snapshot.py    # Read-only Day-0/Day-1 ORT assertion & CTD JSON manifest generator
-└── snapshots/         # Signed JSON provenance baselines (pre-forge & post-forge)
-```
+*See [BrakerRak README](https://github.com/drewv-labs/brakerrak/README.md) for full instructions.*  
 
----
+Cheatsheet
+~~~bash
+# For BrakerBench-P550 Test Bench (NVMe-only)
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash
 
-## 5. Deployment, ORT & Convergence Runbook
+# Full BrakerBox-P550 build (PG18 + Mosquitto MQTT + NFSv4)
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker
+~~~
 
-### Stage 0: Day-0 Pre-Forge Operational Readiness Test (ORT) & Clean-Room Snapshot
-Before modifying packages or block devices on a newly imaged node, execute `ort-snapshot.py` (100% Python 3 stdlib, zero package installs) to verify L1/L2 hardware seating (`PCIe 8.0 GT/s x4`, `5000M` USB SuperSpeed, thermal floor) and generate a `SHA-256` signed Clean-Room baseline artifact:
-
-```bash
-sudo -v && ./ort-snapshot.py --stage day0-pre-forge
-```
-
-### Stage 1: Cold Convergence Forge (`forge.sh`)
-Run the idempotent forge script to strip desktop/snap bloat, configure `sysctl` PMU access (`kernel.perf_event_paranoid = -1`), format `nvme0n1` to `4Kn`, assemble the `mdadm` RAID 10 arrays, and deploy PostgreSQL 18:
-
-```bash
-# Standard Interim Production Build (NVMe + PG18 + BigRed & LilBlu RAID 10)
-sudo ./forge.sh --role prod --with-raid
-
-# NVMe + PG18 Only (Skip USB RAID 10 arrays)
-sudo ./forge.sh --role prod
-
-# Benchmark Role Designation (Sets hostname to brakerbench-p550)
-sudo ./forge.sh --role bench
-```
-
-### Stage 2: Idempotency Validation Pass
-Immediately re-run `./forge.sh` after initial convergence. Every stage must output `[SKIP] (already configured)` with zero service restarts, zero duplicate `/etc/fstab` entries, and exit code `0`:
-
-```bash
-sudo ./forge.sh --role prod --with-raid
-```
-
-### Stage 3: Day-1 Post-Forge CTD Provenance Snapshot
-Capture the converged system state (recording the package delta, active `4096B` LBA sector size, mounted XFS volumes, and live PostgreSQL `SHOW` parameters):
-
-```bash
-sudo -v && ./ort-snapshot.py --stage day1-post-forge
-```
+Then edit `~/.brakerrak/node.env` to setup custom config and rerun to provision and validate the build...  
+~~~bash
+sudo brakerrak verify --role databroker --use-pkg-cache
+~~~
 
 
 ---

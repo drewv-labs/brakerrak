@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 DREW-V Labs // Operational Readiness Test (ORT) & CTD Provenance Snapshot
-Path: drewv-labs/brakerrak/nodes/databroker/brakerbox-p550/ort-snapshot.py
+Path: drewv-labs/brakerrak/targets/sifive-p550/ort-snapshot.py
 Strictly Read-Only System Inspector & Quiescent Baseline Profiler.
 
-Emits:
+Emits (to ~/.brakerrak/snapshots by default):
   1. Unredacted CTD Snapshot : brakerbox-snapshot-<stage>-<ts>-<epoch>.json
   2. Redacted Public Snapshot: brakerbox-snapshot-<stage>-<ts>-<epoch>.public.json
 """
@@ -27,14 +27,12 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-# ANSI Colors for Console ORT Summary
 C_CYAN = "\033[1;36m"
 C_GREEN = "\033[1;32m"
 C_YELLOW = "\033[1;33m"
 C_RED = "\033[1;31m"
 C_RESET = "\033[0m"
 
-# Hardware-agnostic default: empty list unless populated via ~/.brakerrak/node.env
 DEFAULT_RAID_ARRAYS: list[dict[str, Any]] = []
 
 
@@ -51,7 +49,6 @@ def resolve_real_user_home() -> str:
 
 
 def load_node_env(config_path: str | None = None) -> dict[str, str]:
-    """Parses bash-style KEY=VALUE and multiline JSON strings from node.env."""
     candidates: list[str] = []
     if config_path:
         candidates.append(config_path)
@@ -98,7 +95,7 @@ def run_cmd(cmd: list[str], use_sudo: bool = False) -> str:
     if use_sudo and os.geteuid() != 0:
         cmd = ["sudo", "-n"] + cmd
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
         return res.stdout.strip()
     except Exception as e:
         return f"ERROR: {e}"
@@ -113,7 +110,6 @@ def read_sysfs(path: str) -> str | None:
 
 
 def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.5) -> dict[str, Any]:
-    """Samples clocks, thermals, fan RPM, loadavg, and memory over a time window."""
     samples = max(1, int(duration_sec / interval_sec))
     cpu_freqs: dict[str, list[float]] = {}
     thermals: dict[str, list[float]] = {}
@@ -183,7 +179,6 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
 
 
 def inspect_postgres_state() -> dict[str, Any]:
-    """Read-only check of PostgreSQL state and custom tablespaces."""
     psql_ver = run_cmd(["psql", "--version"])
     service_active = run_cmd(["systemctl", "is-active", "postgresql"]) == "active"
     pg_settings: dict[str, str] = {}
@@ -221,7 +216,6 @@ def inspect_postgres_state() -> dict[str, Any]:
 
 
 def inspect_databroker_services(env_map: dict[str, str]) -> dict[str, Any]:
-    """Read-only check of Mosquitto MQTT broker and NFSv4 server state."""
     mqtt_active = run_cmd(["systemctl", "is-active", "mosquitto"]) == "active"
     mqtt_port = int(env_map.get("MQTT_PORT", "1883"))
     nfs_active = run_cmd(["systemctl", "is-active", "nfs-kernel-server"]) == "active"
@@ -244,7 +238,6 @@ def inspect_databroker_services(env_map: dict[str, str]) -> dict[str, Any]:
 
 
 def redact_block_tree(devices: list[dict[str, Any]]) -> None:
-    """Recursively redacts serial numbers and UUIDs across block devices and child partitions."""
     for dev in devices:
         if dev.get("serial") is not None:
             dev["serial"] = "REDACTED"
@@ -256,7 +249,6 @@ def redact_block_tree(devices: list[dict[str, Any]]) -> None:
 
 
 def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up: bool) -> dict[str, Any]:
-    """Constructs a GitHub-safe redacted copy of the CTD snapshot payload."""
     pub = copy.deepcopy(raw_payload)
     pub.pop("provenance_signature", None)
 
@@ -299,19 +291,6 @@ def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up:
     return pub
 
 
-def ensure_snapshots_gitignore(out_dir: str) -> None:
-    """Ensures snapshots/.gitignore protects raw JSON files while allowing *.public.json."""
-    if os.path.basename(os.path.abspath(out_dir)) == "snapshots":
-        gitignore_path = os.path.join(out_dir, ".gitignore")
-        if not os.path.exists(gitignore_path):
-            with open(gitignore_path, "w", encoding="utf-8") as f:
-                f.write(
-                    "# Ignore unredacted CTD snapshots containing hardware serials and network topology\n"
-                    "brakerbox-snapshot-*.json\n"
-                    "!brakerbox-snapshot-*.public.json\n"
-                )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="DREW-V Labs Read-Only ORT & CTD Snapshot Generator")
     parser.add_argument(
@@ -321,8 +300,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--out-dir",
-        default="/home/drew" if os.path.isdir("/home/drew") else os.path.expanduser("~"),
-        help="Directory to write the output JSON snapshot",
+        default=os.path.join(resolve_real_user_home(), ".brakerrak", "snapshots"),
+        help="Directory to write the output JSON snapshot (default: ~/.brakerrak/snapshots)",
     )
     parser.add_argument(
         "--config",
@@ -352,7 +331,6 @@ def main() -> None:
 
     safe_stage = re.sub(r"[^a-zA-Z0-9_-]", "-", args.stage)
     os.makedirs(args.out_dir, exist_ok=True)
-    ensure_snapshots_gitignore(args.out_dir)
 
     base_stem = f"brakerbox-snapshot-{safe_stage}-{iso_compact}-{epoch_sec}"
     out_file = os.path.join(args.out_dir, f"{base_stem}.json")
@@ -368,7 +346,6 @@ def main() -> None:
     print(f"\n[*] Running {args.window:.1f}-second Quiescent Baseline Profiling (@ 2Hz)...")
     quiescent = sample_quiescent_metrics(args.window, 0.5)
 
-    # --- Silicon & Cache Topology ---
     cpuinfo_raw = read_sysfs("/proc/cpuinfo") or ""
     harts: list[dict[str, str]] = []
     current_hart: dict[str, str] = {}
@@ -396,7 +373,6 @@ def main() -> None:
             "shared_cpu_list": read_sysfs(f"{cdir}/shared_cpu_list"),
         })
 
-    # --- PCIe & NVMe Inspection ---
     nvme_dev = node_env.get("NVME_DEV", "/dev/nvme0n1")
     nvme_short = os.path.basename(nvme_dev)
     nvme_ctrl = re.sub(r"n[0-9]+$", "", nvme_short)
@@ -415,7 +391,6 @@ def main() -> None:
         "size_bytes": int(read_sysfs(f"/sys/block/{nvme_short}/size") or 0) * 512 if nvme_present else 0,
     }
 
-    # --- Block Devices & Dynamic USB RAID Enclosure Discovery ---
     lsblk_raw = run_cmd([
         "lsblk", "-J", "-b", "-o",
         "NAME,PATH,SIZE,TYPE,TRAN,VENDOR,MODEL,SERIAL,REV,LOG-SEC,PHY-SEC,FSTYPE,LABEL,PARTLABEL,UUID,MOUNTPOINT"
@@ -483,7 +458,6 @@ def main() -> None:
             "status": "PASS" if usb_superspeed_5000m else "WARN",
         })
 
-    # --- Network State ---
     ip_addr_raw = run_cmd(["ip", "-j", "addr", "show"])
     ip_route_raw = run_cmd(["ip", "-j", "route", "show"])
     try:
@@ -497,7 +471,6 @@ def main() -> None:
 
     end0_up = any(i.get("ifname") == "end0" and i.get("operstate") == "UP" for i in net_ifaces)
 
-    # --- Kernel Ring Buffer Bus Error Scan ---
     dmesg_raw = run_cmd(["dmesg"], use_sudo=True)
     bus_errors = []
     if not dmesg_raw.startswith("ERROR:"):
@@ -505,7 +478,6 @@ def main() -> None:
             if re.search(r"(pcieport.*error|AER|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
                 bus_errors.append(line)
 
-    # --- Users, Groups & Sudoers ---
     human_users = []
     system_users_count = 0
     for u in pwd.getpwall():
@@ -524,7 +496,6 @@ def main() -> None:
         else:
             system_users_count += 1
 
-    # --- Running Processes (Top 35 by RSS Memory + Summary) ---
     ps_raw = run_cmd(["ps", "-eo", "pid,ppid,user,stat,pcpu,pmem,rss,comm,args", "--sort=-rss"])
     ps_lines = ps_raw.splitlines()
     top_processes = []
@@ -543,7 +514,6 @@ def main() -> None:
                 "args": parts[8],
             })
 
-    # --- Full APT / DPKG Package Manifest ---
     dpkg_raw = run_cmd(["dpkg-query", "-W", "-f=${Package}\t${Version}\t${Architecture}\t${Status}\n"])
     packages = []
     for line in dpkg_raw.splitlines():
@@ -556,7 +526,6 @@ def main() -> None:
             })
     pkg_hash = hashlib.sha256(dpkg_raw.encode("utf-8")).hexdigest()
 
-    # --- Key Toolchain, Storage & Database State ---
     postgres_state = inspect_postgres_state()
     broker_services_state = inspect_databroker_services(node_env)
     toolchains = {
@@ -573,7 +542,6 @@ def main() -> None:
         "mdadm": (run_cmd(["mdadm", "--version"]).splitlines() or ["not_installed"])[0],
     }
 
-    # --- Automated Operational Readiness Test (ORT) Assertions ---
     next_ort_idx = 4 + len(raid_ort_checks)
     ort_checks = [
         {
@@ -621,13 +589,12 @@ def main() -> None:
         },
     ]
 
-    # --- Construct CarrierPigeons / HamStack CTD Artifact Envelope ---
     snapshot_payload: dict[str, Any] = {
         "schema_version": "drewv-ctd-manifest/v1.1",
         "artifact": {
             "id": socket.gethostname(),
-            "node_group": "brakerrak-databrokers",
-            "target_designation": "brakerbox-p550 (interim prod) / brakerbench-p550",
+            "node_group": "brakerrak-nodes",
+            "target_designation": "sifive-p550 (databroker / databench)",
             "kind": "hardware_node_baseline_snapshot",
             "stage": args.stage,
             "captured_at_utc": iso_full,
@@ -707,7 +674,6 @@ def main() -> None:
         },
     }
 
-    # Compute Canonical SHA-256 Signature of the Unredacted Snapshot
     canonical_bytes = json.dumps(snapshot_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     manifest_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
     snapshot_payload["provenance_signature"] = {
@@ -718,7 +684,6 @@ def main() -> None:
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(snapshot_payload, f, indent=2)
 
-    # Build and Write Redacted Public Snapshot
     public_sha256 = None
     if not args.no_public:
         public_payload = build_public_snapshot(snapshot_payload, manifest_sha256, end0_up)
@@ -726,7 +691,6 @@ def main() -> None:
         with open(public_out_file, "w", encoding="utf-8") as f:
             json.dump(public_payload, f, indent=2)
 
-    # Print Console ORT Report
     print(f"\n{C_CYAN}--- Operational Readiness Test (ORT) Assertions ---{C_RESET}")
     for chk in ort_checks:
         st = chk["status"]
