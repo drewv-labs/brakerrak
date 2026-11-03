@@ -475,7 +475,7 @@ def main() -> None:
     bus_errors = []
     if not dmesg_raw.startswith("ERROR:"):
         for line in dmesg_raw.splitlines():
-            if re.search(r"(pcieport.*error|AER|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
+            if re.search(r"(pcieport.*error|AER:.*error|AER:.*Corrected|AER:.*Uncorrected|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
                 bus_errors.append(line)
 
     human_users = []
