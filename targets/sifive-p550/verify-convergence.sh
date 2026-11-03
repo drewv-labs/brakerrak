@@ -43,4 +43,3 @@ chown -R "${REAL_USER}:${REAL_USER}" "$SNAP_DIR" 2>/dev/null || true
 
 echo ""
 echo ">>> [PASS] Full SiFive P550 Convergence & Idempotency Lifecycle Verified!"
-EOF_VERIFY
