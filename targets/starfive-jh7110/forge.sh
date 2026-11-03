@@ -274,7 +274,7 @@ else
 fi
 
 CORE_PKGS=(
-    
+
     mdadm lvm2 xfsprogs btrfs-progs parted smartmontools nvme-cli hdparm
     linux-perf parted sysstat iotop htop bc rsync time
     jq curl ca-certificates gnupg lsb-release git build-essential
@@ -332,7 +332,7 @@ vm.dirty_bytes = 536870912
 if [[ ! -f "$SYSCTL_FILE" ]] || [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
     echo "$SYSCTL_CONTENT" > "$SYSCTL_FILE"
     sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
-    log_ok "Applied JH7110 PMU, 2MB HugePages & broker sysctl parameters ($SYSCTL_FILE)"
+    log_ok "Applied JH7110 PMU, 2MB HugePages & broker sysctl parameters \($SYSCTL_FILE\)"
 else
     log_skip "Sysctl parameters in $SYSCTL_FILE already up to date"
 fi
