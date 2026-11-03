@@ -328,11 +328,10 @@ vm.dirty_bytes = 536870912
 -kernel.sched_autogroup_enabled = 0
 
 # Disable NMI watchdog interrupts if supported by kernel architecture
--kernel.nmi_watchdog = 0"
 
 if [[ ! -f "$SYSCTL_FILE" ]] || [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
     echo "$SYSCTL_CONTENT" > "$SYSCTL_FILE"
-    sysctl --system >/dev/null
+    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || true
     log_ok "Applied P550 PMU, 2MB HugePages & broker sysctl parameters ($SYSCTL_FILE)"
 else
     log_skip "Sysctl parameters in $SYSCTL_FILE already up to date"
@@ -368,7 +367,9 @@ if [[ "$FORCE_WIPE_NVME" == "true" ]]; then
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
     fi
     pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
-    wipefs -a "$NVME_DEV"
+    for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
 fi
 
 if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE_NVME" == "false" ]]; then
@@ -414,7 +415,9 @@ else
     if [[ "$USE_LVM" == "true" ]]; then
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
-        wipefs -a "$NVME_DEV"
+        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
 
         pvcreate --dataalignment 4m -f -y "$NVME_DEV"
         vgcreate -s 4m "$VG_NAME" "$NVME_DEV"
@@ -422,7 +425,9 @@ else
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
         log_ok "Created LVM Logical Volume $TARGET_BLOCK_DEV (${LV_PCT} with snapshot reserve)"
     else
-        wipefs -a "$NVME_DEV"
+        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
         parted -s "$NVME_DEV" mklabel gpt
         parted -s -a optimal "$NVME_DEV" mkpart primary xfs 1MiB 100%
         partprobe "$NVME_DEV" || true
@@ -609,7 +614,10 @@ log_step "4. Forging PostgreSQL ${PG_VERSION} (PGDG riscv64 + ${ISA_MARCH} + per
 PGDG_KEY="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
 PGDG_LIST="/etc/apt/sources.list.d/pgdg.list"
 LOCAL_LIST="/etc/apt/sources.list.d/drewv-local-pgdg.list"
-CODENAME="$(lsb_release -cs)"
+CODENAME="$(lsb_release -cs 2>/dev/null || echo sid)"
+case "$CODENAME" in
+    forky|trixie|bookworm|n/a|"") CODENAME="sid" ;;
+esac
 LOCAL_REPO_DIR="/opt/drewv-pgdg-riscv64/debs"
 NVME_CACHE_DIR="${MOUNT_POINT}/.pkg-cache/pgdg-riscv64"
 BUILD_DIR="/opt/drewv-pgdg-riscv64/build"
