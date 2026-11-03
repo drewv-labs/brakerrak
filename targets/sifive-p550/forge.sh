@@ -899,26 +899,39 @@ if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
         apt-get install "${APT_FLAGS[@]}" mosquitto mosquitto-clients
     fi
 
-    MQTT_DATA_DIR="${MOUNT_POINT}/mosquitto"
-    install -d -m 0750 -o mosquitto -g mosquitto "$MQTT_DATA_DIR"
-
     MQTT_CONF="/etc/mosquitto/conf.d/brakerrak.conf"
     DESIRED_MQTT_CONF="# DREW-V Labs // BrakerRak Telemetry Broker Configuration
-listener ${MQTT_PORT} 0.0.0.0
+
+# BrakerRak CTD Telemetry Broker Profile (Ubuntu 24.04 / Mosquitto 2.0.18)
+per_listener_settings false
 allow_anonymous true
-persistence true
-persistence_location ${MQTT_DATA_DIR}/
-log_dest syslog
+
+# Edge Node TCP Ingress
+listener ${MQTT_PORT} 0.0.0.0
+max_connections -1
+
+# Local PigeonCoop Zero-TCP IPC Socket (Port 0 + Path = AF_UNIX)
+listener 0 /run/mosquitto/mosquitto.sock
+
+# High-Throughput Queue & NVMe Wear Mitigation
+autosave_interval 1800
 max_inflight_messages 100
 max_queued_messages 10000"
 
     if [[ ! -f "$MQTT_CONF" ]] || [[ "$(cat "$MQTT_CONF")" != "$DESIRED_MQTT_CONF" ]]; then
         echo "$DESIRED_MQTT_CONF" > "$MQTT_CONF"
+        [[ -n "${ADMIN_USER:-}" ]] && usermod -aG mosquitto "$ADMIN_USER" || true
         systemctl enable mosquitto >/dev/null 2>&1 || true
+        systemctl reset-failed mosquitto >/dev/null 2>&1 || true
         systemctl restart mosquitto
-        log_ok "Configured & started Mosquitto MQTT on :${MQTT_PORT} (${MQTT_DATA_DIR})"
+        chmod 0750 /run/mosquitto 2>/dev/null || true
+        log_ok "Configured & started Mosquitto MQTT on :${MQTT_PORT} + /run/mosquitto/mosquitto.sock"
     else
-        systemctl is-active --quiet mosquitto || systemctl restart mosquitto
+        if ! systemctl is-active --quiet mosquitto; then
+            systemctl reset-failed mosquitto >/dev/null 2>&1 || true
+            systemctl restart mosquitto
+        fi
+        chmod 0750 /run/mosquitto 2>/dev/null || true
         log_skip "Mosquitto MQTT already configured and active on :${MQTT_PORT}"
     fi
     mosquitto_pub -h 127.0.0.1 -p "$MQTT_PORT" -t "brakerrak/${TARGET_HOSTNAME}/status" -m "ONLINE" -r || true
