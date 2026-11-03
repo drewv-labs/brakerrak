@@ -13,8 +13,10 @@
 
 Rather than coupling provisioning logic to hardcoded hostnames or fixed disk topologies, `BrakerRak` operates as a **Two-Axis State Machine (`Targets` × `Roles`)** paired with [RVDK (riscv-data-kit)](https://github.com/drewv-labs/riscv-data-kit) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons):
 
-* **Native Silicon & Storage Alignment:** Hardware-formats NVMe namespaces to native **`4096B` (`4Kn`)** LBA sectors, provisions LVM (`85%VG` with instant rollback snapshot reserve) + XFS, pins **`2MB` `Sv39` HugePages**, and compiles **PostgreSQL 18.6** from source (`-O3` with silicon-specific ISA extensions and `liburing`).
-* **Declarative Role Personas (`databroker` vs. `databench`):** Toggles any supported RISC-V board between a full **`BrakerBox` (`databroker`)** relational/messaging/NFS hub and an isolated **`BrakerBench` (`databench`)** microarchitectural testbed via `~/.brakerrak/node.env` or `--role`.
+* **Native Silicon & Storage Alignment:** Hardware-formats NVMe namespaces to native **`4096B` (`4Kn`)** LBA sectors, provisions LVM (`85%VG` with instant rollback snapshot reserve) + XFS, pins **`2MB` `Sv39` HugePages**, and compiles **PostgreSQL 18.6** from source (`-O3` with silicon-specific ISA extensions and `liburing`). You read that right, PostgreSQL running `io_uring` tapping into the latest Linux concurrency features on bare-metal RISC-V silicon.  
+
+* **Declarative Role Personas (`databroker` vs. `databench`):** Toggles any supported RISC-V board between a full **`BrakerBox` (`databroker`)** relational/messaging/NFS hub and an isolated **`BrakerBench` (`databench`)** microarchitectural testbed via `~/.brakerrak/node.env` or `--role`.  
+
 * **Stateless & Agnostic by Default:** Runs out-of-the-box on single-NVMe boards (`WITH_RAID="false"`), while supporting arbitrary multi-enclosure USB/SATA RAID 10 topologies (`mdadm` XFS or native kernel Btrfs RAID 10 `zstd:1`) defined via an iterable `RAID_ARRAYS_JSON` manifest in `~/.brakerrak/node.env`.
 
 ---
