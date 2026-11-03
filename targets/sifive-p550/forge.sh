@@ -1002,7 +1002,7 @@ if [[ ! -f "$USER_NODE_ENV" ]]; then
 # ==============================================================================
 # DREW-V Labs // BrakerRak User Node Config (~/.brakerrak/node.env)
 # Generated on Pass 1. Customize values below and re-run the following for Pass 2.
-#  > sudo brakerrak verify
+#  > sudo brakerrak verify --use-pkg-cache
 # ==============================================================================
 NODE_ROLE="${NODE_ROLE}"
 TARGET_HOSTNAME="${TARGET_HOSTNAME}"
