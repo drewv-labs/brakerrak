@@ -276,7 +276,7 @@ fi
 CORE_PKGS=(
     
     mdadm lvm2 xfsprogs btrfs-progs parted smartmontools nvme-cli hdparm
-    linux-perf  sysstat iotop htop bc rsync time
+    linux-perf parted sysstat iotop htop bc rsync time
     jq curl ca-certificates gnupg lsb-release git build-essential
 )
 MISSING_PKGS=()
@@ -368,7 +368,9 @@ if [[ "$FORCE_WIPE_NVME" == "true" ]]; then
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
     fi
     pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
-    wipefs -a "$NVME_DEV"
+    for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
 fi
 
 if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE_NVME" == "false" ]]; then
@@ -414,7 +416,9 @@ else
     if [[ "$USE_LVM" == "true" ]]; then
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
-        wipefs -a "$NVME_DEV"
+        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
 
         pvcreate --dataalignment 4m -f -y "$NVME_DEV"
         vgcreate -s 4m "$VG_NAME" "$NVME_DEV"
@@ -422,7 +426,9 @@ else
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
         log_ok "Created LVM Logical Volume $TARGET_BLOCK_DEV (${LV_PCT} with snapshot reserve)"
     else
-        wipefs -a "$NVME_DEV"
+        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
+    wipefs -af "$NVME_DEV"
+    partprobe "$NVME_DEV" 2>/dev/null || true
         parted -s "$NVME_DEV" mklabel gpt
         parted -s -a optimal "$NVME_DEV" mkpart primary xfs 1MiB 100%
         partprobe "$NVME_DEV" || true
@@ -610,9 +616,9 @@ PGDG_KEY="/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc"
 PGDG_LIST="/etc/apt/sources.list.d/pgdg.list"
 LOCAL_LIST="/etc/apt/sources.list.d/drewv-local-pgdg.list"
 CODENAME="$(lsb_release -cs 2>/dev/null || echo sid)"
-if [[ "$CODENAME" == "bookworm" || "$CODENAME" == "n/a" || -z "$CODENAME" ]]; then
-    CODENAME="sid"
-fi
+case "$CODENAME" in
+    forky|trixie|bookworm|n/a|"") CODENAME="sid" ;;
+esac
 LOCAL_REPO_DIR="/opt/drewv-pgdg-riscv64/debs"
 NVME_CACHE_DIR="${MOUNT_POINT}/.pkg-cache/pgdg-riscv64"
 BUILD_DIR="/opt/drewv-pgdg-riscv64/build"
