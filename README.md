@@ -3,10 +3,7 @@
 # BrakerRak
 
 **Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML Deployment Engine**  
-PostgreSQL 18 `io_uring`  
-Isolated Silicon Testbeds  
-`4Kn` NVMe + Dynamic RAID Tiering  
-Continuous Telemetric Documentation (CTD)  
+...the Silicon is gonna Sing!
 
 </div>
 
