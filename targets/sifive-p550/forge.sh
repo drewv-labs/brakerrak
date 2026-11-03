@@ -1001,7 +1001,8 @@ if [[ ! -f "$USER_NODE_ENV" ]]; then
     cat <<EOF > "$USER_NODE_ENV"
 # ==============================================================================
 # DREW-V Labs // BrakerRak User Node Config (~/.brakerrak/node.env)
-# Generated on Pass 1. Customize values below and re-run ./forge.sh for Pass 2.
+# Generated on Pass 1. Customize values below and re-run the following for Pass 2.
+#  > sudo brakerrak verify
 # ==============================================================================
 NODE_ROLE="${NODE_ROLE}"
 TARGET_HOSTNAME="${TARGET_HOSTNAME}"
