@@ -37,6 +37,16 @@ if [[ $# -gt 0 ]]; then
             ACTION="$1"
             shift
             ;;
+        bench)
+            BENCH_SCRIPT="${FORWARD_ARGS[0]:-run_iouring_showdown.sh}"
+            BENCH_PATH="${LOCAL_ROOT}/benchmarks/${BENCH_SCRIPT}"
+            if [[ ! -f "$BENCH_PATH" ]]; then
+                echo "[FATAL] Benchmark script not found: ${BENCH_PATH}" >&2
+                exit 1
+            fi
+            echo "[BRAKERRAK] Dispatching [bench] -> ${BENCH_PATH}"
+            exec bash "$BENCH_PATH" "${FORWARD_ARGS[@]:1}"
+            ;;
     esac
 fi
 
