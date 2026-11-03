@@ -1,0 +1,142 @@
+{
+  "schema_version": "ctd.thermal.v1",
+  "campaign_id": "brakerrak-8fan-nafc1-characterization",
+  "recorded_at_utc": "2026-11-03T22:15:34Z",
+  "ambient_celsius": 21.0,
+  "cooling_topology": {
+    "controller": "Noctua NA-FC1 PWM (5-12V, 3A / 36W Max)",
+    "total_fans": 8,
+    "zones": [
+      {
+        "rack_unit": "U02",
+        "enclosure": "1U Vented Honeycomb Spacer + Shelf",
+        "fans": "5x 40x40mm PWM (Front Intake across youyeetoo fins & under-PCB cutouts)",
+        "targets": [
+          "visionferret-h8",
+          "brakerbench-vf2"
+        ]
+      },
+      {
+        "rack_unit": "U03",
+        "enclosure": "SilverStone SST-RM100 1U Rackmount Chassis",
+        "fans": "3x 40x40mm Chassis Fans + ESWIN EIC7700X Closed-Loop SOM Blower",
+        "targets": [
+          "brakerbox-p550"
+        ]
+      }
+    ]
+  },
+  "workload_profile": {
+    "engine": "python3 multiprocessing blake2b + memoryview stride",
+    "duration_sec": 600,
+    "sample_interval_sec": 10,
+    "harts_saturated": 4,
+    "memory_thrash_mb_per_hart": 32,
+    "total_working_set_mb": 128
+  },
+  "telemetry": {
+    "brakerbox-p550": {
+      "soc": "ESWIN EIC7700X (4x SiFive P550 3-Wide OoO @ 1.4GHz)",
+      "sensors": {
+        "hwmon:pvt": {
+          "quiescent_idle_min_c": 37.0,
+          "pwm_0_pct": {
+            "idle_c": 42.92,
+            "mean_c": 48.69,
+            "peak_c": 50.8,
+            "rise_over_ambient_c": 29.8
+          },
+          "pwm_50_pct": {
+            "idle_c": 44.97,
+            "mean_c": 47.62,
+            "peak_c": 48.13,
+            "rise_over_ambient_c": 27.13
+          },
+          "pwm_100_pct": {
+            "idle_c": 39.68,
+            "mean_c": 42.16,
+            "peak_c": 42.92,
+            "rise_over_ambient_c": 21.92
+          }
+        },
+        "hwmon:nvme": {
+          "device": "WD_BLACK SN850X 2TB (PCIe Gen3 x4, 4Kn)",
+          "pwm_0_pct": {
+            "idle_c": 30.85,
+            "mean_c": 32.7,
+            "peak_c": 32.85
+          },
+          "pwm_50_pct": {
+            "idle_c": 32.85,
+            "mean_c": 32.85,
+            "peak_c": 32.85
+          },
+          "pwm_100_pct": {
+            "idle_c": 32.85,
+            "mean_c": 32.85,
+            "peak_c": 32.85
+          }
+        }
+      }
+    },
+    "brakerbench-vf2": {
+      "soc": "StarFive JH7110 (4x SiFive U74 2-Wide InO @ 1.5GHz)",
+      "m2_device": "WD_BLACK SN750 2TB NVMe (PCIe Gen2 x1)",
+      "sensors": {
+        "hwmon:sfctemp": {
+          "quiescent_idle_min_c": 34.0,
+          "pwm_0_pct": {
+            "idle_c": 37.71,
+            "mean_c": 47.76,
+            "peak_c": 51.28,
+            "rise_over_ambient_c": 30.28
+          },
+          "pwm_50_pct": {
+            "idle_c": 38.06,
+            "mean_c": 44.0,
+            "peak_c": 44.38,
+            "rise_over_ambient_c": 23.38
+          },
+          "pwm_100_pct": {
+            "idle_c": 35.04,
+            "mean_c": 41.33,
+            "peak_c": 41.83,
+            "rise_over_ambient_c": 20.83
+          }
+        }
+      }
+    },
+    "visionferret-h8": {
+      "soc": "StarFive JH7110 (4x SiFive U74 2-Wide InO @ 1.5GHz)",
+      "m2_device": "Hailo-8 M.2 NPU (26 TOPS, Quiescent Deep-Idle)",
+      "sensors": {
+        "hwmon:sfctemp": {
+          "quiescent_idle_min_c": 30.0,
+          "pwm_0_pct": {
+            "idle_c": 34.17,
+            "mean_c": 43.4,
+            "peak_c": 46.58,
+            "rise_over_ambient_c": 25.58
+          },
+          "pwm_50_pct": {
+            "idle_c": 34.75,
+            "mean_c": 40.55,
+            "peak_c": 40.9,
+            "rise_over_ambient_c": 19.9
+          },
+          "pwm_100_pct": {
+            "idle_c": 30.0,
+            "mean_c": 38.0,
+            "peak_c": 38.0,
+            "rise_over_ambient_c": 17.0
+          }
+        }
+      }
+    },
+    "rakwrt-r6s": {
+      "soc": "Rockchip RK3588S (Passive Aluminum Enclosure)",
+      "quiescent_idle_c": 36.0
+    }
+  },
+  "sha256_provenance_digest": "c4e97238a4dca9a40aba1fd460ccb9eca40066f00f33301a433a66f1d6bb31f9"
+}
