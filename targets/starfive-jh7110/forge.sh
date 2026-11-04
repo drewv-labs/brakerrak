@@ -274,7 +274,7 @@ else
 fi
 
 CORE_PKGS=(
-    
+
     mdadm lvm2 xfsprogs btrfs-progs parted smartmontools nvme-cli hdparm
     linux-perf sysstat iotop htop bc rsync time
     jq curl ca-certificates gnupg lsb-release git build-essential
@@ -397,20 +397,34 @@ else
 fi
 
 # ==============================================================================
-# STAGE 3A: Partitioning / LVM & XFS Formatting on NVMe + /etc/fstab
+# STAGE 3A: Partitioning / LVM & Filesystem Formatting on NVMe + /etc/fstab
 # ==============================================================================
-log_step "3A. Provisioning NVMe Storage Volume & Mounting XFS ($MOUNT_POINT)"
+if modprobe xfs 2>/dev/null || grep -qw xfs /proc/filesystems; then
+    NVME_FSTYPE="xfs"
+else
+    NVME_FSTYPE="ext4"
+fi
+
+log_step "3A. Provisioning NVMe Storage Volume & Mounting ${NVME_FSTYPE^^} ($MOUNT_POINT)"
 
 EXISTING_FS_DEV="$(blkid -L "$FS_LABEL" || true)"
+EXISTING_FS_TYPE=""
+if [[ -n "$EXISTING_FS_DEV" ]]; then
+    EXISTING_FS_TYPE="$(blkid -s TYPE -o value "$EXISTING_FS_DEV" 2>/dev/null || true)"
+fi
 
-if [[ -n "$EXISTING_FS_DEV" && "$FORCE_WIPE_NVME" == "false" ]]; then
+if [[ -n "$EXISTING_FS_DEV" && "$EXISTING_FS_TYPE" == "$NVME_FSTYPE" && "$FORCE_WIPE_NVME" == "false" ]]; then
     TARGET_BLOCK_DEV="$EXISTING_FS_DEV"
-    log_skip "XFS volume '$FS_LABEL' already exists at $TARGET_BLOCK_DEV"
+    log_skip "${NVME_FSTYPE^^} volume '$FS_LABEL' already exists at $TARGET_BLOCK_DEV"
 else
-    log_warn "Creating fresh storage layout on $NVME_DEV..."
     umount -f "$MOUNT_POINT" 2>/dev/null || true
 
-    if [[ "$USE_LVM" == "true" ]]; then
+    if [[ -b "/dev/${VG_NAME}/${LV_NAME}" && "$FORCE_WIPE_NVME" == "false" ]]; then
+        TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
+        log_warn "Reformatting existing LVM volume $TARGET_BLOCK_DEV from '${EXISTING_FS_TYPE:-none}' to '${NVME_FSTYPE}' (kernel $(uname -r) lacks xfs.ko)..."
+        wipefs -af "$TARGET_BLOCK_DEV" >/dev/null 2>&1 || true
+    elif [[ "$USE_LVM" == "true" ]]; then
+        log_warn "Creating fresh LVM storage layout on $NVME_DEV..."
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
@@ -423,11 +437,12 @@ else
         TARGET_BLOCK_DEV="/dev/${VG_NAME}/${LV_NAME}"
         log_ok "Created LVM Logical Volume $TARGET_BLOCK_DEV (${LV_PCT} with snapshot reserve)"
     else
+        log_warn "Creating fresh GPT partition layout on $NVME_DEV..."
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
         wipefs -af "$NVME_DEV"
         partprobe "$NVME_DEV" 2>/dev/null || true
         parted -s "$NVME_DEV" mklabel gpt
-        parted -s -a optimal "$NVME_DEV" mkpart primary xfs 1MiB 100%
+        parted -s -a optimal "$NVME_DEV" mkpart primary "$NVME_FSTYPE" 1MiB 100%
         partprobe "$NVME_DEV" || true
         udevadm settle
         sleep 2
@@ -436,25 +451,36 @@ else
     fi
 
     SECTOR_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
-    mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
+    if [[ "$NVME_FSTYPE" == "xfs" ]]; then
+        mkfs.xfs -f -s "size=${SECTOR_SZ}" -b size=4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
+    else
+        mkfs.ext4 -F -b 4096 -L "$FS_LABEL" "$TARGET_BLOCK_DEV"
+    fi
     udevadm settle
-    log_ok "Formatted $TARGET_BLOCK_DEV as XFS (label: $FS_LABEL, sector: ${SECTOR_SZ}B)"
+    log_ok "Formatted $TARGET_BLOCK_DEV as ${NVME_FSTYPE^^} (label: $FS_LABEL, block/sector: ${SECTOR_SZ}B)"
 fi
 
 mkdir -p "$MOUNT_POINT"
 
-FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
-if ! grep -q "LABEL=${FS_LABEL}" /etc/fstab && ! grep -q "[[:space:]]${MOUNT_POINT}[[:space:]]" /etc/fstab; then
+if [[ "$NVME_FSTYPE" == "xfs" ]]; then
+    FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  xfs  rw,noatime,nodiratime,attr2,inode64,logbsize=256k,noquota,nofail,x-systemd.device-timeout=15s  0  2"
+else
+    FSTAB_ENTRY="LABEL=${FS_LABEL}  ${MOUNT_POINT}  ext4  rw,noatime,nodiratime,data=ordered,nofail,x-systemd.device-timeout=15s  0  2"
+fi
+
+if ! grep -qE "^LABEL=${FS_LABEL}[[:space:]]+${MOUNT_POINT}[[:space:]]+${NVME_FSTYPE}[[:space:]]" /etc/fstab; then
+    sed -i "\|LABEL=${FS_LABEL}|d" /etc/fstab 2>/dev/null || true
+    sed -i "\|[[:space:]]${MOUNT_POINT}[[:space:]]|d" /etc/fstab 2>/dev/null || true
     echo "$FSTAB_ENTRY" >> /etc/fstab
     systemctl daemon-reload
-    log_ok "Added $FS_LABEL to /etc/fstab with nofail protection"
+    log_ok "Added $FS_LABEL ($NVME_FSTYPE) to /etc/fstab with nofail protection"
 else
-    log_skip "$MOUNT_POINT already present in /etc/fstab"
+    log_skip "$MOUNT_POINT ($NVME_FSTYPE) already present in /etc/fstab"
 fi
 
 if ! mountpoint -q "$MOUNT_POINT"; then
     mount "$MOUNT_POINT"
-    log_ok "Mounted $MOUNT_POINT"
+    log_ok "Mounted $MOUNT_POINT ($NVME_FSTYPE)"
 else
     log_skip "$MOUNT_POINT is already mounted"
 fi
@@ -720,7 +746,7 @@ else
 
         PERF_BIN="$(command -v perf || true)"
         if [[ -n "$PERF_BIN" ]] && ! "$PERF_BIN" stat -e cycles true >/dev/null 2>&1; then
-            PERF_BIN="$(find /usr/lib/linux-tools-* -name perf -type f 2>/dev/null | sort -V | tail -n1 || true)"
+            PERF_BIN="$(find /usr/bin /usr/lib/linux-tools-* \( -name "perf" -o -name "perf_[0-9]*" \) -type f 2>/dev/null | grep -v "wrapper" | sort -V | tail -n1 || true)"
         fi
 
         START_EPOCH="$(date +%s.%N)"
