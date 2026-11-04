@@ -229,3 +229,5 @@ brakerbench-snapshot-*.json
 pg*-forge-perf-*
 pg*-forge-meta-*
 .DS_Store
+skills/
+GEMINI.md
