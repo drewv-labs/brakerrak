@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // SiFive HiFive Premier JH7110 Target Forge Script
+# DREW-V Labs // StarFive VisionFive 2 (JH7110) Target Forge Script
 # Path: drewv-labs/brakerrak/targets/starfive-jh7110/forge.sh
-# Architecture: RVA20 (RV64GC + Zba/Zbb) | 4x JH7110 3-Wide OoO | 32GB LPDDR5
+# Architecture: RVA20 (RV64GC + Zba/Zbb) | 4x SiFive U74 2-Wide InO | 8GB LPDDR4
 #
 # Usage:
-#   ./forge.sh                                    # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
-#   ./forge.sh --config /path/to/node.env         # Explicitly load a specific declarative config file
-#   ./forge.sh --role databroker|databench        # Select role persona (aliases: prod|bench)
-#   ./forge.sh --with-raid                        # Provision/mount arrays defined in RAID_ARRAYS_JSON
-#   ./forge.sh --with-mqtt                        # Enable Eclipse Mosquitto MQTT broker on NVMe
-#   ./forge.sh --with-nfs                         # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
-#   ./forge.sh --force-wipe-nvme                  # Destructively 4Kn format NVMe & zero-cache rebuild PG18
-#   ./forge.sh --with-raid --force-wipe-raid      # Destructively rebuild USB RAID10 arrays
-#   ./forge.sh --force-rebuild-pg                 # Force zero-cache PGDG deb-src recompile with perf stat
-#   ./forge.sh --use-pkg-cache                    # Restore/use cached JH7110 .deb packages on NVMe
+#   ./forge.sh                                     # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
+#   ./forge.sh --config /path/to/node.env          # Explicitly load a specific declarative config file
+#   ./forge.sh --role databroker|databench         # Select role persona (aliases: prod|bench)
+#   ./forge.sh --with-raid                         # Provision/mount arrays defined in RAID_ARRAYS_JSON
+#   ./forge.sh --with-mqtt                         # Enable Eclipse Mosquitto MQTT broker on NVMe
+#   ./forge.sh --with-nfs                          # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
+#   ./forge.sh --force-wipe-nvme                   # Destructively 4Kn format NVMe & zero-cache rebuild PG18
+#   ./forge.sh --with-raid --force-wipe-raid       # Destructively rebuild USB RAID10 arrays
+#   ./forge.sh --force-rebuild-pg                  # Force zero-cache PGDG deb-src recompile with perf stat
+#   ./forge.sh --use-pkg-cache                     # Restore/use cached JH7110 .deb packages on NVMe
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -59,8 +59,8 @@ ADMIN_USER="${ADMIN_USER:-${REAL_USER}}"
 LAB_SUBNET="${LAB_SUBNET:-127.0.0.1/32}"
 
 ISA_MARCH="${ISA_MARCH:-rv64gc_zba_zbb}"
-CPU_MTUNE="${CPU_MTUNE:-sifive-p550}"
-KERNEL_HUGEPAGES_2MB="${KERNEL_HUGEPAGES_2MB:-4608}"
+CPU_MTUNE="${CPU_MTUNE:-sifive-u74}"
+KERNEL_HUGEPAGES_2MB="${KERNEL_HUGEPAGES_2MB:-1152}"
 
 NVME_DEV="${NVME_DEV:-/dev/nvme0n1}"
 NVME_TARGET_LBA_BYTES="${NVME_TARGET_LBA_BYTES:-4096}"
@@ -76,10 +76,10 @@ RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 
 PG_VERSION="${PG_VERSION:-18}"
 PG_MAX_CONN="${PG_MAX_CONN:-250}"
-PG_SHARED_BUFFERS="${PG_SHARED_BUFFERS:-8GB}"
-PG_EFFECTIVE_CACHE_SIZE="${PG_EFFECTIVE_CACHE_SIZE:-24GB}"
+PG_SHARED_BUFFERS="${PG_SHARED_BUFFERS:-2GB}"
+PG_EFFECTIVE_CACHE_SIZE="${PG_EFFECTIVE_CACHE_SIZE:-6GB}"
 PG_WORK_MEM="${PG_WORK_MEM:-32MB}"
-PG_MAINT_WORK_MEM="${PG_MAINT_WORK_MEM:-2GB}"
+PG_MAINT_WORK_MEM="${PG_MAINT_WORK_MEM:-512MB}"
 PG_IO_CONCURRENCY="${PG_IO_CONCURRENCY:-200}"
 PG_MAINT_IO_CONCURRENCY="${PG_MAINT_IO_CONCURRENCY:-100}"
 PG_PREBUILT_DEB_URL="${PG_PREBUILT_DEB_URL:-}"
@@ -274,9 +274,9 @@ else
 fi
 
 CORE_PKGS=(
-
+    
     mdadm lvm2 xfsprogs btrfs-progs parted smartmontools nvme-cli hdparm
-    linux-perf parted sysstat iotop htop bc rsync time
+    linux-perf sysstat iotop htop bc rsync time
     jq curl ca-certificates gnupg lsb-release git build-essential
 )
 MISSING_PKGS=()
@@ -307,12 +307,12 @@ if [[ "$WITH_RAID" == "true" && "$RAID_ARRAY_COUNT" -eq 0 ]]; then
 fi
 
 if ! getent group postgres >/dev/null; then
-    groupadd -r -g 26 postgres || groupadd -r postgres
+    groupadd -r -g 26 postgres 2>/dev/null || groupadd -r postgres
 fi
 PG_GID="$(getent group postgres | cut -d: -f3)"
 
 SYSCTL_FILE="/etc/sysctl.d/90-brakerbox-broker.conf"
-SYSCTL_CONTENT="# Allow non-root perf sampling of JH7110 L1/PL2/CCACHE hardware counters"
+SYSCTL_CONTENT="# Allow non-root perf sampling of JH7110 L1/PL2/CCACHE hardware counters
 kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = 0
 
@@ -325,9 +325,7 @@ vm.swappiness = 1
 vm.dirty_background_bytes = 67108864
 vm.dirty_bytes = 536870912
 -kernel.sched_migration_cost_ns = 5000000
--kernel.sched_autogroup_enabled = 0
-
-# Disable NMI watchdog interrupts if supported by kernel architecture
+-kernel.sched_autogroup_enabled = 0"
 
 if [[ ! -f "$SYSCTL_FILE" ]] || [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
     echo "$SYSCTL_CONTENT" > "$SYSCTL_FILE"
@@ -416,8 +414,8 @@ else
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
-    wipefs -af "$NVME_DEV"
-    partprobe "$NVME_DEV" 2>/dev/null || true
+        wipefs -af "$NVME_DEV"
+        partprobe "$NVME_DEV" 2>/dev/null || true
 
         pvcreate --dataalignment 4m -f -y "$NVME_DEV"
         vgcreate -s 4m "$VG_NAME" "$NVME_DEV"
@@ -426,8 +424,8 @@ else
         log_ok "Created LVM Logical Volume $TARGET_BLOCK_DEV (${LV_PCT} with snapshot reserve)"
     else
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
-    wipefs -af "$NVME_DEV"
-    partprobe "$NVME_DEV" 2>/dev/null || true
+        wipefs -af "$NVME_DEV"
+        partprobe "$NVME_DEV" 2>/dev/null || true
         parted -s "$NVME_DEV" mklabel gpt
         parted -s -a optimal "$NVME_DEV" mkpart primary xfs 1MiB 100%
         partprobe "$NVME_DEV" || true
@@ -749,7 +747,7 @@ else
 {
   "hostname": "${TARGET_HOSTNAME}",
   "role": "${NODE_ROLE}",
-  "soc": "ESWIN EIC7700X (4x StarFive JH7110 (SiFive U74) @ 1.4GHz)",
+  "soc": "StarFive JH7110 (4x SiFive U74 @ 1.5GHz)",
   "isa_flags": "${JH7110_FLAGS}",
   "pg_version": "${PG_VERSION}",
   "zero_cache_build": $([[ "$USE_PKG_CACHE" == "false" ]] && echo "true" || echo "false"),
@@ -776,7 +774,7 @@ NVME_PG_ROOT="${MOUNT_POINT}/postgresql"
 NVME_PG_DATA="${NVME_PG_ROOT}/${PG_VERSION}/main"
 DEFAULT_PG_DATA="/var/lib/postgresql/${PG_VERSION}/main"
 CONF_DIR="/etc/postgresql/${PG_VERSION}/main/conf.d"
-DROPIN_CONF="${CONF_DIR}/99-brakerbox-vf2.conf"
+DROPIN_CONF="${CONF_DIR}/99-brakerbench-vf2.conf"
 PG_HBA="/etc/postgresql/${PG_VERSION}/main/pg_hba.conf"
 
 rm -f "${CONF_DIR}/99-brackerbox-p550.conf"
@@ -806,12 +804,12 @@ fi
 log_ok "Selected PostgreSQL 18 Async I/O method: io_method = ${IO_METHOD}"
 
 mkdir -p "$CONF_DIR"
-DESIRED_PG_CONF="# DREW-V Labs: SiFive HiFive Premier JH7110 (32GB LPDDR5 + WD_BLACK SN850X 4Kn)
+DESIRED_PG_CONF="# DREW-V Labs: StarFive VisionFive 2 (JH7110) (8GB LPDDR4 + WD_BLACK SN850X 4Kn)
 data_directory = '${NVME_PG_DATA}'
 listen_addresses = '*'
 max_connections = ${PG_MAX_CONN}
 
-# 32GB LPDDR5 Memory Allocation (Backed by 2MB Sv39 HugePages)
+# 8GB LPDDR4 Memory Allocation (Backed by 2MB Sv39 HugePages)
 shared_buffers = ${PG_SHARED_BUFFERS}
 effective_cache_size = ${PG_EFFECTIVE_CACHE_SIZE}
 work_mem = ${PG_WORK_MEM}
@@ -1043,7 +1041,7 @@ ACTIVE_DATA_DIR="$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null
 ACTIVE_IO_METHOD="$(sudo -u postgres psql -tAc "SHOW io_method;" 2>/dev/null || echo "N/A")"
 ACTIVE_BUFFERS="$(sudo -u postgres psql -tAc "SHOW shared_buffers;" 2>/dev/null || echo "N/A")"
 HUGEPAGES_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo)"
-HUGEPAGES_TOTAL="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo)"
+HUGEPAGES_TOTAL="$(awk '/HugePages_Free:/ {f=$2} /HugePages_Total:/ {print $2}' /proc/meminfo)"
 FINAL_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
 MQTT_STATE="$(systemctl is-active mosquitto 2>/dev/null || echo "inactive")"
 NFS_STATE="$(systemctl is-active nfs-kernel-server 2>/dev/null || echo "inactive")"
