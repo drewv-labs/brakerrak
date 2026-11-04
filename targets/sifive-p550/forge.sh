@@ -5,16 +5,16 @@
 # Architecture: RVA20 (RV64GC + Zba/Zbb) | 4x P550 3-Wide OoO | 32GB LPDDR5
 #
 # Usage:
-#   ./forge.sh                                    # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
-#   ./forge.sh --config /path/to/node.env         # Explicitly load a specific declarative config file
-#   ./forge.sh --role databroker|databench        # Select role persona (aliases: prod|bench)
-#   ./forge.sh --with-raid                        # Provision/mount arrays defined in RAID_ARRAYS_JSON
-#   ./forge.sh --with-mqtt                        # Enable Eclipse Mosquitto MQTT broker on NVMe
-#   ./forge.sh --with-nfs                         # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
-#   ./forge.sh --force-wipe-nvme                  # Destructively 4Kn format NVMe & zero-cache rebuild PG18
-#   ./forge.sh --with-raid --force-wipe-raid      # Destructively rebuild USB RAID10 arrays
-#   ./forge.sh --force-rebuild-pg                 # Force zero-cache PGDG deb-src recompile with perf stat
-#   ./forge.sh --use-pkg-cache                    # Restore/use cached P550 .deb packages on NVMe
+#   ./forge.sh                                     # Two-Pass idempotent build (reads ~/.brakerrak/node.env if present)
+#   ./forge.sh --config /path/to/node.env          # Explicitly load a specific declarative config file
+#   ./forge.sh --role databroker|databench         # Select role persona (aliases: prod|bench)
+#   ./forge.sh --with-raid                         # Provision/mount arrays defined in RAID_ARRAYS_JSON
+#   ./forge.sh --with-mqtt                         # Enable Eclipse Mosquitto MQTT broker on NVMe
+#   ./forge.sh --with-nfs                          # Export RAID vaults (or NVMe nfs_vault if no RAID) over NFSv4
+#   ./forge.sh --force-wipe-nvme                   # Destructively 4Kn format NVMe & zero-cache rebuild PG18
+#   ./forge.sh --with-raid --force-wipe-raid       # Destructively rebuild USB RAID10 arrays
+#   ./forge.sh --force-rebuild-pg                  # Force zero-cache PGDG deb-src recompile with perf stat
+#   ./forge.sh --use-pkg-cache                     # Restore/use cached P550 .deb packages on NVMe
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -307,12 +307,12 @@ if [[ "$WITH_RAID" == "true" && "$RAID_ARRAY_COUNT" -eq 0 ]]; then
 fi
 
 if ! getent group postgres >/dev/null; then
-    groupadd -r -g 26 postgres || groupadd -r postgres
+    groupadd -r -g 26 postgres 2>/dev/null || groupadd -r postgres
 fi
 PG_GID="$(getent group postgres | cut -d: -f3)"
 
 SYSCTL_FILE="/etc/sysctl.d/90-brakerbox-broker.conf"
-SYSCTL_CONTENT="# Allow non-root perf sampling of P550 L1/PL2/CCACHE hardware counters"
+SYSCTL_CONTENT="# Allow non-root perf sampling of P550 L1/PL2/CCACHE hardware counters
 kernel.perf_event_paranoid = -1
 kernel.kptr_restrict = 0
 
@@ -325,9 +325,7 @@ vm.swappiness = 1
 vm.dirty_background_bytes = 67108864
 vm.dirty_bytes = 536870912
 -kernel.sched_migration_cost_ns = 5000000
--kernel.sched_autogroup_enabled = 0
-
-# Disable NMI watchdog interrupts if supported by kernel architecture
+-kernel.sched_autogroup_enabled = 0"
 
 if [[ ! -f "$SYSCTL_FILE" ]] || [[ "$(cat "$SYSCTL_FILE")" != "$SYSCTL_CONTENT" ]]; then
     echo "$SYSCTL_CONTENT" > "$SYSCTL_FILE"
@@ -416,8 +414,8 @@ else
         vgremove -ff -y "$VG_NAME" 2>/dev/null || true
         pvremove -ff -y "$NVME_DEV" 2>/dev/null || true
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
-    wipefs -af "$NVME_DEV"
-    partprobe "$NVME_DEV" 2>/dev/null || true
+        wipefs -af "$NVME_DEV"
+        partprobe "$NVME_DEV" 2>/dev/null || true
 
         pvcreate --dataalignment 4m -f -y "$NVME_DEV"
         vgcreate -s 4m "$VG_NAME" "$NVME_DEV"
@@ -426,8 +424,8 @@ else
         log_ok "Created LVM Logical Volume $TARGET_BLOCK_DEV (${LV_PCT} with snapshot reserve)"
     else
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
-    wipefs -af "$NVME_DEV"
-    partprobe "$NVME_DEV" 2>/dev/null || true
+        wipefs -af "$NVME_DEV"
+        partprobe "$NVME_DEV" 2>/dev/null || true
         parted -s "$NVME_DEV" mklabel gpt
         parted -s -a optimal "$NVME_DEV" mkpart primary xfs 1MiB 100%
         partprobe "$NVME_DEV" || true
@@ -1043,7 +1041,7 @@ ACTIVE_DATA_DIR="$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null
 ACTIVE_IO_METHOD="$(sudo -u postgres psql -tAc "SHOW io_method;" 2>/dev/null || echo "N/A")"
 ACTIVE_BUFFERS="$(sudo -u postgres psql -tAc "SHOW shared_buffers;" 2>/dev/null || echo "N/A")"
 HUGEPAGES_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo)"
-HUGEPAGES_TOTAL="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo)"
+HUGEPAGES_TOTAL="$(awk '/HugePages_Free:/ {f=$2} /HugePages_Total:/ {print $2}' /proc/meminfo)"
 FINAL_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
 MQTT_STATE="$(systemctl is-active mosquitto 2>/dev/null || echo "inactive")"
 NFS_STATE="$(systemctl is-active nfs-kernel-server 2>/dev/null || echo "inactive")"
