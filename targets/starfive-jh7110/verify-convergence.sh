@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# DREW-V Labs // SiFive P550 End-to-End Convergence & Idempotency Harness
+# DREW-V Labs // StarFive JH7110 End-to-End Convergence & Idempotency Harness
 # Path: drewv-labs/brakerrak/targets/starfive-jh7110/verify-convergence.sh
 # ==============================================================================
 set -Eeuo pipefail
@@ -19,7 +19,7 @@ mkdir -p "$SNAP_DIR"
 chown -R "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.brakerrak" 2>/dev/null || true
 
 if [[ -d "$RVDK_DIR" ]]; then
-    echo ">>> [STAGE 0A] Running Ubuntu & SiFive P550 BSP Day-0 Bootstraps (riscv-data-kit)..."
+    echo ">>> [STAGE 0A] Running Debian & StarFive JH7110 BSP Day-0 Bootstraps (riscv-data-kit)..."
     [[ -x "${RVDK_DIR}/os/bootstrap-debian.sh" ]] && "${RVDK_DIR}/os/bootstrap-debian.sh"
     [[ -x "${RVDK_DIR}/bsp/bootstrap-sifive-p550.sh" ]] && "${RVDK_DIR}/bsp/bootstrap-sifive-p550.sh"
 fi
@@ -42,4 +42,4 @@ echo ">>> [STAGE 3] Capturing Day-1 Post-Forge CTD Provenance Snapshot..."
 chown -R "${REAL_USER}:${REAL_USER}" "$SNAP_DIR" 2>/dev/null || true
 
 echo ""
-echo ">>> [PASS] Full SiFive P550 Convergence & Idempotency Lifecycle Verified!"
+echo ">>> [PASS] Full StarFive JH7110 Convergence & Idempotency Lifecycle Verified!"

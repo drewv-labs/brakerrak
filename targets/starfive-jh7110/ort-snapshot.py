@@ -5,8 +5,8 @@ Path: drewv-labs/brakerrak/targets/starfive-jh7110/ort-snapshot.py
 Strictly Read-Only System Inspector & Quiescent Baseline Profiler.
 
 Emits (to ~/.brakerrak/snapshots by default):
-  1. Unredacted CTD Snapshot : brakerbox-snapshot-<stage>-<ts>-<epoch>.json
-  2. Redacted Public Snapshot: brakerbox-snapshot-<stage>-<ts>-<epoch>.public.json
+  1. Unredacted CTD Snapshot : brakerbench-snapshot-<stage>-<ts>-<epoch>.json
+  2. Redacted Public Snapshot: brakerbench-snapshot-<stage>-<ts>-<epoch>.public.json
 """
 import argparse
 import copy
@@ -137,6 +137,14 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
             if t_val and t_val.lstrip("-").isdigit():
                 thermals.setdefault(tz_name, []).append(round(int(t_val) / 1000.0, 2))
 
+        for hp in sorted(glob.glob("/sys/class/hwmon/hwmon*/temp*_input")):
+            hw_dir = os.path.dirname(hp)
+            hw_name = read_sysfs(f"{hw_dir}/name") or os.path.basename(hw_dir)
+            lbl = read_sysfs(hp.replace("_input", "_label")) or os.path.basename(hp).replace("_input", "")
+            t_val = read_sysfs(hp)
+            if t_val and t_val.lstrip("-").isdigit():
+                thermals.setdefault(f"{hw_name}:{lbl}", []).append(round(int(t_val) / 1000.0, 2))
+
         for fp in fan_paths:
             f_val = read_sysfs(fp)
             if f_val and f_val.isdigit():
@@ -248,7 +256,7 @@ def redact_block_tree(devices: list[dict[str, Any]]) -> None:
             redact_block_tree(children)
 
 
-def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up: bool) -> dict[str, Any]:
+def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, eth0_up: bool) -> dict[str, Any]:
     pub = copy.deepcopy(raw_payload)
     pub.pop("provenance_signature", None)
 
@@ -269,7 +277,7 @@ def build_public_snapshot(raw_payload: dict[str, Any], raw_sha256: str, end0_up:
 
     pub["network_topology"] = {
         "hostname": raw_payload.get("network_topology", {}).get("hostname"),
-        "primary_nic_end0_operstate": "UP" if end0_up else "DOWN",
+        "primary_nic_eth0_operstate": "UP" if eth0_up else "DOWN",
     }
 
     pub.pop("security_and_users", None)
@@ -332,7 +340,7 @@ def main() -> None:
     safe_stage = re.sub(r"[^a-zA-Z0-9_-]", "-", args.stage)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    base_stem = f"brakerbox-snapshot-{safe_stage}-{iso_compact}-{epoch_sec}"
+    base_stem = f"brakerbench-snapshot-{safe_stage}-{iso_compact}-{epoch_sec}"
     out_file = os.path.join(args.out_dir, f"{base_stem}.json")
     public_out_file = os.path.join(args.out_dir, f"{base_stem}.public.json")
 
@@ -452,7 +460,7 @@ def main() -> None:
         usb_ort_idx = 4 + len(raid_ort_checks)
         raid_ort_checks.append({
             "id": f"ORT-{usb_ort_idx:02d}_USB3_SUPERSPEED",
-            "description": "Rear Teal USB 3.2 Gen1 Ports Negotiated at 5000M SuperSpeed",
+            "description": "Rear USB 3.0 Ports Negotiated at 5000M SuperSpeed",
             "expected": "5000M SuperSpeed present",
             "actual": "5000M detected" if usb_superspeed_5000m else "No 5000M devices detected",
             "status": "PASS" if usb_superspeed_5000m else "WARN",
@@ -469,13 +477,21 @@ def main() -> None:
     except Exception:
         net_routes = []
 
-    end0_up = any(i.get("ifname") == "end0" and i.get("operstate") == "UP" for i in net_ifaces)
+    eth0_up = any(
+        (i.get("ifname") == "eth0" or "end0" in (i.get("altnames") or []))
+        and i.get("operstate") == "UP"
+        for i in net_ifaces
+    )
 
     dmesg_raw = run_cmd(["dmesg"], use_sudo=True)
     bus_errors = []
     if not dmesg_raw.startswith("ERROR:"):
         for line in dmesg_raw.splitlines():
-            if re.search(r"(pcieport.*error|AER:.*error|AER:.*Corrected|AER:.*Uncorrected|nvme.*error|I/O error|usb.*reset|under-voltage)", line, re.IGNORECASE):
+            if re.search(
+                r"(pcieport.*error|AER:.*error|AER:.*Corrected|AER:.*Uncorrected|nvme.*error|I/O error|usb.*reset|under-voltage)",
+                line,
+                re.IGNORECASE,
+            ):
                 bus_errors.append(line)
 
     human_users = []
@@ -546,39 +562,47 @@ def main() -> None:
     ort_checks = [
         {
             "id": "ORT-01_CPU_HARTS",
-            "description": "4x SiFive P550 Harts Online (rv64imafdc_zba_zbb)",
+            "description": "4x SiFive U74 Harts Online (rv64imafdc_zba_zbb)",
             "expected": 4,
             "actual": len(harts),
             "status": "PASS" if len(harts) == 4 else "FAIL",
         },
         {
             "id": "ORT-02_LPDDR4_CAPACITY",
-            "description": "32GB LPDDR5 System Memory Detected (>= 30 GiB usable)",
+            "description": "8GB LPDDR4 System Memory Detected (>= 7.5 GiB usable)",
             "expected": ">= 7500000 kB",
             "actual": f"{os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // 1024} kB",
             "status": "PASS" if (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") // 1024) >= 7500000 else "FAIL",
         },
         {
             "id": "ORT-03_PCIE_NVME_LINK",
-            "description": "Primary NVMe Seated at PCIe Gen3 x4 (8.0 GT/s, Width x4)",
+            "description": "Primary NVMe Seated at PCIe Gen2 x1 (5.0 GT/s, Width x1)",
             "expected": "5.0 GT/s PCIe | x1",
             "actual": f"{nvme_info['pcie_link_speed']} | x{nvme_info['pcie_link_width']}",
-            "status": "PASS" if (nvme_present and "8.0" in str(nvme_info["pcie_link_speed"]) and str(nvme_info["pcie_link_width"]) == "4") else "FAIL",
+            "status": "PASS"
+            if (
+                nvme_present
+                and "5.0" in str(nvme_info["pcie_link_speed"])
+                and str(nvme_info["pcie_link_width"]) == "1"
+            )
+            else "FAIL",
         },
         *raid_ort_checks,
         {
-            "id": f"ORT-{next_ort_idx:02d}_PRIMARY_NIC_END0",
-            "description": "Primary SoC NIC (end0) Carrier UP with IPv4 Lease",
+            "id": f"ORT-{next_ort_idx:02d}_PRIMARY_NIC_ETH0",
+            "description": "Primary SoC NIC (eth0) Carrier UP with IPv4 Lease",
             "expected": "UP",
-            "actual": "UP" if end0_up else "DOWN",
-            "status": "PASS" if end0_up else "FAIL",
+            "actual": "UP" if eth0_up else "DOWN",
+            "status": "PASS" if eth0_up else "FAIL",
         },
         {
             "id": f"ORT-{next_ort_idx + 1:02d}_THERMAL_IDLE_FLOOR",
             "description": "Quiescent SoC Thermal Ceiling Below 55.0 C",
             "expected": "< 55.0 C",
             "actual": f"{max([v['max'] for v in quiescent['thermal_zones_celsius'].values() if v['max'] is not None], default=0.0)} C",
-            "status": "PASS" if max([v["max"] for v in quiescent["thermal_zones_celsius"].values() if v["max"] is not None], default=0.0) < 55.0 else "WARN",
+            "status": "PASS"
+            if max([v["max"] for v in quiescent["thermal_zones_celsius"].values() if v["max"] is not None], default=0.0) < 55.0
+            else "WARN",
         },
         {
             "id": f"ORT-{next_ort_idx + 2:02d}_KERNEL_BUS_HEALTH",
@@ -594,7 +618,7 @@ def main() -> None:
         "artifact": {
             "id": socket.gethostname(),
             "node_group": "brakerrak-nodes",
-            "target_designation": "sifive-p550 (databroker / databench)",
+            "target_designation": "starfive-jh7110 (databench / databroker)",
             "kind": "hardware_node_baseline_snapshot",
             "stage": args.stage,
             "captured_at_utc": iso_full,
@@ -686,7 +710,7 @@ def main() -> None:
 
     public_sha256 = None
     if not args.no_public:
-        public_payload = build_public_snapshot(snapshot_payload, manifest_sha256, end0_up)
+        public_payload = build_public_snapshot(snapshot_payload, manifest_sha256, eth0_up)
         public_sha256 = public_payload["provenance_signature"]["canonical_payload_sha256"]
         with open(public_out_file, "w", encoding="utf-8") as f:
             json.dump(public_payload, f, indent=2)

@@ -1069,8 +1069,8 @@ ACTIVE_BUFFERS="$(sudo -u postgres psql -tAc "SHOW shared_buffers;" 2>/dev/null 
 HUGEPAGES_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo)"
 HUGEPAGES_TOTAL="$(awk '/HugePages_Free:/ {f=$2} /HugePages_Total:/ {print $2}' /proc/meminfo)"
 FINAL_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size")"
-MQTT_STATE="$(systemctl is-active mosquitto 2>/dev/null || echo "inactive")"
-NFS_STATE="$(systemctl is-active nfs-kernel-server 2>/dev/null || echo "inactive")"
+MQTT_STATE="$(systemctl is-active mosquitto 2>\/dev\/null || true)"
+NFS_STATE="$(systemctl is-active nfs-kernel-server 2>\/dev\/null || true)"
 
 printf "  • %-18s : %s (Role: %s | Pass: %s)\n" "Hostname" "$(hostname)" "$NODE_ROLE" "$FORGE_PASS"
 printf "  • %-18s : %s (%s)\n" "Kernel / Arch" "$(uname -r)" "$(uname -m)"
