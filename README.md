@@ -1,9 +1,11 @@
 <div align="center">
 
+<img src="./docs/RISC-V-logo.png" alt="BrakerBench-VF2" width="600">
+
 # BrakerRak
 
 **Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML Deployment Engine**  
-...the Silicon is gonna Sing!
+...the Silicon is gonna Sing!  
 
 </div>
 
