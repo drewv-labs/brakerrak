@@ -2,8 +2,7 @@
 
   <img src="./.github/images/brakerrak-banner.png" alt="RVDK Banner" width="100%"/>
 
-  **Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML R&D Deployment Engine**  
-  ...the Silicon is gonna Sing!  
+  **...the Silicon is gonna Sing!**  
 
 </div>
 
