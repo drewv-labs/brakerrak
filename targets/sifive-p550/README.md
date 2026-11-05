@@ -4,7 +4,7 @@
 
 *Optimized SiFive HiFive Premier P550 Data Broker Build*
 
-<img src="./assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="600">
+<img src="./assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="600"/>
 
 </div>
 

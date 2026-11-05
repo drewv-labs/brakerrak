@@ -1,9 +1,9 @@
 <div align="center">
 
-# BrakerRak
+  <img src="./.github/images/brakerrak-banner.png" alt="RVDK Banner" width="100%"/>
 
-**Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML R&D Deployment Engine**  
-...the Silicon is gonna Sing!  
+  **Declarative, Plug-n-Play Bare-Metal RISC-V Data & Edge ML R&D Deployment Engine**  
+  ...the Silicon is gonna Sing!  
 
 </div>
 
@@ -157,6 +157,10 @@ When `WITH_RAID="true"`, `BrakerRak` dynamically iterates through `RAID_ARRAYS_J
 4. **Stage 2 — Idempotency Verification Pass (`brakerrak forge`):** Re-executes the forge against the live node, asserting `100% [SKIP]` across all stages in ~2 seconds with zero service restarts or destructive storage mutations.
 5. **Stage 3 — Post-Forge CTD Provenance (`brakerrak ort --stage day1-post-forge`):** Emits a SHA-256 signed JSON manifest (`.json` + redacted `.public.json`) to `~/.brakerrak/snapshots/` verifying `4Kn` block alignment, active `io_uring` backend configuration, HugePage consumption, and tablespace/NFS routing.
 
+---
+
+###### Trademarks & Non-Affiliation Notice
+> **BrakerRak** is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **StarFive**, or **Milk-V**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
 
 ---
 
