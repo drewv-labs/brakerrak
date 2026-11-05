@@ -100,9 +100,9 @@ sudo brakerrak verify --use-pkg-cache
 
 ## Glamor Shots
 
-<div align="center">
-
 <img src="./assets/brakerbox-p550-topdown.jpg" alt="BrakerBox-P550-TopDown" width="600">  
+
+<div align="right">
 
 <img src="./assets/brakerbox-p550-full-frontal.jpg" alt="BrakerBox-P550-FullFrontal" width="600">  
 
