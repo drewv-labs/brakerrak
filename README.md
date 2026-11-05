@@ -1,8 +1,8 @@
 <div align="center">
 
   <img src="./.github/images/brakerrak-banner.png" alt="RVDK Banner" width="100%"/>
-
-  **...the Silicon is gonna Sing!**  
+  
+  *...the Silicon is gonna Sing!*
 
 </div>
 
@@ -10,7 +10,7 @@
 
 `BrakerRak` (named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker)) is a declarative, hardware-agnostic provisioning and benchmarking engine designed to converge, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) [RISC-V](https://riscv.org/) silicon** across high-throughput relational data brokering and heterogeneous Edge ML workloads.
 
-Rather than coupling provisioning logic to hardcoded hostnames or fixed disk topologies, `BrakerRak` operates as a **Two-Axis State Machine (`Targets` × `Roles`)** paired with [RVDK (riscv-data-kit)](https://github.com/drewv-labs/riscv-data-kit) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons):
+Rather than coupling provisioning logic to hardcoded hostnames or fixed disk topologies, `BrakerRak` operates as a **Two-Axis State Machine (`Targets` × `Roles`)** [RVDK](https://github.com/drewv-labs/riscv-data-kit) harness with wrapped [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) `HamStak` system:
 
 * **Native Silicon & Storage Alignment:** Hardware-formats NVMe namespaces to native **`4096B` (`4Kn`)** LBA sectors, provisions LVM (`85%VG` with instant rollback snapshot reserve) + XFS, pins **`2MB` `Sv39` HugePages**, and compiles **PostgreSQL 18.6** from source (`-O3` with silicon-specific ISA extensions and `liburing`). You read that right, PostgreSQL running `io_uring` tapping into the latest Linux concurrency features on bare-metal RISC-V silicon.  
 
