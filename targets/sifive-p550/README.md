@@ -96,6 +96,21 @@ Then edit `~/.brakerrak/node.env` to setup custom config and rerun to provision 
 sudo brakerrak verify --role databroker --use-pkg-cache
 ~~~
 
+---
+
+## Pics! Because it did happen...
+
+<div align="center">
+
+<img src="./assets/brakerbox-p550-topdown.jpg" alt="BrakerBox-P550" width="600">  
+
+*DREW-V Labs 1U server chassis layout*  
+
+<img src="./assets/brakerbox-p550-full-frontal.jpg" alt="BrakerBox-P550" width="600">  
+
+*BrakerBox-P550 + BigRed-WDR48 & LilBlu-WDB24 RAID Arrays* 
+
+</div>
 
 ---
 
