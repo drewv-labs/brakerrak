@@ -29,15 +29,15 @@ Rather than coupling provisioning logic to hardcoded hostnames or fixed disk top
 | **`databroker`** | `brakerbox-<tag>` | Active + Custom Warm/Cold Tablespaces | Enabled (Persisted on `4Kn` NVMe) | Exports RAID Vaults (or `/mnt/nvme_pgdata/nfs_vault` if `WITH_RAID=false`) | `PigeonCoop` + `Pigeoneer` |
 | **`databench`** | `brakerbench-<tag>` | Active (Locked Planner Cost Constants) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | `Pigeoneer` Only |
 
-### 2. Silicon Targets (`targets/`)
+### 2. Silicon Targets (`soc-drawer/`)
 
-| Target Directory | SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **`targets/sifive-p550`** | ESWIN EIC7700X (HiFive Premier P550) | `4x SiFive P550` (`3-Wide OoO @ 1.4GHz`) | `RVA20` (`-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550`) | **Active / Verified** |
-| **`targets/starfive-jh7110`** | StarFive JH7110 (VisionFive 2) | `4x SiFive U74` (`2-Wide InO @ 1.5GHz`) | `RVA20` (`-O3 -march=rv64gc -mcpu=sifive-u74`) | **Active / In Progress** |
-| `targets/spacemit-k1` | SpacemiT K1/M1 (Milk-V Jupiter 1) | `8x X60` (`2-Wide InO @ 1.8GHz`) | `RVA22` + `256-bit RVV 1.0` | Planned |
-| `targets/spacemit-k3` | SpacemiT K3 (Milk-V Jupiter 2) | `8x X100` (`4-Wide OoO @ 2.4GHz` + `60 TOPS`) | `RVA23` + `1024-bit RVV 1.0` | Planned |
-| `targets/ultrarisc-dp1000` | UltraRISC UR-DP1000 (Milk-V Titan) | `8x UR-CP100` (`4-Wide OoO @ 2.0GHz`) | `RVA22` + `H-Ext 1.0` | Planned |
+| SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
+| :--- | :--- | :--- | :--- |
+| ESWIN EIC7700X (HiFive Premier P550) | `4x SiFive P550` (`3-Wide OoO @ 1.4GHz`) | `RVA20` (`-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550`) | **Active / Verified** |
+| StarFive JH7110 (VisionFive 2) | `4x SiFive U74` (`2-Wide InO @ 1.5GHz`) | `RVA20` (`-O3 -march=rv64gc -mcpu=sifive-u74`) | **Active / In Progress** |
+| SpacemiT K1/M1 (Milk-V Jupiter 1) | `8x X60` (`2-Wide InO @ 1.8GHz`) | `RVA22` + `256-bit RVV 1.0` | Planned |
+| SpacemiT K3 (Milk-V Jupiter 2) | `8x X100` (`4-Wide OoO @ 2.4GHz` + `60 TOPS`) | `RVA23` + `1024-bit RVV 1.0` | Planned |
+| UltraRISC UR-DP1000 (Milk-V Titan) | `8x UR-CP100` (`4-Wide OoO @ 2.0GHz`) | `RVA22` + `H-Ext 1.0` | Planned |
 
 ---
 
@@ -52,13 +52,15 @@ brakerrak/
 ├── roles/
 │   ├── databroker.env                   # BrakerBox persona: PG18 + Mosquitto + NFSv4 + PigeonCoop
 │   └── databench.env                    # BrakerBench persona: Locked PG18 planner + Pigeoneer only
-├── targets/
-│   ├── sifive-p550/                     # HiFive Premier P550 (ESWIN EIC7700X, RVA20 + Zba/Zbb)
-│   │   ├── forge.sh                     # Stage 1 & 2: Two-Pass idempotent convergence script
-│   │   ├── ort-snapshot.py              # Stage 0 & 3: Zero-dependency ORT & CTD manifest generator
-│   │   ├── reset-day0.sh                # Option A: In-place 512e NVMe & OS factory rollback
-│   │   └── verify-convergence.sh        # One-shot 5-stage validation & idempotency harness
+├── soc-drawer/
+│   ├── eswin-eic7700x/                  # HiFive Premier P550 (ESWIN EIC7700X, RVA20 + Zba/Zbb)
+│   │   └── ort-snapshot.py              # Stage 0 & 3: Zero-dependency ORT & CTD manifest generator
 │   └── starfive-jh7110/                 # VisionFive 2 (StarFive JH7110, SiFive U74)
+│       └── ort-snapshot.py              # Stage 0 & 3: Zero-dependency ORT & CTD manifest generator
+├── scripts/
+│   ├── ort-snapshot.sh                  # Auto-detects SoC and dispatches soc-drawer/<target>/ort-snapshot.py
+│   ├── reset-day0.sh                    # Option A: In-place 512e NVMe & OS factory rollback
+│   └── verify-convergence.sh            # One-shot 5-stage validation & idempotency harness
 └── examples/
     ├── databroker-raid.env.example      # Reference multi-array databroker configuration
     └── databench.env.example            # Reference isolated databench configuration

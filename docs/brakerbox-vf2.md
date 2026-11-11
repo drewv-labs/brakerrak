@@ -12,7 +12,7 @@
 
 ## 1. Architectural Overview
 
-DREW-V Labs presents this `brakerbench-vf2` build as a 1U rack-shelf RISC-V relational benchmark testbed and edge data broker built around the **[StarFive VisionFive 2](https://www.starfivetech.com/en/index.php?s=hardware&c=show&id=14)** (`JH7110`) platform paired with an M.2 NVMe SSD (tested w/ `WD_BLACK SN750` 2TB). Built on the latest PostgreSQL 18.6 `io_uring`, it serves as the canonical **2-Wide In-Order (`InO`)** baseline against the **3-Wide Out-of-Order (`OoO`)** [`BrakerBox-P550`](../sifive-p550/README.md).
+DREW-V Labs presents this `brakerbench-vf2` build as a 1U rack-shelf RISC-V relational benchmark testbed and edge data broker built around the **[StarFive VisionFive 2](https://www.starfivetech.com/en/index.php?s=hardware&c=show&id=14)** (`JH7110`) platform paired with an M.2 NVMe SSD (tested w/ `WD_BLACK SN750` 2TB). Built on the latest PostgreSQL 18.6 `io_uring`, it serves as the canonical **2-Wide In-Order (`InO`)** baseline against the **3-Wide Out-of-Order (`OoO`)** [`BrakerBox-P550`](../eswin-eic7700x/README.md).
 
 By switching to `io_uring`, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead—critical on Dual-Issue In-Order `SiFive U74` harts where syscall traps and `io worker` IPC stalls cannot be hidden behind out-of-order speculative execution.
 
