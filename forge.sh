@@ -7,32 +7,51 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker --hostname jakebase-vf2
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
-# Usage (Local CLI after bootstrap):
+# Usage (Local CLI after bootstrap or install-cli.sh):
 #   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--force-rebuild-pg]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
+#   sudo brakerrak update
 # ==============================================================================
-set -Eeuo pipefail
 
+# Ensure compatibility when invoked via `zsh` or `bash`
+if [[ -n "${ZSH_VERSION:-}" ]]; then
+    emulate -L ksh
+    setopt PIPE_FAIL ERR_RETURN NO_UNSET
+else
+    set -Eeuo pipefail
+fi
+
+SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ $EUID -ne 0 ]]; then
-    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+        exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
-        echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash': curl -fsSL https://brakerrak.dev/forge.sh | sudo bash" >&2
+        echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://brakerrak.dev/forge.sh | sudo bash" >&2
         exit 1
     fi
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo root)}"
-REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 2>/dev/null || eval echo "~${REAL_USER}")"
-[[ -z "$REAL_HOME" ]] && REAL_HOME="/root"
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
+
+if command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+elif command -v dscl >/dev/null 2>&1; then
+    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+else
+    REAL_HOME=""
+fi
+[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
+[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
 
 BRAKER_DIR="${REAL_HOME}/.brakerrak"
 ENGINE_DIR="${BRAKER_DIR}/engine"
 NODE_ENV="${BRAKER_DIR}/node.env"
 REPO_URL="${BRAKERRAK_REPO_URL:-https://github.com/drewv-labs/brakerrak.git}"
 REPO_BRANCH="${BRAKERRAK_BRANCH:-main}"
+BRAKERRAK_BASE_URL="${BRAKERRAK_BASE_URL:-https://brakerrak.dev}"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
 
 log_brak()  { printf "\033[1;35m[BRAKERRAK]\033[0m %s\n" "$1"; }
@@ -47,7 +66,7 @@ log_fatal() { printf "\033[1;31m[BRAKERRAK:FATAL]\033[0m %s\n" "$1" >&2; exit 1;
 ACTION="forge"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        forge|ort|verify|reset|update)
+        forge|ort|verify|reset|update|self-update)
             ACTION="$1"
             shift
             ;;
@@ -57,7 +76,6 @@ fi
 # ==============================================================================
 # 2. Sync ~/.brakerrak/engine & Link /usr/local/bin/brakerrak
 # ==============================================================================
-SCRIPT_SELF="${BASH_SOURCE[0]:-}"
 if [[ -n "$SCRIPT_SELF" ]]; then
     SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
     CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
@@ -65,30 +83,47 @@ else
     CANDIDATE_ROOT=""
 fi
 
-if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" && "$ACTION" != "update" ]]; then
+if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
+    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+        exec bash "${CANDIDATE_ROOT}/install-cli.sh"
+    else
+        curl -fsSL "${BRAKERRAK_BASE_URL}/install-cli.sh" | bash
+        exit 0
+    fi
+fi
+
+if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
 else
-    if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
-        apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
-    fi
-    install -d -m 0750 -o "$REAL_USER" -g "$REAL_USER" "$BRAKER_DIR"
-    if [[ -d "${ENGINE_DIR}/.git" ]]; then
-        log_brak "Syncing BrakerRak engine in ${ENGINE_DIR}..."
-        sudo -u "$REAL_USER" git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
-        sudo -u "$REAL_USER" git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
+    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+        bash "${CANDIDATE_ROOT}/install-cli.sh" --quiet
     else
-        log_brak "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
-        rm -rf "$ENGINE_DIR"
-        sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
+        if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+                export DEBIAN_FRONTEND=noninteractive
+                apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+                apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
+            else
+                log_fatal "Missing git or curl."
+            fi
+        fi
+        install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
+        if [[ -d "${ENGINE_DIR}/.git" ]]; then
+            log_brak "Syncing BrakerRak engine in ${ENGINE_DIR}..."
+            sudo -u "$REAL_USER" git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
+            sudo -u "$REAL_USER" git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
+        else
+            log_brak "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
+            rm -rf "$ENGINE_DIR"
+            sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
+        fi
     fi
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
-chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}"/scripts/*.sh 2>/dev/null || true
+chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh 2>/dev/null || true
+install -d -m 0755 /usr/local/bin
 ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
-[[ "$ACTION" == "update" ]] && { log_ok "BrakerRak engine updated."; exit 0; }
 
 # ==============================================================================
 # 3. Route Shared Lifecycle Subcommands Immediately (ort | verify | reset)
@@ -150,7 +185,10 @@ done
 # ==============================================================================
 # 5. Auto-Detect Silicon Target & Short Tag from /proc/device-tree/model
 # ==============================================================================
-DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+DT_MODEL="Unknown"
+if [[ -r /proc/device-tree/model ]]; then
+    DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+fi
 if [[ -z "$TARGET_BOARD" ]]; then
     case "$DT_MODEL" in
         *"Premier P550"*|*"EIC7700"*|*"Megrez"*)
@@ -182,7 +220,7 @@ log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) | Action: ${ACTION}"
 # ==============================================================================
 # 6. CONFIG RESOLUTION (Pass 1 Template Generation vs. Pass 2 node.env Load)
 # ==============================================================================
-install -d -m 0750 -o "$REAL_USER" -g "$REAL_USER" "$BRAKER_DIR"
+install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
 
 if [[ -f "$NODE_ENV" ]]; then
     FORGE_PASS="2"
@@ -257,7 +295,7 @@ ENABLE_NFS_SERVER="${ENABLE_NFS_SERVER}"
 # Opt-In Community RISC-V Telemetry Commons
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT}"
 EOF
-    chown "${REAL_USER}:${REAL_USER}" "$NODE_ENV"
+    chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
     chmod 0640 "$NODE_ENV"
     log_ok "Generated Pass 1 node configuration: ${NODE_ENV}"
 fi

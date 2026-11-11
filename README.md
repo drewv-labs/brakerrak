@@ -49,6 +49,7 @@ All user-specific configuration (`~/.brakerrak/node.env`) and generated hardware
 brakerrak/
 ├── README.md
 ├── forge.sh                             # Universal curl-to-forge auto-dispatcher & local CLI entrypoint
+├── install-cli.sh                       # Standalone CLI & engine installer (/usr/local/bin/brakerrak)
 ├── roles/
 │   ├── databroker.env                   # BrakerBox persona: PG18 + Mosquitto + NFSv4 + PigeonCoop
 │   └── databench.env                    # BrakerBench persona: Locked PG18 planner + Pigeoneer only
@@ -75,6 +76,9 @@ brakerrak/
 `BrakerRak`'s root `forge.sh` inspects `/proc/device-tree/model` to auto-detect the underlying RISC-V board, syncs the framework into `~/.brakerrak/engine`, installs the `/usr/local/bin/brakerrak` CLI symlink, and executes the target convergence pipeline:
 
 ```bash
+# Install the brakerrak CLI & engine without running the convergence forge (Linux bash or macOS zsh)
+curl -fsSL https://brakerrak.dev/install-cli.sh | sudo bash
+
 # Converge node as an isolated benchmark target (default Pass 1 behavior: databench, NVMe-only)
 curl -fsSL https://brakerrak.dev/forge.sh | sudo bash
 
