@@ -8,9 +8,9 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--force-rebuild-pg]
+#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
-#   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg]
+#   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
 #   sudo brakerrak update [--skip-rvdk]
 # ==============================================================================
@@ -210,6 +210,9 @@ while [[ $# -gt 0 ]]; do
         --force-rebuild-pg|--force-build|--compile-pg|--no-pkg-cache)
                                     FORCE_REBUILD_PG="true"; shift ;;
         --use-pkg-cache)            FORCE_REBUILD_PG="false"; shift ;;
+        --noprogbar|--no-progbar)   export BRAKERRAK_NO_PROGBAR="1"
+                                    export RVDK_NO_PROGBAR="1"
+                                    shift ;;
         *)                          FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
@@ -252,6 +255,16 @@ case "$TARGET_BOARD" in
     starfive-jh7110) FACTORY_USER="user" ;;
 esac
 
+if [[ -f "${LOCAL_ROOT}/scripts/lib-progbar.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${LOCAL_ROOT}/scripts/lib-progbar.sh"
+else
+    brak_prog_init()    { :; }
+    brak_prog()         { :; }
+    brak_prog_cleanup() { :; }
+fi
+
+brak_prog_init "Resolving ${TARGET_BOARD} node configuration..."
 log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) | Action: ${ACTION}"
 
 # ==============================================================================
@@ -369,43 +382,53 @@ export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT WITH
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
 # ==============================================================================
 if [[ ! -x /usr/local/bin/rvdk ]]; then
+    brak_prog 5 "Stage 0A: Installing RVDK CLI..." 0 "Cloning RVDK engine..."
     log_step "0A. Installing RVDK Package Manager CLI (${RVDK_BASE_URL}/install-cli.sh)"
     curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
 fi
 
+brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launching rvdk day0..."
 log_step "1. RVDK Day-0 OS & Silicon BSP Convergence (Hostname: ${TARGET_HOSTNAME})"
 /usr/local/bin/rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
 
+brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
 log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
 NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT")
 [[ "$FORCE_WIPE_NVME" == "true" ]] && NVME_FLAGS+=(--force-wipe)
 /usr/local/bin/rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
 
+brak_prog 45 "Stage 3/7: PostgreSQL 18.6 (io_uring + Sv39 HugePages)" 0 "Launching rvdk postgresql..."
 log_step "3. RVDK PostgreSQL 18.6 Convergence (io_uring + Sv39 HugePages)"
 PG_FLAGS=(--data-mount "$MOUNT_POINT" --subnet "$LAB_SUBNET")
 [[ "$FORCE_REBUILD_PG" == "true" ]] && PG_FLAGS+=(--force-build)
 /usr/local/bin/rvdk postgresql "${PG_FLAGS[@]}"
 
 if [[ "$WITH_RAID" == "true" ]]; then
+    brak_prog 70 "Stage 4/7: Btrfs RAID 10 Vault Provisioning" 0 "Launching rvdk mods/btrfs-raid..."
     log_step "4. RVDK Btrfs RAID 10 Vault Provisioning & Tablespace Binding"
     RAID_FLAGS=()
     [[ "$FORCE_WIPE_RAID" == "true" ]] && RAID_FLAGS+=(--force-wipe-raid)
     /usr/local/bin/rvdk mods/btrfs-raid ${RAID_FLAGS[@]+"${RAID_FLAGS[@]}"}
 else
+    brak_prog 74 "Stage 4/7: Btrfs RAID 10 Skipped (WITH_RAID=false)" 100 "mods/btrfs-raid skipped"
     log_step "4. Btrfs RAID 10 Vault Provisioning Skipped (WITH_RAID=false)"
 fi
 
 if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
+    brak_prog 78 "Stage 5A/7: Eclipse Mosquitto MQTT Broker (:${MQTT_PORT})" 0 "Launching rvdk mods/mosquitto..."
     log_step "5A. RVDK Eclipse Mosquitto MQTT Broker (:${MQTT_PORT} + Unix Socket)"
     /usr/local/bin/rvdk mods/mosquitto --port "$MQTT_PORT" --data-mount "$MOUNT_POINT"
 else
+    brak_prog 82 "Stage 5A/7: Mosquitto MQTT Skipped (ENABLE_MQTT_BROKER=false)" 100 "mods/mosquitto skipped"
     log_step "5A. Mosquitto MQTT Broker Skipped (ENABLE_MQTT_BROKER=false)"
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
+    brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})" 0 "Launching rvdk mods/nfs-vault..."
     log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})"
     /usr/local/bin/rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
 else
+    brak_prog 90 "Stage 5B/7: NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)" 100 "mods/nfs-vault skipped"
     log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
     if systemctl is-active --quiet nfs-server.service 2>/dev/null || systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
         systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
@@ -420,6 +443,7 @@ fi
 # ==============================================================================
 # 8. STAGE 6: POST-FLIGHT CONVERGENCE SUMMARY
 # ==============================================================================
+brak_prog 95 "Stage 6/7: Collecting Post-Flight Convergence Summary..." 100 "RVDK pipeline converged"
 CPU_HARTS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")"
 if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
     CPU_GOV="$(cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>/dev/null | sort -u | paste -sd/ -)"
@@ -486,6 +510,7 @@ printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "$LAB_SUBNET
 if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
     if id -u "$FACTORY_USER" >/dev/null 2>&1 || [[ -d "/home/${FACTORY_USER}" ]]; then
         if [[ "$REAL_USER" == "$ADMIN_USER" ]]; then
+            brak_prog 98 "Stage 7/7: Purging factory user '${FACTORY_USER}' -> '${ADMIN_USER}'" 50 "utils/purge-user.sh ${FACTORY_USER}"
             log_step "7. Migrating Artifacts & Purging Factory Default User ('${FACTORY_USER}' -> '${ADMIN_USER}')"
             /usr/local/bin/rvdk utils/purge-user.sh "$FACTORY_USER" --to-user "$ADMIN_USER"
             echo ""
@@ -495,4 +520,6 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
     fi
 fi
 
+brak_prog 100 "${TARGET_HOSTNAME} (${NODE_ROLE}) Forge Complete!" 100 "All RVDK stages complete"
+brak_prog_cleanup
 log_ok "${TARGET_HOSTNAME} PostgreSQL 18.6 (${NODE_ROLE}) Forge Complete!"
