@@ -18,6 +18,10 @@ if [[ "${_BRAKERRAK_PROGBAR_SOURCED:-0}" == "1" ]]; then
 fi
 _BRAKERRAK_PROGBAR_SOURCED="1"
 
+# Literal ESC byte (0x1B). Never pass `\0337` through `printf "%b"`, because
+# bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
+_BRAK_ESC=$'\033'
+
 _BRAK_PROG_ACTIVE="0"
 _BRAK_PROG_ROWS=0
 _BRAK_PROG_COLS=0
@@ -25,28 +29,20 @@ _BRAK_MASTER_PCT=0
 _BRAK_MASTER_MSG=""
 _BRAK_SUB_PCT=0
 _BRAK_SUB_MSG="Ready"
-_BRAK_PROG_TTY=""
 
 _BRAK_FILL_TEMPLATE="########################################"
 _BRAK_DOTS_TEMPLATE="........................................"
 
 _brak_prog_out() {
-    if [[ -n "$_BRAK_PROG_TTY" ]]; then
-        printf "%b" "$1" > "$_BRAK_PROG_TTY" 2>/dev/null || true
-    else
-        printf "%b" "$1" 2>/dev/null || true
+    if [[ -t 1 ]]; then
+        printf '%s' "$1" 2>/dev/null || true
     fi
     return 0
 }
 
 _brak_prog_query_geom() {
     local sz="" r="" c=""
-    if [[ -n "$_BRAK_PROG_TTY" ]]; then
-        sz="$(stty size < "$_BRAK_PROG_TTY" 2>/dev/null || true)"
-    fi
-    if [[ -z "$sz" ]]; then
-        sz="$(stty size <&1 2>/dev/null || stty size <&2 2>/dev/null || true)"
-    fi
+    sz="$(stty size <&1 2>/dev/null || stty size < /dev/tty 2>/dev/null || stty size <&2 2>/dev/null || true)"
     if [[ -n "$sz" ]]; then
         r="${sz%% *}"
         c="${sz##* }"
@@ -73,13 +69,14 @@ _brak_prog_format_line() {
     local pct="$4"
     local msg="$5"
     local cols="$6"
+    local esc="$_BRAK_ESC"
 
     (( pct < 0 )) && pct=0
     (( pct > 100 )) && pct=100
 
     local max_vis=$(( cols - 1 ))
     if (( max_vis < 24 )); then
-        printf ""
+        printf ''
         return 0
     fi
 
@@ -102,6 +99,7 @@ _brak_prog_format_line() {
 
     msg="${msg//$'\r'/}"
     msg="${msg//$'\n'/ }"
+    msg="${msg//"$esc"/}"
     local msg_budget=$(( max_vis - 18 - bar_w - 3 - 1 ))
     local msg_part=""
     if (( msg_budget >= 4 )) && [[ -n "$msg" ]]; then
@@ -112,8 +110,11 @@ _brak_prog_format_line() {
         fi
     fi
 
-    printf "%b%s\033[0m[%b%s\033[0m\033[2m%s\033[0m]%s" \
-        "$badge_ansi" "$badge_txt" "$bar_ansi" "$hashes" "$dots" "$msg_part"
+    printf '%s%s%s[0m[%s%s%s[0m%s[2m%s%s[0m]%s' \
+        "$badge_ansi" "$badge_txt" "$esc" \
+        "$bar_ansi" "$hashes" "$esc" \
+        "$esc" "$dots" "$esc" \
+        "$msg_part"
     return 0
 }
 
@@ -136,6 +137,7 @@ _brak_prog_sync_sub_from_disk() {
 _brak_prog_render() {
     [[ "$_BRAK_PROG_ACTIVE" != "1" ]] && return 0
 
+    local esc="$_BRAK_ESC"
     local prev_rows="$_BRAK_PROG_ROWS"
     _brak_prog_query_geom
     local rows="$_BRAK_PROG_ROWS"
@@ -149,26 +151,30 @@ _brak_prog_render() {
     local master_row="$rows"
 
     local sub_line master_line
-    sub_line="$(_brak_prog_format_line "RVDK" "\033[46;30;1m" "\033[1;36m" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" "$cols")"
-    master_line="$(_brak_prog_format_line "BrakerRak" "\033[45;37;1m" "\033[1;35m" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" "$cols")"
+    sub_line="$(_brak_prog_format_line "RVDK" "${esc}[46;30;1m" "${esc}[1;36m" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" "$cols")"
+    master_line="$(_brak_prog_format_line "BrakerRak" "${esc}[45;37;1m" "${esc}[1;35m" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" "$cols")"
 
-    local seq="\0337\033[1;${scroll_end}r"
+    local seq="${esc}7${esc}[1;${scroll_end}r"
     if (( prev_rows > 0 && prev_rows != rows )); then
         local old_sub=$(( prev_rows - 1 ))
         if (( old_sub >= 1 && old_sub <= rows )); then
-            seq+="\033[${old_sub};1f\033[0K"
+            seq+="${esc}[${old_sub};1H${esc}[0K"
         fi
         if (( prev_rows >= 1 && prev_rows <= rows )); then
-            seq+="\033[${prev_rows};1f\033[0K"
+            seq+="${esc}[${prev_rows};1H${esc}[0K"
         fi
     fi
-    seq+="\033[${sub_row};1f${sub_line}\033[0K\033[${master_row};1f${master_line}\033[0K\0338"
+    seq+="${esc}[${sub_row};1H${sub_line}${esc}[0K${esc}[${master_row};1H${master_line}${esc}[0K${esc}8"
+    if (( prev_rows > 0 && prev_rows > rows )); then
+        seq+="${esc}[${scroll_end};1H"
+    fi
     _brak_prog_out "$seq"
     return 0
 }
 
 brak_prog_init() {
     local init_msg="${1:-Initializing BrakerRak forge...}"
+    local esc="$_BRAK_ESC"
 
     if [[ "${BRAKERRAK_NO_PROGBAR:-0}" == "1" || "${NO_PROGBAR:-0}" == "1" ]]; then
         export RVDK_NO_PROGBAR="1"
@@ -176,11 +182,6 @@ brak_prog_init() {
     fi
     if [[ ! -t 1 || "${TERM:-dumb}" == "dumb" ]]; then
         return 0
-    fi
-    if (: > /dev/tty) 2>/dev/null; then
-        _BRAK_PROG_TTY="/dev/tty"
-    else
-        _BRAK_PROG_TTY=""
     fi
 
     _brak_prog_query_geom
@@ -200,12 +201,14 @@ brak_prog_init() {
 
     (
         umask 077
-        printf "%s|%s\n" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE"
-        printf "%s|%s\n" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE"
+        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE"
+        printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE"
     ) 2>/dev/null || true
 
+    # Advance 2 lines (scrolling existing bottom content up) and step up 2 rows
+    # BEFORE DECSC so the saved cursor is guaranteed inside [1 .. scroll_end].
     local scroll_end=$(( _BRAK_PROG_ROWS - 2 ))
-    _brak_prog_out "\n\n\0337\033[1;${scroll_end}r\0338\033[2A"
+    _brak_prog_out $'\n\n'"${esc}[2A${esc}7${esc}[1;${scroll_end}r${esc}8"
 
     trap 'brak_prog_cleanup' EXIT
     trap 'brak_prog_cleanup; trap - INT; kill -INT $$' INT
@@ -230,7 +233,7 @@ brak_prog() {
     [[ -n "$msg" ]] && _BRAK_MASTER_MSG="$msg"
 
     if [[ -n "${BRAKERRAK_MASTER_STATE:-}" ]]; then
-        printf "%s|%s\n" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE" 2>/dev/null || true
+        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE" 2>/dev/null || true
     fi
 
     if [[ $# -ge 3 ]]; then
@@ -242,7 +245,7 @@ brak_prog() {
         _BRAK_SUB_PCT="$spct"
         _BRAK_SUB_MSG="$smsg"
         if [[ -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
-            printf "%s|%s\n" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE" 2>/dev/null || true
+            printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE" 2>/dev/null || true
         fi
     fi
 
@@ -252,12 +255,13 @@ brak_prog() {
 
 brak_prog_cleanup() {
     local rc=$?
+    local esc="$_BRAK_ESC"
     if [[ "$_BRAK_PROG_ACTIVE" == "1" ]]; then
         _brak_prog_query_geom
         local rows="$_BRAK_PROG_ROWS"
         if (( rows >= 3 )); then
             local sub_row=$(( rows - 1 ))
-            _brak_prog_out "\0337\033[1;${rows}r\033[${sub_row};1f\033[0K\033[${rows};1f\033[0K\0338"
+            _brak_prog_out "${esc}7${esc}[1;${rows}r${esc}[${sub_row};1H${esc}[0K${esc}[${rows};1H${esc}[0K${esc}8"
         fi
         _BRAK_PROG_ACTIVE="0"
     fi
