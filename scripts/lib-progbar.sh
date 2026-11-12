@@ -5,8 +5,8 @@
 #
 # Layout when active on an interactive TTY:
 #   Rows [1 .. ROWS-2] : Scrolling command & APT/compiler output (DECSTBM)
-#   Row  [ROWS-1]      : Current RVDK sub-process progress bar (cyan badge)
-#   Row  [ROWS]        : BrakerRak master pipeline progress bar (magenta badge)
+#   Row  [ROWS-1]      : Current RVDK sub-process progress bar (#1c49f2 blue)
+#   Row  [ROWS]        : BrakerRak master pipeline progress bar (#5a26e5 purple)
 #
 # Suppressed via `--noprogbar` (`BRAKERRAK_NO_PROGBAR=1`), non-TTY stdout,
 # `TERM=dumb`, or small terminals (<10x40), cascading `RVDK_NO_PROGBAR=1` to
@@ -21,6 +21,21 @@ _BRAKERRAK_PROGBAR_SOURCED="1"
 # Literal ESC byte (0x1B). Never pass `\0337` through `printf "%b"`, because
 # bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
 _BRAK_ESC=$'\033'
+
+# Brand palette:
+#   RVDK Blue       : #1c49f2 -> RGB(28, 73, 242)
+#   BrakerRak Purple: #5a26e5 -> RGB(90, 38, 229)
+if [[ "${TERM:-}" == "linux" ]]; then
+    _BRAK_RVDK_BADGE_SGR="${_BRAK_ESC}[44;97;1m"
+    _BRAK_RVDK_BAR_SGR="${_BRAK_ESC}[1;34m"
+    _BRAK_MASTER_BADGE_SGR="${_BRAK_ESC}[45;97;1m"
+    _BRAK_MASTER_BAR_SGR="${_BRAK_ESC}[1;35m"
+else
+    _BRAK_RVDK_BADGE_SGR="${_BRAK_ESC}[48;2;28;73;242;38;2;255;255;255;1m"
+    _BRAK_RVDK_BAR_SGR="${_BRAK_ESC}[38;2;28;73;242;1m"
+    _BRAK_MASTER_BADGE_SGR="${_BRAK_ESC}[48;2;90;38;229;38;2;255;255;255;1m"
+    _BRAK_MASTER_BAR_SGR="${_BRAK_ESC}[38;2;90;38;229;1m"
+fi
 
 _BRAK_PROG_ACTIVE="0"
 _BRAK_PROG_ROWS=0
@@ -151,8 +166,8 @@ _brak_prog_render() {
     local master_row="$rows"
 
     local sub_line master_line
-    sub_line="$(_brak_prog_format_line "RVDK" "${esc}[46;30;1m" "${esc}[1;36m" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" "$cols")"
-    master_line="$(_brak_prog_format_line "BrakerRak" "${esc}[45;37;1m" "${esc}[1;35m" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" "$cols")"
+    sub_line="$(_brak_prog_format_line "RVDK" "$_BRAK_RVDK_BADGE_SGR" "$_BRAK_RVDK_BAR_SGR" "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" "$cols")"
+    master_line="$(_brak_prog_format_line "BrakerRak" "$_BRAK_MASTER_BADGE_SGR" "$_BRAK_MASTER_BAR_SGR" "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" "$cols")"
 
     local seq="${esc}7${esc}[1;${scroll_end}r"
     if (( prev_rows > 0 && prev_rows != rows )); then
