@@ -113,10 +113,16 @@ if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
     fi
 fi
 
-if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" ]]; then
+# If symlinked into a different user's ~/.brakerrak/engine (e.g. factory 'user' after switching to admin user),
+# clone/copy into the active user's ~/.brakerrak/engine so purging the factory user never breaks /usr/local/bin/brakerrak.
+if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" ]] && ! [[ "$CANDIDATE_ROOT" == */.brakerrak/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
     LOCAL_ROOT="$CANDIDATE_ROOT"
 else
-    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+    if [[ "$CANDIDATE_ROOT" == */.brakerrak/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" && ! -d "${ENGINE_DIR}/.git" ]]; then
+        install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR" "${BRAKER_DIR}/snapshots"
+        cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
+        chown -R "${REAL_USER}:${REAL_GRP}" "$ENGINE_DIR"
+    elif [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         bash "${CANDIDATE_ROOT}/install-cli.sh" --quiet
     else
         if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
@@ -241,12 +247,27 @@ else
     esac
 fi
 
+FACTORY_USER=""
+case "$TARGET_BOARD" in
+    starfive-jh7110) FACTORY_USER="user" ;;
+esac
+
 log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) | Action: ${ACTION}"
 
 # ==============================================================================
 # 6. CONFIG RESOLUTION (Pass 1 Template Generation vs. Pass 2 node.env Load)
 # ==============================================================================
 install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
+
+# If Pass 1 was run from the factory default user (e.g. 'user' on JH7110) and we are now
+# running as the designated admin user before purging 'user', pre-seed node.env from /home/<factory_user>
+if [[ -n "$FACTORY_USER" && "$REAL_USER" != "$FACTORY_USER" && ! -f "$NODE_ENV" && -f "/home/${FACTORY_USER}/.brakerrak/node.env" ]]; then
+    cp -a "/home/${FACTORY_USER}/.brakerrak/node.env" "$NODE_ENV"
+    sed -i "s/^ADMIN_USER=\"${FACTORY_USER}\"/ADMIN_USER=\"${REAL_USER}\"/" "$NODE_ENV" 2>/dev/null || true
+    chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
+    chmod 0640 "$NODE_ENV"
+    log_ok "Adopted Pass 1 node.env from /home/${FACTORY_USER}/.brakerrak/node.env -> ${NODE_ENV}"
+fi
 
 if [[ -f "$NODE_ENV" ]]; then
     FORGE_PASS="2"
@@ -399,6 +420,35 @@ fi
 # ==============================================================================
 # 8. STAGE 6: POST-FLIGHT CONVERGENCE SUMMARY
 # ==============================================================================
+CPU_HARTS="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "?")"
+if [[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    CPU_GOV="$(cat /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor 2>/dev/null | sort -u | paste -sd/ -)"
+else
+    CPU_GOV="firmware-fixed"
+fi
+CPU_KHZ=""
+for freq_file in \
+    /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq \
+    /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq \
+    /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq; do
+    if [[ -r "$freq_file" ]]; then
+        CPU_KHZ="$(tr -dc '0-9' < "$freq_file" 2>/dev/null || true)"
+        [[ -n "$CPU_KHZ" ]] && break
+    fi
+done
+if [[ -n "$CPU_KHZ" && "$CPU_KHZ" -gt 0 ]]; then
+    CPU_CLOCK_INFO="${CPU_GOV} @ $(( CPU_KHZ / 1000 )) MHz (${CPU_HARTS} Harts)"
+elif [[ -r /proc/device-tree/cpus/cpu@0/clock-frequency ]] && command -v python3 >/dev/null 2>&1; then
+    DT_MHZ="$(python3 -c 'import pathlib; b=pathlib.Path("/proc/device-tree/cpus/cpu@0/clock-frequency").read_bytes(); print(int.from_bytes(b, "big") // 1000000)' 2>/dev/null || true)"
+    if [[ -n "$DT_MHZ" && "$DT_MHZ" -gt 0 ]]; then
+        CPU_CLOCK_INFO="${CPU_GOV} @ ${DT_MHZ} MHz (${CPU_HARTS} Harts)"
+    else
+        CPU_CLOCK_INFO="${CPU_GOV} (${CPU_HARTS} Harts)"
+    fi
+else
+    CPU_CLOCK_INFO="${CPU_GOV} (${CPU_HARTS} Harts)"
+fi
+
 NVME_SHORT="$(basename "$NVME_DEV")"
 LBA_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
 NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "unmounted")"
@@ -421,6 +471,7 @@ fi
 log_step "6. Post-Flight Verification Summary (Pass ${FORGE_PASS})"
 printf "  • Hostname           : %s (Role: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$FORGE_PASS"
 printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
+printf "  • CPU Governor/Clock : %s\n" "$CPU_CLOCK_INFO"
 printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"
 printf "  • Hot NVMe Mount     : %s\n" "$NVME_MNT_INFO"
 printf "  • PG Data Directory  : %s\n" "$PG_DATA_DIR"
@@ -428,4 +479,20 @@ printf "  • PG 18 Async I/O    : io_method = %s\n" "$PG_IO_METHOD"
 printf "  • PG Shared Buffers  : %s (HugePages in use: %s / %s)\n" "$PG_SHBUF" "$HP_USED" "$HP_TOTAL"
 printf "  • Mosquitto MQTT     : %s (Port %s)\n" "$MQTT_STATE" "$MQTT_PORT"
 printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "$LAB_SUBNET"
+
+# ==============================================================================
+# 9. STAGE 7: FACTORY DEFAULT USER MIGRATION & PURGE
+# ==============================================================================
+if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
+    if id -u "$FACTORY_USER" >/dev/null 2>&1 || [[ -d "/home/${FACTORY_USER}" ]]; then
+        if [[ "$REAL_USER" == "$ADMIN_USER" ]]; then
+            log_step "7. Migrating Artifacts & Purging Factory Default User ('${FACTORY_USER}' -> '${ADMIN_USER}')"
+            /usr/local/bin/rvdk utils/purge-user.sh "$FACTORY_USER" --to-user "$ADMIN_USER"
+            echo ""
+        else
+            log_brak "Factory user '${FACTORY_USER}' still exists (active session: '${REAL_USER}'). Log in as '${ADMIN_USER}' and re-run 'sudo brakerrak' to migrate ~/.brakerrak & purge '${FACTORY_USER}'."
+        fi
+    fi
+fi
+
 log_ok "${TARGET_HOSTNAME} PostgreSQL 18.6 (${NODE_ROLE}) Forge Complete!"
