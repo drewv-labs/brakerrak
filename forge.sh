@@ -8,7 +8,7 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--force-rebuild-pg]
+#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--force-rebuild-pg]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
@@ -174,6 +174,7 @@ CLI_MOUNT_POINT=""
 CLI_WITH_RAID=""
 CLI_ENABLE_MQTT=""
 CLI_ENABLE_NFS=""
+CLI_NFS_BACKEND=""
 FORCE_WIPE_NVME="false"
 FORCE_WIPE_RAID="false"
 FORCE_REBUILD_PG="false"
@@ -181,25 +182,29 @@ FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)           TARGET_BOARD="${2:-}"; shift 2 ;;
-        --role)             CLI_ROLE="${2:-}"; shift 2 ;;
-        --hostname)         CLI_HOSTNAME="${2:-}"; shift 2 ;;
-        --user)             CLI_USER="${2:-}"; shift 2 ;;
-        --subnet)           CLI_SUBNET="${2:-}"; shift 2 ;;
-        --nvme-dev)         CLI_NVME_DEV="${2:-}"; shift 2 ;;
-        --mount-point)      CLI_MOUNT_POINT="${2:-}"; shift 2 ;;
-        --with-raid)        CLI_WITH_RAID="true"; shift ;;
-        --no-raid)          CLI_WITH_RAID="false"; shift ;;
-        --with-mqtt)        CLI_ENABLE_MQTT="true"; shift ;;
-        --no-mqtt)          CLI_ENABLE_MQTT="false"; shift ;;
-        --with-nfs)         CLI_ENABLE_NFS="true"; shift ;;
-        --no-nfs)           CLI_ENABLE_NFS="false"; shift ;;
-        --force-wipe-nvme)  FORCE_WIPE_NVME="true"; shift ;;
-        --force-wipe-raid)  FORCE_WIPE_RAID="true"; shift ;;
+        --target)                   TARGET_BOARD="${2:-}"; shift 2 ;;
+        --role)                     CLI_ROLE="${2:-}"; shift 2 ;;
+        --hostname)                 CLI_HOSTNAME="${2:-}"; shift 2 ;;
+        --user)                     CLI_USER="${2:-}"; shift 2 ;;
+        --subnet)                   CLI_SUBNET="${2:-}"; shift 2 ;;
+        --nvme-dev)                 CLI_NVME_DEV="${2:-}"; shift 2 ;;
+        --mount-point)              CLI_MOUNT_POINT="${2:-}"; shift 2 ;;
+        --with-raid)                CLI_WITH_RAID="true"; shift ;;
+        --no-raid)                  CLI_WITH_RAID="false"; shift ;;
+        --with-mqtt)                CLI_ENABLE_MQTT="true"; shift ;;
+        --no-mqtt)                  CLI_ENABLE_MQTT="false"; shift ;;
+        --with-nfs)                 CLI_ENABLE_NFS="true"; shift ;;
+        --no-nfs)                   CLI_ENABLE_NFS="false"; shift ;;
+        --nfs-backend)              CLI_NFS_BACKEND="${2:-}"; shift 2 ;;
+        --nfs-ganesha)              CLI_NFS_BACKEND="ganesha"; shift ;;
+        --nfs-kernel|--nfs-kernal)  CLI_NFS_BACKEND="kernel"; shift ;;
+        --nfs-auto)                 CLI_NFS_BACKEND="auto"; shift ;;
+        --force-wipe-nvme)          FORCE_WIPE_NVME="true"; shift ;;
+        --force-wipe-raid)          FORCE_WIPE_RAID="true"; shift ;;
         --force-rebuild-pg|--force-build|--compile-pg|--no-pkg-cache)
-                            FORCE_REBUILD_PG="true"; shift ;;
-        --use-pkg-cache)    FORCE_REBUILD_PG="false"; shift ;;
-        *)                  FORWARD_ARGS+=("$1"); shift ;;
+                                    FORCE_REBUILD_PG="true"; shift ;;
+        --use-pkg-cache)            FORCE_REBUILD_PG="false"; shift ;;
+        *)                          FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
 
@@ -287,7 +292,18 @@ RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 ENABLE_MQTT_BROKER="${CLI_ENABLE_MQTT:-${ENABLE_MQTT_BROKER:-$DEFAULT_MQTT}}"
 MQTT_PORT="${MQTT_PORT:-1883}"
 ENABLE_NFS_SERVER="${CLI_ENABLE_NFS:-${ENABLE_NFS_SERVER:-$DEFAULT_NFS}}"
+NFS_BACKEND="${CLI_NFS_BACKEND:-${NFS_BACKEND:-ganesha}}"
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT:-false}"
+
+NFS_BACKEND="$(tr '[:upper:]' '[:lower:]' <<< "$NFS_BACKEND")"
+case "$NFS_BACKEND" in
+    ganesha|nfs-ganesha|userspace)           NFS_BACKEND="ganesha" ;;
+    kernel|nfs-kernel|nfs-kernal|knfsd|nfsd) NFS_BACKEND="kernel" ;;
+    auto)                                    NFS_BACKEND="auto" ;;
+    *)
+        log_fatal "Unknown NFS_BACKEND '${NFS_BACKEND}' (expected: ganesha | kernel | auto)"
+        ;;
+esac
 
 if [[ "$FORGE_PASS" == "1" ]]; then
     cat <<EOF > "$NODE_ENV"
@@ -312,6 +328,8 @@ RAID_ARRAYS_JSON='${RAID_ARRAYS_JSON}'
 ENABLE_MQTT_BROKER="${ENABLE_MQTT_BROKER}"
 MQTT_PORT="${MQTT_PORT}"
 ENABLE_NFS_SERVER="${ENABLE_NFS_SERVER}"
+# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto
+NFS_BACKEND="${NFS_BACKEND}"
 
 # Opt-In Community RISC-V Telemetry Commons
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT}"
@@ -319,10 +337,12 @@ EOF
     chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
     chmod 0640 "$NODE_ENV"
     log_ok "Generated Pass 1 node configuration: ${NODE_ENV}"
+elif ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null; then
+    printf '\n# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto\nNFS_BACKEND="%s"\n' "$NFS_BACKEND" >> "$NODE_ENV"
 fi
 
 export BRAKERRAK_NODE_ENV="$NODE_ENV"
-export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT WITH_RAID RAID_ARRAYS_JSON ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER
+export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT WITH_RAID RAID_ARRAYS_JSON ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND
 
 # ==============================================================================
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
@@ -362,8 +382,8 @@ else
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
-    log_step "5B. RVDK NFSv4 Vault Exports (-> ${LAB_SUBNET})"
-    /usr/local/bin/rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT"
+    log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})"
+    /usr/local/bin/rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
 else
     log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
     if systemctl is-active --quiet nfs-server.service 2>/dev/null || systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
