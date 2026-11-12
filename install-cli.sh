@@ -106,6 +106,14 @@ if [[ "$QUIET_MODE" == "false" ]]; then
         OS_PRETTY="$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
     fi
 
+    RVDK_ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
+    if [[ -d "${RVDK_ENGINE_DIR}/.git" ]]; then
+        RVDK_SHA="$(git -C "$RVDK_ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
+        RVDK_STATUS="${RVDK_ENGINE_DIR} (${RVDK_SHA})"
+    else
+        RVDK_STATUS="auto-installed on forge/update"
+    fi
+
     cat <<EOF
 
 ======================================================================
@@ -113,6 +121,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    Board : ${DT_MODEL}
    OS    : ${OS_PRETTY}
    Root  : ${ENGINE_DIR}
+   RVDK  : ${RVDK_STATUS}
 
  Usage:
    sudo brakerrak                           # Converge node using ~/.brakerrak/node.env
@@ -121,7 +130,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
    sudo brakerrak ort [--stage <tag>]       # Capture read-only ORT & CTD snapshot
    sudo brakerrak verify [--use-pkg-cache]  # Run 5-stage convergence & idempotency harness
    sudo brakerrak reset --confirm-destroy   # Roll back NVMe to factory 512e & Day-0 state
-   sudo brakerrak update                    # Pull latest BrakerRak engine from GitHub
+   sudo brakerrak update                    # Pull latest RVDK + BrakerRak engines from GitHub
 ======================================================================
 EOF
 fi

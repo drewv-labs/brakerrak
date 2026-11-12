@@ -105,8 +105,9 @@ else
 fi
 
 echo "=== 1. Stopping DataBroker Services & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
-systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server 2>/dev/null || true
-systemctl disable nfs-kernel-server mosquitto 2>/dev/null || true
+systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service 2>/dev/null || true
+systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto 2>/dev/null || true
+systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
 pkill -9 -u postgres 2>/dev/null || true
 
 if [[ "$KEEP_CACHE" == "true" ]]; then
@@ -191,6 +192,9 @@ rm -f /etc/mosquitto/conf.d/brakerrak.conf \
       /etc/mosquitto/conf.d/99-rvdk-broker.conf
 rm -f /etc/exports.d/rvdk-vaults.exports \
       /etc/exports.d/brakerrak-vaults.exports
+if [[ -f /etc/ganesha/ganesha.conf ]] && grep -q "DREW-V Labs // RVDK" /etc/ganesha/ganesha.conf 2>/dev/null; then
+    printf "# Reset by BrakerRak reset-day0.sh\n" > /etc/ganesha/ganesha.conf
+fi
 if [[ -f /etc/exports ]]; then
     sed -i '/# BRAKERRAK_NFS_BEGIN/,/# BRAKERRAK_NFS_END/d' /etc/exports 2>/dev/null || true
 fi

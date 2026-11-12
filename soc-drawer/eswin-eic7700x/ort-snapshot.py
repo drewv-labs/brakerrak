@@ -218,11 +218,22 @@ def inspect_postgres_state() -> dict[str, Any]:
 def inspect_databroker_services(env_map: dict[str, str]) -> dict[str, Any]:
     mqtt_active = run_cmd(["systemctl", "is-active", "mosquitto"]) == "active"
     mqtt_port = int(env_map.get("MQTT_PORT", "1883"))
-    nfs_active = run_cmd(["systemctl", "is-active", "nfs-kernel-server"]) == "active"
-    exports_raw = read_sysfs("/etc/exports") or ""
+    nfs_kernel_active = run_cmd(["systemctl", "is-active", "nfs-server.service"]) == "active"
+    nfs_ganesha_active = run_cmd(["systemctl", "is-active", "nfs-ganesha.service"]) == "active"
+    nfs_active = nfs_kernel_active or nfs_ganesha_active
+    nfs_backend = (
+        "nfs-kernel-server"
+        if nfs_kernel_active
+        else ("nfs-ganesha" if nfs_ganesha_active else "none")
+    )
+    exports_sources = [
+        read_sysfs("/etc/exports") or "",
+        read_sysfs("/etc/exports.d/rvdk-vaults.exports") or "",
+    ]
     active_exports = [
         line.strip()
-        for line in exports_raw.splitlines()
+        for raw in exports_sources
+        for line in raw.splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
     return {
@@ -232,6 +243,7 @@ def inspect_databroker_services(env_map: dict[str, str]) -> dict[str, Any]:
         },
         "nfs_v4_server": {
             "systemd_service_active": nfs_active,
+            "backend": nfs_backend,
             "configured_exports": active_exports,
         },
     }

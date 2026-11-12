@@ -12,7 +12,7 @@
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
-#   sudo brakerrak update
+#   sudo brakerrak update [--skip-rvdk]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -84,10 +84,31 @@ else
 fi
 
 if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
+    RVDK_QUIET_ARGS=("--quiet")
+    SKIP_RVDK_UPDATE="false"
+    BRAK_UPDATE_ARGS=()
+    for uarg in "$@"; do
+        case "$uarg" in
+            --skip-rvdk|--only-brakerrak) SKIP_RVDK_UPDATE="true" ;;
+            -v|--verbose)                 RVDK_QUIET_ARGS=() ;;
+            *)                            BRAK_UPDATE_ARGS+=("$uarg") ;;
+        esac
+    done
+
+    if [[ "$SKIP_RVDK_UPDATE" != "true" ]]; then
+        if [[ -x /usr/local/bin/rvdk ]]; then
+            /usr/local/bin/rvdk update ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+        elif [[ -f "${REAL_HOME}/.rvdk/engine/install-cli.sh" ]]; then
+            bash "${REAL_HOME}/.rvdk/engine/install-cli.sh" ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+        else
+            curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+        fi
+    fi
+
     if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
-        exec bash "${CANDIDATE_ROOT}/install-cli.sh"
+        exec bash "${CANDIDATE_ROOT}/install-cli.sh" ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
     else
-        curl -fsSL "${BRAKERRAK_BASE_URL}/install-cli.sh" | bash
+        curl -fsSL "${BRAKERRAK_BASE_URL}/install-cli.sh" | bash -s -- ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
         exit 0
     fi
 fi
@@ -341,13 +362,17 @@ else
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
-    log_step "5B. RVDK NFSv4 Kernel Server Vault Exports (-> ${LAB_SUBNET})"
+    log_step "5B. RVDK NFSv4 Vault Exports (-> ${LAB_SUBNET})"
     /usr/local/bin/rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT"
 else
-    log_step "5B. NFSv4 Kernel Server Skipped (ENABLE_NFS_SERVER=false)"
-    if systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
-        systemctl disable --now nfs-kernel-server
+    log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
+    if systemctl is-active --quiet nfs-server.service 2>/dev/null || systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
+        systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
         log_ok "Disabled nfs-kernel-server for benchmark isolation"
+    fi
+    if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
+        systemctl disable --now nfs-ganesha.service 2>/dev/null || true
+        log_ok "Disabled nfs-ganesha for benchmark isolation"
     fi
 fi
 
@@ -365,8 +390,13 @@ HP_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 
 HP_USED=$(( HP_TOTAL - HP_FREE ))
 MQTT_STATE="$(systemctl is-active mosquitto 2>/dev/null || true)"
 [[ -z "$MQTT_STATE" ]] && MQTT_STATE="inactive"
-NFS_STATE="$(systemctl is-active nfs-kernel-server 2>/dev/null || true)"
-[[ -z "$NFS_STATE" ]] && NFS_STATE="inactive"
+if systemctl is-active --quiet nfs-server.service 2>/dev/null; then
+    NFS_STATE="active (kernel nfsd)"
+elif systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
+    NFS_STATE="active (userspace nfs-ganesha)"
+else
+    NFS_STATE="inactive"
+fi
 
 log_step "6. Post-Flight Verification Summary (Pass ${FORGE_PASS})"
 printf "  • Hostname           : %s (Role: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$FORGE_PASS"
