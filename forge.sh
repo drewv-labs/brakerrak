@@ -8,7 +8,7 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--with-tailscale] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
@@ -62,6 +62,14 @@ REPO_URL="${BRAKERRAK_REPO_URL:-https://github.com/drewv-labs/brakerrak.git}"
 REPO_BRANCH="${BRAKERRAK_BRANCH:-main}"
 BRAKERRAK_BASE_URL="${BRAKERRAK_BASE_URL:-https://brakerrak.dev}"
 RVDK_BASE_URL="${RVDK_BASE_URL:-https://rvdk.drewv-labs.dev}"
+
+# Track whether `apt-get update` has already run during this forge session (true|false)
+# so subsequent RVDK modules receive `--no-apt-update`.
+APT_UPDATED="${APT_UPDATED:-false}"
+case "$APT_UPDATED" in
+    1|true|TRUE|yes|YES) APT_UPDATED="true" ;;
+    *)                   APT_UPDATED="false" ;;
+esac
 
 log_brak()  { printf "\033[1;35m[BRAKERRAK]\033[0m %s\n" "$1"; }
 log_step()  { printf "\n\033[1;36m=== [%s] %s ===\033[0m\n" "$(date +%H:%M:%S)" "$1"; }
@@ -137,7 +145,10 @@ else
         if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
             if command -v apt-get >/dev/null 2>&1; then
                 export DEBIAN_FRONTEND=noninteractive
-                apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+                if [[ "$APT_UPDATED" != "true" ]]; then
+                    apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+                    APT_UPDATED="true"
+                fi
                 apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
             else
                 log_fatal "Missing git or curl."
@@ -229,6 +240,8 @@ while [[ $# -gt 0 ]]; do
                                     CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--advertise-routes" "${2:-}"); shift 2 ;;
         --tailscale-userspace)
                                     CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--userspace"); shift ;;
+        --no-apt-update|--skip-apt-update)
+                                    APT_UPDATED="true"; shift ;;
         --force-wipe-nvme)          FORCE_WIPE_NVME="true"; shift ;;
         --force-wipe-raid)          FORCE_WIPE_RAID="true"; shift ;;
         --force-rebuild-pg|--force-build|--compile-pg|--no-pkg-cache)
@@ -240,6 +253,26 @@ while [[ $# -gt 0 ]]; do
         *)                          FORWARD_ARGS+=("$1"); shift ;;
     esac
 done
+
+APT_STAMP_FILE="/run/brakerrak-apt-$$.stamp"
+export RVDK_APT_STAMP_FILE="$APT_STAMP_FILE"
+if [[ "$APT_UPDATED" != "true" ]]; then
+    rm -f "$APT_STAMP_FILE" 2>/dev/null || true
+fi
+
+# Dispatch an RVDK subcommand while propagating `--no-apt-update` once APT_UPDATED=true
+run_rvdk() {
+    local subcmd="$1"
+    shift
+    if [[ "$APT_UPDATED" == "true" ]]; then
+        /usr/local/bin/rvdk "$subcmd" --no-apt-update "$@"
+    else
+        /usr/local/bin/rvdk "$subcmd" "$@"
+        if [[ -f "$APT_STAMP_FILE" ]]; then
+            APT_UPDATED="true"
+        fi
+    fi
+}
 
 # ==============================================================================
 # 5. Auto-Detect Silicon Target & Short Tag from /proc/device-tree/model
@@ -413,26 +446,26 @@ fi
 
 brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launching rvdk day0..."
 log_step "1. RVDK Day-0 OS & Silicon BSP Convergence (Hostname: ${TARGET_HOSTNAME})"
-/usr/local/bin/rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
+run_rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
 
 brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
 log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
 NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT")
 [[ "$FORCE_WIPE_NVME" == "true" ]] && NVME_FLAGS+=(--force-wipe)
-/usr/local/bin/rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
+run_rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
 
 brak_prog 45 "Stage 3/7: PostgreSQL 18.6 (io_uring + Sv39 HugePages)" 0 "Launching rvdk postgresql..."
 log_step "3. RVDK PostgreSQL 18.6 Convergence (io_uring + Sv39 HugePages)"
 PG_FLAGS=(--data-mount "$MOUNT_POINT" --subnet "$LAB_SUBNET")
 [[ "$FORCE_REBUILD_PG" == "true" ]] && PG_FLAGS+=(--force-build)
-/usr/local/bin/rvdk postgresql "${PG_FLAGS[@]}"
+run_rvdk postgresql "${PG_FLAGS[@]}"
 
 if [[ "$WITH_RAID" == "true" ]]; then
     brak_prog 70 "Stage 4/7: Btrfs RAID 10 Vault Provisioning" 0 "Launching rvdk mods/btrfs-raid..."
     log_step "4. RVDK Btrfs RAID 10 Vault Provisioning & Tablespace Binding"
     RAID_FLAGS=()
     [[ "$FORCE_WIPE_RAID" == "true" ]] && RAID_FLAGS+=(--force-wipe-raid)
-    /usr/local/bin/rvdk mods/btrfs-raid ${RAID_FLAGS[@]+"${RAID_FLAGS[@]}"}
+    run_rvdk mods/btrfs-raid ${RAID_FLAGS[@]+"${RAID_FLAGS[@]}"}
 else
     brak_prog 74 "Stage 4/7: Btrfs RAID 10 Skipped (WITH_RAID=false)" 100 "mods/btrfs-raid skipped"
     log_step "4. Btrfs RAID 10 Vault Provisioning Skipped (WITH_RAID=false)"
@@ -441,7 +474,7 @@ fi
 if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
     brak_prog 78 "Stage 5A/7: Eclipse Mosquitto MQTT Broker (:${MQTT_PORT})" 0 "Launching rvdk mods/mosquitto..."
     log_step "5A. RVDK Eclipse Mosquitto MQTT Broker (:${MQTT_PORT} + Unix Socket)"
-    /usr/local/bin/rvdk mods/mosquitto --port "$MQTT_PORT" --data-mount "$MOUNT_POINT"
+    run_rvdk mods/mosquitto --port "$MQTT_PORT" --data-mount "$MOUNT_POINT"
 else
     brak_prog 82 "Stage 5A/7: Mosquitto MQTT Skipped (ENABLE_MQTT_BROKER=false)" 100 "mods/mosquitto skipped"
     log_step "5A. Mosquitto MQTT Broker Skipped (ENABLE_MQTT_BROKER=false)"
@@ -450,7 +483,7 @@ fi
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
     brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})" 0 "Launching rvdk mods/nfs-vault..."
     log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})"
-    /usr/local/bin/rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
+    run_rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
 else
     brak_prog 90 "Stage 5B/7: NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)" 100 "mods/nfs-vault skipped"
     log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
@@ -468,9 +501,9 @@ if [[ "$CLI_WITH_TAILSCALE" == "true" ]]; then
     brak_prog 92 "Stage 5C: Tailscale Mesh VPN (--with-tailscale)" 0 "Launching rvdk mods/tailscale..."
     log_step "5C. RVDK Tailscale Mesh VPN (--with-tailscale)"
     if [[ -n "$CLI_TS_AUTHKEY" ]]; then
-        TS_AUTHKEY="$CLI_TS_AUTHKEY" /usr/local/bin/rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
+        TS_AUTHKEY="$CLI_TS_AUTHKEY" run_rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
     else
-        /usr/local/bin/rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
+        run_rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
     fi
 fi
 
@@ -569,6 +602,7 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
     fi
 fi
 
+rm -f "$APT_STAMP_FILE" 2>/dev/null || true
 brak_prog 100 "${TARGET_HOSTNAME} (${NODE_ROLE}) Forge Complete!" 100 "All RVDK stages complete"
 brak_prog_cleanup
 log_ok "${TARGET_HOSTNAME} PostgreSQL 18.6 (${NODE_ROLE}) Forge Complete!"

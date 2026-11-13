@@ -4,7 +4,7 @@
 # Path: brakerrak/scripts/verify-convergence.sh
 #
 # Usage:
-#   sudo brakerrak verify [--role databroker|databench] [--hostname <name>] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak verify [--role databroker|databench] [--hostname <name>] [--force-rebuild-pg] [--no-apt-update] [--noprogbar]
 #   sudo ./scripts/verify-convergence.sh [--out-dir ~/.brakerrak/snapshots] [--noprogbar]
 # ==============================================================================
 set -Eeuo pipefail
@@ -81,7 +81,7 @@ bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"}
 
 echo ""
 echo ">>> [STAGE 2] Executing Idempotency Validation Pass 2 (Expecting Converged [SKIP] States)..."
-bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS2_ARGS[@]+"${PASS2_ARGS[@]}"}
+APT_UPDATED="true" bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS2_ARGS[@]+"${PASS2_ARGS[@]}"}
 
 echo ""
 echo ">>> [STAGE 3] Capturing Day-1 Post-Forge CTD Provenance Snapshot..."

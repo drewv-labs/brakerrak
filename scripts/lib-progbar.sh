@@ -286,6 +286,9 @@ brak_prog_cleanup() {
     if [[ -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
         rm -f "${BRAKERRAK_SUB_STATE}" 2>/dev/null || true
     fi
+    if [[ -n "${RVDK_APT_STAMP_FILE:-}" ]]; then
+        rm -f "${RVDK_APT_STAMP_FILE}" 2>/dev/null || true
+    fi
     unset BRAKERRAK_PROGBAR_ACTIVE BRAKERRAK_MASTER_STATE BRAKERRAK_SUB_STATE 2>/dev/null || true
     return "$rc"
 }
