@@ -8,7 +8,7 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--with-tailscale] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
@@ -190,6 +190,9 @@ CLI_WITH_RAID=""
 CLI_ENABLE_MQTT=""
 CLI_ENABLE_NFS=""
 CLI_NFS_BACKEND=""
+CLI_WITH_TAILSCALE="false"
+CLI_TS_AUTHKEY=""
+CLI_TS_FLAGS=()
 FORCE_WIPE_NVME="false"
 FORCE_WIPE_RAID="false"
 FORCE_REBUILD_PG="false"
@@ -214,6 +217,18 @@ while [[ $# -gt 0 ]]; do
         --nfs-ganesha)              CLI_NFS_BACKEND="ganesha"; shift ;;
         --nfs-kernel|--nfs-kernal)  CLI_NFS_BACKEND="kernel"; shift ;;
         --nfs-auto)                 CLI_NFS_BACKEND="auto"; shift ;;
+        --with-tailscale|--tailscale)
+                                    CLI_WITH_TAILSCALE="true"; shift ;;
+        --tailscale-up|--ts-up)
+                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--up"); shift ;;
+        --tailscale-ssh|--ts-ssh)
+                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--ssh"); shift ;;
+        --tailscale-authkey|--ts-authkey)
+                                    CLI_WITH_TAILSCALE="true"; CLI_TS_AUTHKEY="${2:-}"; shift 2 ;;
+        --tailscale-routes)
+                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--advertise-routes" "${2:-}"); shift 2 ;;
+        --tailscale-userspace)
+                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--userspace"); shift ;;
         --force-wipe-nvme)          FORCE_WIPE_NVME="true"; shift ;;
         --force-wipe-raid)          FORCE_WIPE_RAID="true"; shift ;;
         --force-rebuild-pg|--force-build|--compile-pg|--no-pkg-cache)
@@ -449,6 +464,16 @@ else
     fi
 fi
 
+if [[ "$CLI_WITH_TAILSCALE" == "true" ]]; then
+    brak_prog 92 "Stage 5C: Tailscale Mesh VPN (--with-tailscale)" 0 "Launching rvdk mods/tailscale..."
+    log_step "5C. RVDK Tailscale Mesh VPN (--with-tailscale)"
+    if [[ -n "$CLI_TS_AUTHKEY" ]]; then
+        TS_AUTHKEY="$CLI_TS_AUTHKEY" /usr/local/bin/rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
+    else
+        /usr/local/bin/rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
+    fi
+fi
+
 # ==============================================================================
 # 8. STAGE 6: POST-FLIGHT CONVERGENCE SUMMARY
 # ==============================================================================
@@ -501,6 +526,16 @@ else
     NFS_STATE="inactive"
 fi
 
+TS_SUMMARY=""
+if [[ "$CLI_WITH_TAILSCALE" == "true" ]] || systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+    if systemctl is-active --quiet tailscaled.service 2>/dev/null; then
+        TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+        TS_SUMMARY="active (${TS_IP:-needs 'sudo tailscale up'})"
+    else
+        TS_SUMMARY="inactive"
+    fi
+fi
+
 log_step "6. Post-Flight Verification Summary (Pass ${FORGE_PASS})"
 printf "  • Hostname           : %s (Role: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$FORGE_PASS"
 printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
@@ -511,7 +546,12 @@ printf "  • PG Data Directory  : %s\n" "$PG_DATA_DIR"
 printf "  • PG 18 Async I/O    : io_method = %s\n" "$PG_IO_METHOD"
 printf "  • PG Shared Buffers  : %s (HugePages in use: %s / %s)\n" "$PG_SHBUF" "$HP_USED" "$HP_TOTAL"
 printf "  • Mosquitto MQTT     : %s (Port %s)\n" "$MQTT_STATE" "$MQTT_PORT"
-printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "$LAB_SUBNET"
+if [[ -n "$TS_SUMMARY" ]]; then
+    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n" "$NFS_STATE" "$LAB_SUBNET"
+    printf "  • Tailscale Mesh VPN : %s\n\n" "$TS_SUMMARY"
+else
+    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "$LAB_SUBNET"
+fi
 
 # ==============================================================================
 # 9. STAGE 7: FACTORY DEFAULT USER MIGRATION & PURGE
