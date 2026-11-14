@@ -8,7 +8,8 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak deeptune [--role databroker|databench|devbench]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
@@ -77,13 +78,21 @@ log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[BRAKERRAK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
+# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` vs `ml`)
+role_to_rvdk_tune() {
+    case "${1:-databroker}" in
+        devbench) echo "ml" ;;
+        *)        echo "data" ;;
+    esac
+}
+
 # ==============================================================================
-# 1. Parse Subcommand (forge | ort | verify | reset | update)
+# 1. Parse Subcommand (forge | deeptune | ort | verify | reset | update)
 # ==============================================================================
 ACTION="forge"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        forge|ort|verify|reset|update|self-update)
+        forge|deeptune|deep-tune|ort|verify|reset|update|self-update)
             ACTION="$1"
             shift
             ;;
@@ -173,9 +182,34 @@ install -d -m 0755 /usr/local/bin
 ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
 
 # ==============================================================================
-# 3. Route Shared Lifecycle Subcommands Immediately (ort | verify | reset)
+# 3. Route Shared Lifecycle Subcommands Immediately (deeptune | ort | verify | reset)
 # ==============================================================================
 case "$ACTION" in
+    deeptune|deep-tune)
+        DT_ROLE=""
+        DT_EXPLICIT_TUNE=""
+        DT_PASS_ARGS=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --role)    DT_ROLE="${2:-}"; shift 2 ;;
+                -t|--tune) DT_EXPLICIT_TUNE="${2:-}"; shift 2 ;;
+                --tune=*)  DT_EXPLICIT_TUNE="${1#*=}"; shift ;;
+                *)         DT_PASS_ARGS+=("$1"); shift ;;
+            esac
+        done
+        if [[ -z "$DT_EXPLICIT_TUNE" ]]; then
+            if [[ -z "$DT_ROLE" && -f "$NODE_ENV" ]]; then
+                DT_ROLE="$(awk -F= '/^NODE_ROLE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$NODE_ENV" 2>/dev/null || true)"
+            fi
+            DT_EXPLICIT_TUNE="$(role_to_rvdk_tune "${DT_ROLE:-databroker}")"
+        fi
+        for a in ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}; do
+            if [[ "$a" == "status" || "$a" == "--status" ]]; then
+                exec /usr/local/bin/rvdk deeptune "${DT_PASS_ARGS[@]}"
+            fi
+        done
+        exec /usr/local/bin/rvdk deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
+        ;;
     ort)
         exec bash "${LOCAL_ROOT}/scripts/ort-snapshot.sh" "$@"
         ;;
@@ -201,6 +235,8 @@ CLI_WITH_RAID=""
 CLI_ENABLE_MQTT=""
 CLI_ENABLE_NFS=""
 CLI_NFS_BACKEND=""
+CLI_WITH_DEEPTUNE="false"
+CLI_DEEPTUNE_TUNE=""
 CLI_WITH_TAILSCALE="false"
 CLI_TS_AUTHKEY=""
 CLI_TS_FLAGS=()
@@ -228,6 +264,10 @@ while [[ $# -gt 0 ]]; do
         --nfs-ganesha)              CLI_NFS_BACKEND="ganesha"; shift ;;
         --nfs-kernel|--nfs-kernal)  CLI_NFS_BACKEND="kernel"; shift ;;
         --nfs-auto)                 CLI_NFS_BACKEND="auto"; shift ;;
+        --deeptune|--deep-tune|--with-deeptune)
+                                    CLI_WITH_DEEPTUNE="true"; shift ;;
+        --tune)                     CLI_WITH_DEEPTUNE="true"; CLI_DEEPTUNE_TUNE="${2:-}"; shift 2 ;;
+        --tune=*)                   CLI_WITH_DEEPTUNE="true"; CLI_DEEPTUNE_TUNE="${1#*=}"; shift ;;
         --with-tailscale|--tailscale)
                                     CLI_WITH_TAILSCALE="true"; shift ;;
         --tailscale-up|--ts-up)
@@ -275,12 +315,26 @@ run_rvdk() {
 }
 
 # ==============================================================================
-# 5. Auto-Detect Silicon Target & Short Tag from /proc/device-tree/model
+# 5. Resolve Silicon Target & Short Tag (RVDK Kit Cache -> Device Tree Fallback)
 # ==============================================================================
 DT_MODEL="Unknown"
-if [[ -r /proc/device-tree/model ]]; then
+FACTORY_USER=""
+
+if [[ -z "$TARGET_BOARD" && -r /etc/rvdk/kit.env ]]; then
+    # shellcheck disable=SC1091
+    source /etc/rvdk/kit.env
+    if [[ -n "${RVDK_SOC_SLUG:-}" ]]; then
+        DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
+        TARGET_BOARD="$RVDK_SOC_SLUG"
+        TARGET_TAG="${RVDK_BOARD_TAG:-node}"
+        FACTORY_USER="${RVDK_FACTORY_USER:-}"
+    fi
+fi
+
+if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
     DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 fi
+
 if [[ -z "$TARGET_BOARD" ]]; then
     case "$DT_MODEL" in
         *"Premier P550"*|*"EIC7700"*|*"Megrez"*)
@@ -296,7 +350,7 @@ if [[ -z "$TARGET_BOARD" ]]; then
         *)
             log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>." ;;
     esac
-else
+elif [[ -z "${TARGET_TAG:-}" ]]; then
     case "$TARGET_BOARD" in
         eswin-eic7700x|sifive-p550) TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
         starfive-jh7110)            TARGET_TAG="vf2" ;;
@@ -307,10 +361,11 @@ else
     esac
 fi
 
-FACTORY_USER=""
-case "$TARGET_BOARD" in
-    starfive-jh7110) FACTORY_USER="user" ;;
-esac
+if [[ -z "$FACTORY_USER" ]]; then
+    case "$TARGET_BOARD" in
+        starfive-jh7110) FACTORY_USER="user" ;;
+    esac
+fi
 
 if [[ -f "${LOCAL_ROOT}/scripts/lib-progbar.sh" ]]; then
     # shellcheck disable=SC1091
@@ -498,13 +553,20 @@ else
 fi
 
 if [[ "$CLI_WITH_TAILSCALE" == "true" ]]; then
-    brak_prog 92 "Stage 5C: Tailscale Mesh VPN (--with-tailscale)" 0 "Launching rvdk mods/tailscale..."
+    brak_prog 91 "Stage 5C: Tailscale Mesh VPN (--with-tailscale)" 0 "Launching rvdk mods/tailscale..."
     log_step "5C. RVDK Tailscale Mesh VPN (--with-tailscale)"
     if [[ -n "$CLI_TS_AUTHKEY" ]]; then
         TS_AUTHKEY="$CLI_TS_AUTHKEY" run_rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
     else
         run_rvdk mods/tailscale --hostname "$TARGET_HOSTNAME" ${CLI_TS_FLAGS[@]+"${CLI_TS_FLAGS[@]}"}
     fi
+fi
+
+if [[ "$CLI_WITH_DEEPTUNE" == "true" ]]; then
+    RESOLVED_TUNE="${CLI_DEEPTUNE_TUNE:-$(role_to_rvdk_tune "$NODE_ROLE")}"
+    brak_prog 93 "Stage 5D: Silicon & OS Extreme DeepTune (--tune ${RESOLVED_TUNE})" 0 "Launching rvdk deeptune --tune ${RESOLVED_TUNE}..."
+    log_step "5D. RVDK Silicon & OS Extreme DeepTune (Role: ${NODE_ROLE} -> --tune ${RESOLVED_TUNE})"
+    run_rvdk deeptune --tune "$RESOLVED_TUNE"
 fi
 
 # ==============================================================================
