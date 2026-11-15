@@ -4,7 +4,7 @@
 # Path: brakerrak/scripts/verify-convergence.sh
 #
 # Usage:
-#   sudo brakerrak verify [--role databroker|databench] [--hostname <name>] [--force-rebuild-pg] [--no-apt-update] [--noprogbar]
+#   sudo brakerrak verify [--role databroker|braksky|databench|visionferret|devbench|devsky] [--hostname <name>] [--force-rebuild-pg] [--no-apt-update] [--noprogbar]
 #   sudo ./scripts/verify-convergence.sh [--out-dir ~/.brakerrak/snapshots] [--noprogbar]
 # ==============================================================================
 set -Eeuo pipefail

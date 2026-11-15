@@ -8,9 +8,10 @@
 #   Row  [ROWS-1]      : Current RVDK sub-process progress bar (#1c49f2 blue)
 #   Row  [ROWS]        : BrakerRak master pipeline progress bar (#5a26e5 purple)
 #
+# Passes generic RVDK_PARENT_* dock hooks to child RVDK invocations so RVDK
+# stays platform-agnostic while docking cleanly above BrakerRak's master bar.
 # Suppressed via `--noprogbar` (`BRAKERRAK_NO_PROGBAR=1`), non-TTY stdout,
-# `TERM=dumb`, or small terminals (<10x40), cascading `RVDK_NO_PROGBAR=1` to
-# child RVDK invocations.
+# `TERM=dumb`, or small terminals (<10x40), cascading `RVDK_NO_PROGBAR=1`.
 # ==============================================================================
 
 if [[ "${_BRAKERRAK_PROGBAR_SOURCED:-0}" == "1" ]]; then
@@ -134,9 +135,9 @@ _brak_prog_format_line() {
 }
 
 _brak_prog_sync_sub_from_disk() {
-    if [[ -n "${BRAKERRAK_SUB_STATE:-}" && -r "${BRAKERRAK_SUB_STATE}" ]]; then
+    if [[ -n "${RVDK_SUB_STATE:-}" && -r "${RVDK_SUB_STATE}" ]]; then
         local s_raw="" s_pct="" s_msg=""
-        IFS= read -r s_raw < "${BRAKERRAK_SUB_STATE}" 2>/dev/null || true
+        IFS= read -r s_raw < "${RVDK_SUB_STATE}" 2>/dev/null || true
         if [[ -n "$s_raw" ]]; then
             s_pct="${s_raw%%|*}"
             s_msg="${s_raw#*|}"
@@ -210,14 +211,17 @@ brak_prog_init() {
     _BRAK_SUB_PCT=0
     _BRAK_SUB_MSG="Standing by..."
 
-    export BRAKERRAK_PROGBAR_ACTIVE="1"
-    export BRAKERRAK_MASTER_STATE="/tmp/.brakerrak-progbar.$$.master"
-    export BRAKERRAK_SUB_STATE="/tmp/.brakerrak-progbar.$$.sub"
+    export RVDK_PARENT_PROGBAR="1"
+    export RVDK_PARENT_LABEL="BrakerRak"
+    export RVDK_PARENT_BADGE_SGR="$_BRAK_MASTER_BADGE_SGR"
+    export RVDK_PARENT_BAR_SGR="$_BRAK_MASTER_BAR_SGR"
+    export RVDK_PARENT_STATE="/tmp/.brakerrak-progbar.$$.master"
+    export RVDK_SUB_STATE="/tmp/.brakerrak-progbar.$$.sub"
 
     (
         umask 077
-        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE"
-        printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE"
+        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$RVDK_PARENT_STATE"
+        printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$RVDK_SUB_STATE"
     ) 2>/dev/null || true
 
     # Advance 2 lines (scrolling existing bottom content up) and step up 2 rows
@@ -247,8 +251,8 @@ brak_prog() {
     _BRAK_MASTER_PCT="$pct"
     [[ -n "$msg" ]] && _BRAK_MASTER_MSG="$msg"
 
-    if [[ -n "${BRAKERRAK_MASTER_STATE:-}" ]]; then
-        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$BRAKERRAK_MASTER_STATE" 2>/dev/null || true
+    if [[ -n "${RVDK_PARENT_STATE:-}" ]]; then
+        printf '%s|%s\n' "$_BRAK_MASTER_PCT" "$_BRAK_MASTER_MSG" > "$RVDK_PARENT_STATE" 2>/dev/null || true
     fi
 
     if [[ $# -ge 3 ]]; then
@@ -259,8 +263,8 @@ brak_prog() {
         (( spct > 100 )) && spct=100
         _BRAK_SUB_PCT="$spct"
         _BRAK_SUB_MSG="$smsg"
-        if [[ -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
-            printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$BRAKERRAK_SUB_STATE" 2>/dev/null || true
+        if [[ -n "${RVDK_SUB_STATE:-}" ]]; then
+            printf '%s|%s\n' "$_BRAK_SUB_PCT" "$_BRAK_SUB_MSG" > "$RVDK_SUB_STATE" 2>/dev/null || true
         fi
     fi
 
@@ -280,15 +284,15 @@ brak_prog_cleanup() {
         fi
         _BRAK_PROG_ACTIVE="0"
     fi
-    if [[ -n "${BRAKERRAK_MASTER_STATE:-}" ]]; then
-        rm -f "${BRAKERRAK_MASTER_STATE}" 2>/dev/null || true
+    if [[ -n "${RVDK_PARENT_STATE:-}" ]]; then
+        rm -f "${RVDK_PARENT_STATE}" 2>/dev/null || true
     fi
-    if [[ -n "${BRAKERRAK_SUB_STATE:-}" ]]; then
-        rm -f "${BRAKERRAK_SUB_STATE}" 2>/dev/null || true
+    if [[ -n "${RVDK_SUB_STATE:-}" ]]; then
+        rm -f "${RVDK_SUB_STATE}" 2>/dev/null || true
     fi
     if [[ -n "${RVDK_APT_STAMP_FILE:-}" ]]; then
         rm -f "${RVDK_APT_STAMP_FILE}" 2>/dev/null || true
     fi
-    unset BRAKERRAK_PROGBAR_ACTIVE BRAKERRAK_MASTER_STATE BRAKERRAK_SUB_STATE 2>/dev/null || true
+    unset RVDK_PARENT_PROGBAR RVDK_PARENT_LABEL RVDK_PARENT_BADGE_SGR RVDK_PARENT_BAR_SGR RVDK_PARENT_STATE RVDK_SUB_STATE 2>/dev/null || true
     return "$rc"
 }

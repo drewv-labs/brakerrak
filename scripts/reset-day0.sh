@@ -43,7 +43,7 @@ fi
 # Auto-detect factory hostname default from Device Tree + /etc/os-release
 DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
 OS_ID="$(. /etc/os-release 2>/dev/null && echo "${ID:-debian}" || echo "debian")"
-if [[ "$DT_MODEL" == *"VisionFive 2"* || "$DT_MODEL" == *"JH7110"* ]] && [[ "$OS_ID" == "debian" ]]; then
+if [[ "$DT_MODEL" == *"VisionFive 2"* || "$DT_MODEL" == *"VF2"* || "$DT_MODEL" == *"JH7110"* ]] && [[ "$OS_ID" == "debian" ]]; then
     DEFAULT_RESET_HOST="starfive"
 elif [[ "$OS_ID" == "ubuntu" ]]; then
     DEFAULT_RESET_HOST="ubuntu"
@@ -105,8 +105,8 @@ else
 fi
 
 echo "=== 1. Stopping DataBroker Services & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
-systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service 2>/dev/null || true
-systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto 2>/dev/null || true
+systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
+systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
 systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
 pkill -9 -u postgres 2>/dev/null || true
 
@@ -146,13 +146,16 @@ fi
 
 echo "=== 3. Tearing Down LVM (${VG_NAME}) & Resetting ${NVME_DEV} to Factory 512e (512B) ==="
 if [[ -b "$NVME_DEV" ]]; then
-    umount "/dev/mapper/${VG_NAME}-"* 2>/dev/null || umount -l "/dev/mapper/${VG_NAME}-"* 2>/dev/null || true
-    if vgs "$VG_NAME" >/dev/null 2>&1; then
-        lvchange -an "$VG_NAME" 2>/dev/null || true
-        vgchange -an "$VG_NAME" 2>/dev/null || true
-        vgremove -ff -y "$VG_NAME" 2>/dev/null || true
-    fi
-    dmsetup remove "${VG_NAME}-${LV_NAME}" 2>/dev/null || true
+    for cand_vg in "$VG_NAME" "vg_rvdk"; do
+        [[ -z "$cand_vg" ]] && continue
+        umount "/dev/mapper/${cand_vg}-"* 2>/dev/null || umount -l "/dev/mapper/${cand_vg}-"* 2>/dev/null || true
+        if vgs "$cand_vg" >/dev/null 2>&1; then
+            lvchange -an "$cand_vg" 2>/dev/null || true
+            vgchange -an "$cand_vg" 2>/dev/null || true
+            vgremove -ff -y "$cand_vg" 2>/dev/null || true
+        fi
+        dmsetup remove "${cand_vg}-${LV_NAME}" 2>/dev/null || true
+    done
     pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
     for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
     wipefs -af "$NVME_DEV" >/dev/null 2>&1 || true
@@ -207,7 +210,7 @@ if [[ "$KEEP_CACHE" == "true" ]] && ls /tmp/pgdg-deb-backup/*.deb >/dev/null 2>&
 fi
 apt-get -o DPkg::Lock::Timeout=120 update -q || true
 
-echo "=== 5. Reverting /etc/fstab, HugePages Sysctls & Hostname ==="
+echo "=== 5. Reverting /etc/fstab, HugePages/DeepTune Sysctls & Hostname ==="
 sed -i "\|${FS_LABEL}|d" /etc/fstab 2>/dev/null || true
 sed -i "\|[[:space:]]${MOUNT_POINT}[[:space:]]|d" /etc/fstab 2>/dev/null || true
 if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
@@ -215,16 +218,26 @@ if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
         [[ -n "$lbl" ]] && sed -i "\|${lbl}|d" /etc/fstab 2>/dev/null || true
     done
 fi
-systemctl daemon-reload
 
 rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf \
       /etc/sysctl.d/90-brakerbox-broker.conf \
-      /etc/udev/rules.d/99-brakerrak-usb-raid.rules
+      /etc/sysctl.d/95-rvdk-deeptune.conf \
+      /etc/udev/rules.d/95-rvdk-deeptune-io.rules \
+      /etc/udev/rules.d/99-brakerrak-usb-raid.rules \
+      /etc/systemd/system/rvdk-thp-tune.service \
+      /etc/rvdk/deeptune.env \
+      /var/lib/rvdk/deeptune.conf
+systemctl daemon-reload
 
 sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
 udevadm control --reload-rules && udevadm trigger
 
-hostnamectl set-hostname "$RESET_HOSTNAME"
+if command -v hostnamectl >/dev/null 2>&1; then
+    hostnamectl set-hostname "$RESET_HOSTNAME"
+else
+    echo "$RESET_HOSTNAME" > /etc/hostname
+    hostname "$RESET_HOSTNAME"
+fi
 sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${RESET_HOSTNAME}/g" /etc/hosts 2>/dev/null || true
 
 if [[ "$PURGE_CONFIG" == "true" && -f "$USER_NODE_ENV" ]]; then

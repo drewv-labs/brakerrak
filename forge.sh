@@ -8,10 +8,10 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|devbench] [--hostname <name>] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
-#   sudo brakerrak deeptune [--role databroker|databench|devbench]
+#   sudo brakerrak [forge] [--role databroker|braksky|databench|visionferret|devbench|devsky] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak deeptune [--role databroker|braksky|databench|visionferret|devbench|devsky]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
-#   sudo brakerrak verify [--role databroker|databench] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak verify [--role databroker|braksky|databench|visionferret|devbench|devsky] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
 #   sudo brakerrak update [--skip-rvdk]
 # ==============================================================================
@@ -78,11 +78,29 @@ log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
 log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
 log_fatal() { printf "\033[1;31m[BRAKERRAK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
 
-# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` vs `ml`)
+# Normalize role alias -> canonical role name in `roles/<role>.env`
+normalize_role() {
+    local raw
+    raw="$(tr '[:upper:]' '[:lower:]' <<< "${1:-databroker}")"
+    case "$raw" in
+        prod|broker|databroker|brakerbox)        echo "databroker" ;;
+        braksky|sky)                             echo "braksky" ;;
+        bench|databench|brakerbench)             echo "databench" ;;
+        visionferret|vferret|ferret|mlbench)     echo "visionferret" ;;
+        devbench|dev)                            echo "devbench" ;;
+        devsky|dsk|skunksky)                     echo "devsky" ;;
+        *)                                       echo "" ;;
+    esac
+}
+
+# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ml` | `ai`)
 role_to_rvdk_tune() {
-    case "${1:-databroker}" in
-        devbench) echo "ml" ;;
-        *)        echo "data" ;;
+    local canon
+    canon="$(normalize_role "${1:-databroker}")"
+    case "$canon" in
+        devbench|visionferret) echo "ml" ;;
+        braksky|devsky)        echo "ai" ;;
+        *)                     echo "data" ;;
     esac
 }
 
@@ -177,7 +195,7 @@ else
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
-chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh 2>/dev/null || true
+chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh "${LOCAL_ROOT}"/benchmarks/*.sh 2>/dev/null || true
 install -d -m 0755 /usr/local/bin
 ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
 
@@ -232,6 +250,7 @@ CLI_SUBNET=""
 CLI_NVME_DEV=""
 CLI_MOUNT_POINT=""
 CLI_WITH_RAID=""
+CLI_ENABLE_PG=""
 CLI_ENABLE_MQTT=""
 CLI_ENABLE_NFS=""
 CLI_NFS_BACKEND=""
@@ -256,6 +275,8 @@ while [[ $# -gt 0 ]]; do
         --mount-point)              CLI_MOUNT_POINT="${2:-}"; shift 2 ;;
         --with-raid)                CLI_WITH_RAID="true"; shift ;;
         --no-raid)                  CLI_WITH_RAID="false"; shift ;;
+        --with-pg|--with-postgres)  CLI_ENABLE_PG="true"; shift ;;
+        --no-pg|--no-postgres)      CLI_ENABLE_PG="false"; shift ;;
         --with-mqtt)                CLI_ENABLE_MQTT="true"; shift ;;
         --no-mqtt)                  CLI_ENABLE_MQTT="false"; shift ;;
         --with-nfs)                 CLI_ENABLE_NFS="true"; shift ;;
@@ -337,27 +358,64 @@ fi
 
 if [[ -z "$TARGET_BOARD" ]]; then
     case "$DT_MODEL" in
-        *"Premier P550"*|*"EIC7700"*|*"Megrez"*)
+        *"Premier P550"*)
             TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
-        *"VisionFive 2"*|*"JH7110"*|*"Mars"*|*"OrangePi RV"*)
+        *"Megrez"*)
+            TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="megrez" ;;
+        *"StarPro64"*|*"EIC7700"*)
+            TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
+        *"Unmatched"*|*"FU740"*)
+            TARGET_BOARD="sifive-fu740"; TARGET_TAG="unmatched" ;;
+        *"VisionFive 2 Lite"*|*"VF2 Lite"*|*"JH7110S"*|*"JH-7110S"*)
+            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2lite" ;;
+        *"VisionFive 2"*|*"VF2"*)
             TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
+        *"Mars"*)
+            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="mars" ;;
+        *"OrangePi RV2"*|*"Orange Pi RV2"*)
+            TARGET_BOARD="spacemit-k1"; TARGET_TAG="rv2" ;;
+        *"OrangePi R2S"*|*"Orange Pi R2S"*)
+            TARGET_BOARD="spacemit-k1"; TARGET_TAG="r2s" ;;
+        *"OrangePi RV"*|*"Orange Pi RV"*)
+            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="opirv" ;;
+        *"JH7110"*|*"Star64"*)
+            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
+        *"AIBOX-K3"*|*"Firefly"*K3*)
+            TARGET_BOARD="spacemit-k3"; TARGET_TAG="aiboxk3" ;;
         *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
             TARGET_BOARD="spacemit-k3"; TARGET_TAG="jptr2" ;;
-        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*|*"OrangePi RV2"*)
+        *"BPI-F3"*|*"Banana Pi BPI-F3"*)
+            TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpif3" ;;
+        *"BPI-CM6"*|*"Banana Pi BPI-CM6"*)
+            TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpicm6" ;;
+        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
             TARGET_BOARD="spacemit-k1"; TARGET_TAG="jptr1" ;;
         *"Titan"*|*"DP1000"*)
             TARGET_BOARD="ultrarisc-dp1000"; TARGET_TAG="titan" ;;
+        *"Atlantis"*|*"Ascalon"*)
+            TARGET_BOARD="tenstorrent-atlantis"; TARGET_TAG="atlantis" ;;
         *)
             log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>." ;;
     esac
 elif [[ -z "${TARGET_TAG:-}" ]]; then
     case "$TARGET_BOARD" in
-        eswin-eic7700x|sifive-p550) TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
-        starfive-jh7110)            TARGET_TAG="vf2" ;;
-        spacemit-k1)                TARGET_TAG="jptr1" ;;
-        spacemit-k3)                TARGET_TAG="jptr2" ;;
-        ultrarisc-dp1000)           TARGET_TAG="titan" ;;
-        *)                          TARGET_TAG="node" ;;
+        eswin-eic7700x|sifive-p550)   TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
+        milkv-megrez)                 TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="megrez" ;;
+        sifive-fu740|sifive-unmatched) TARGET_BOARD="sifive-fu740"; TARGET_TAG="unmatched" ;;
+        starfive-vf2-lite)            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2lite" ;;
+        milkv-mars)                   TARGET_BOARD="starfive-jh7110"; TARGET_TAG="mars" ;;
+        orangepi-rv)                  TARGET_BOARD="starfive-jh7110"; TARGET_TAG="opirv" ;;
+        starfive-jh7110|starfive-vf2) TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
+        orangepi-rv2)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="rv2" ;;
+        orangepi-r2s)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="r2s" ;;
+        bananapi-f3)                  TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpif3" ;;
+        bananapi-cm6)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpicm6" ;;
+        spacemit-k1|milkv-jupiter)    TARGET_BOARD="spacemit-k1"; TARGET_TAG="jptr1" ;;
+        firefly-aibox-k3)             TARGET_BOARD="spacemit-k3"; TARGET_TAG="aiboxk3" ;;
+        spacemit-k3|milkv-jupiter2)   TARGET_BOARD="spacemit-k3"; TARGET_TAG="jptr2" ;;
+        ultrarisc-dp1000|milkv-titan) TARGET_BOARD="ultrarisc-dp1000"; TARGET_TAG="titan" ;;
+        tenstorrent-atlantis)         TARGET_TAG="atlantis" ;;
+        *)                            TARGET_TAG="node" ;;
     esac
 fi
 
@@ -380,7 +438,7 @@ brak_prog_init "Resolving ${TARGET_BOARD} node configuration..."
 log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) | Action: ${ACTION}"
 
 # ==============================================================================
-# 6. CONFIG RESOLUTION (Pass 1 Template Generation vs. Pass 2 node.env Load)
+# 6. CONFIG RESOLUTION (Pass 1 Template Generation, Pass 2 Load & Role Flipping)
 # ==============================================================================
 install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
 
@@ -394,51 +452,57 @@ if [[ -n "$FACTORY_USER" && "$REAL_USER" != "$FACTORY_USER" && ! -f "$NODE_ENV" 
     log_ok "Adopted Pass 1 node.env from /home/${FACTORY_USER}/.brakerrak/node.env -> ${NODE_ENV}"
 fi
 
+WRITE_NODE_ENV="false"
 if [[ -f "$NODE_ENV" ]]; then
     FORGE_PASS="2"
     log_brak "Pass 2 Detected: Loading node configuration from ${NODE_ENV}"
     # shellcheck disable=SC1090
     source "$NODE_ENV"
+    SAVED_ROLE="$(normalize_role "${NODE_ROLE:-databroker}")"
+    [[ -z "$SAVED_ROLE" ]] && SAVED_ROLE="databroker"
+    NODE_ROLE="$SAVED_ROLE"
+
+    if [[ -n "$CLI_ROLE" ]]; then
+        REQUESTED_ROLE="$(normalize_role "$CLI_ROLE")"
+        [[ -z "$REQUESTED_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | braksky | databench | visionferret | devbench | devsky)"
+        if [[ "$REQUESTED_ROLE" != "$SAVED_ROLE" ]]; then
+            log_brak "Stateless Persona Flip: ${SAVED_ROLE} -> ${REQUESTED_ROLE}"
+            NODE_ROLE="$REQUESTED_ROLE"
+            WRITE_NODE_ENV="true"
+            unset ENABLE_POSTGRES ENABLE_MQTT_BROKER ENABLE_NFS_SERVER PIGEON_ROLE RVDK_TUNE_PROFILE
+            if [[ -z "$CLI_HOSTNAME" && "${TARGET_HOSTNAME:-}" =~ ^(brakerbox|braksky|brakerbench|databroker|databench|vferret|visionferret|devbench|devsky)- ]]; then
+                unset TARGET_HOSTNAME
+            fi
+        fi
+    fi
 else
     FORGE_PASS="1"
-    NODE_ROLE="${CLI_ROLE:-databroker}"
+    WRITE_NODE_ENV="true"
+    NODE_ROLE="$(normalize_role "${CLI_ROLE:-databroker}")"
+    [[ -z "$NODE_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | braksky | databench | visionferret | devbench | devsky)"
 fi
 
-case "${CLI_ROLE:-$NODE_ROLE}" in
-    prod|broker|databroker)
-        NODE_ROLE="databroker"
-        DEFAULT_HOST="brakerbox-${TARGET_TAG}"
-        DEFAULT_MQTT="true"
-        DEFAULT_NFS="true"
-        ;;
-    bench|databench)
-        NODE_ROLE="databench"
-        DEFAULT_HOST="brakerbench-${TARGET_TAG}"
-        DEFAULT_MQTT="false"
-        DEFAULT_NFS="false"
-        ;;
-    devbench)
-        NODE_ROLE="devbench"
-        DEFAULT_HOST="devbench-${TARGET_TAG}"
-        DEFAULT_MQTT="true"
-        DEFAULT_NFS="false"
-        ;;
-    *)
-        log_fatal "Unknown role '${CLI_ROLE:-$NODE_ROLE}' (expected: databroker | databench | devbench)"
-        ;;
-esac
+ROLE_ENV_FILE="${LOCAL_ROOT}/roles/${NODE_ROLE}.env"
+[[ ! -f "$ROLE_ENV_FILE" ]] && log_fatal "Role definition file missing: ${ROLE_ENV_FILE}"
+# shellcheck disable=SC1090
+source "$ROLE_ENV_FILE"
 
-TARGET_HOSTNAME="${CLI_HOSTNAME:-${TARGET_HOSTNAME:-$DEFAULT_HOST}}"
+TARGET_HOSTNAME="${CLI_HOSTNAME:-${TARGET_HOSTNAME:-${NODE_ROLE}-${TARGET_TAG}}}"
+[[ -n "$CLI_HOSTNAME" && "$FORGE_PASS" == "2" ]] && WRITE_NODE_ENV="true"
 ADMIN_USER="${CLI_USER:-${ADMIN_USER:-$REAL_USER}}"
 LAB_SUBNET="${CLI_SUBNET:-${LAB_SUBNET:-10.0.10.0/24}}"
 NVME_DEV="${CLI_NVME_DEV:-${NVME_DEV:-/dev/nvme0n1}}"
 MOUNT_POINT="${CLI_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nvme_pgdata}}"
+VG_NAME="${VG_NAME:-vg_braker}"
 WITH_RAID="${CLI_WITH_RAID:-${WITH_RAID:-false}}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
-ENABLE_MQTT_BROKER="${CLI_ENABLE_MQTT:-${ENABLE_MQTT_BROKER:-$DEFAULT_MQTT}}"
+ENABLE_POSTGRES="${CLI_ENABLE_PG:-${ENABLE_POSTGRES:-true}}"
+ENABLE_MQTT_BROKER="${CLI_ENABLE_MQTT:-${ENABLE_MQTT_BROKER:-false}}"
 MQTT_PORT="${MQTT_PORT:-1883}"
-ENABLE_NFS_SERVER="${CLI_ENABLE_NFS:-${ENABLE_NFS_SERVER:-$DEFAULT_NFS}}"
+ENABLE_NFS_SERVER="${CLI_ENABLE_NFS:-${ENABLE_NFS_SERVER:-false}}"
 NFS_BACKEND="${CLI_NFS_BACKEND:-${NFS_BACKEND:-ganesha}}"
+PIGEON_ROLE="${PIGEON_ROLE:-pigeoneer}"
+RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE:-$(role_to_rvdk_tune "$NODE_ROLE")}"
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT:-false}"
 
 NFS_BACKEND="$(tr '[:upper:]' '[:lower:]' <<< "$NFS_BACKEND")"
@@ -451,16 +515,18 @@ case "$NFS_BACKEND" in
         ;;
 esac
 
-if [[ "$FORGE_PASS" == "1" ]]; then
+if [[ "$WRITE_NODE_ENV" == "true" ]]; then
     cat <<EOF > "$NODE_ENV"
 # ==============================================================================
 # DREW-V Labs // BrakerRak User Node Config (~/.brakerrak/node.env)
-# Generated on Pass 1. Customize values below and re-run 'sudo brakerrak' for Pass 2.
+# Role Personas: databroker | braksky | databench | visionferret | devbench | devsky
 # ==============================================================================
 NODE_ROLE="${NODE_ROLE}"
 TARGET_HOSTNAME="${TARGET_HOSTNAME}"
 ADMIN_USER="${ADMIN_USER}"
 LAB_SUBNET="${LAB_SUBNET}"
+RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE}"
+PIGEON_ROLE="${PIGEON_ROLE}"
 
 # Hot NVMe Storage
 NVME_DEV="${NVME_DEV}"
@@ -470,7 +536,8 @@ MOUNT_POINT="${MOUNT_POINT}"
 WITH_RAID="${WITH_RAID}"
 RAID_ARRAYS_JSON='${RAID_ARRAYS_JSON}'
 
-# DataBroker Network Services (When ENABLE_NFS_SERVER=true and WITH_RAID=false, exports \${MOUNT_POINT}/nfs_vault)
+# Role Services (Toggle via role flip or explicit overrides)
+ENABLE_POSTGRES="${ENABLE_POSTGRES}"
 ENABLE_MQTT_BROKER="${ENABLE_MQTT_BROKER}"
 MQTT_PORT="${MQTT_PORT}"
 ENABLE_NFS_SERVER="${ENABLE_NFS_SERVER}"
@@ -482,13 +549,22 @@ SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT}"
 EOF
     chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
     chmod 0640 "$NODE_ENV"
-    log_ok "Generated Pass 1 node configuration: ${NODE_ENV}"
-elif ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null; then
-    printf '\n# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto\nNFS_BACKEND="%s"\n' "$NFS_BACKEND" >> "$NODE_ENV"
+    log_ok "Persisted node configuration (${NODE_ROLE} -> ${TARGET_HOSTNAME}): ${NODE_ENV}"
+else
+    if ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null; then
+        printf '\n# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto\nNFS_BACKEND="%s"\n' "$NFS_BACKEND" >> "$NODE_ENV"
+    fi
+    if ! grep -q '^ENABLE_POSTGRES=' "$NODE_ENV" 2>/dev/null; then
+        printf 'ENABLE_POSTGRES="%s"\n' "$ENABLE_POSTGRES" >> "$NODE_ENV"
+    fi
+    if ! grep -q '^RVDK_TUNE_PROFILE=' "$NODE_ENV" 2>/dev/null; then
+        printf 'RVDK_TUNE_PROFILE="%s"\n' "$RVDK_TUNE_PROFILE" >> "$NODE_ENV"
+    fi
 fi
 
 export BRAKERRAK_NODE_ENV="$NODE_ENV"
-export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT WITH_RAID RAID_ARRAYS_JSON ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND
+export RVDK_ENV_FILE="$NODE_ENV"
+export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT VG_NAME WITH_RAID RAID_ARRAYS_JSON ENABLE_POSTGRES ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND PIGEON_ROLE RVDK_TUNE_PROFILE
 
 # ==============================================================================
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
@@ -505,22 +581,31 @@ run_rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
 
 brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
 log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
-NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT")
+NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT" --vg "$VG_NAME")
 [[ "$FORCE_WIPE_NVME" == "true" ]] && NVME_FLAGS+=(--force-wipe)
 run_rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
 
-brak_prog 45 "Stage 3/7: PostgreSQL 18.6 (io_uring + Sv39 HugePages)" 0 "Launching rvdk postgresql..."
-log_step "3. RVDK PostgreSQL 18.6 Convergence (io_uring + Sv39 HugePages)"
-PG_FLAGS=(--data-mount "$MOUNT_POINT" --subnet "$LAB_SUBNET")
-[[ "$FORCE_REBUILD_PG" == "true" ]] && PG_FLAGS+=(--force-build)
-run_rvdk postgresql "${PG_FLAGS[@]}"
+if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+    brak_prog 45 "Stage 3/7: PostgreSQL 18.6 (io_uring + Sv39 HugePages)" 0 "Launching rvdk postgresql..."
+    log_step "3. RVDK PostgreSQL 18.6 Convergence (io_uring + Sv39 HugePages)"
+    PG_FLAGS=(--data-mount "$MOUNT_POINT" --subnet "$LAB_SUBNET")
+    [[ "$FORCE_REBUILD_PG" == "true" ]] && PG_FLAGS+=(--force-build)
+    run_rvdk postgresql "${PG_FLAGS[@]}"
+else
+    brak_prog 65 "Stage 3/7: PostgreSQL 18.6 Skipped (ENABLE_POSTGRES=false)" 100 "postgresql skipped (${NODE_ROLE})"
+    log_step "3. PostgreSQL 18.6 Convergence Skipped (ENABLE_POSTGRES=false for ${NODE_ROLE})"
+    if systemctl is-active --quiet postgresql.service 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
+        systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
+        log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE} workloads"
+    fi
+fi
 
 if [[ "$WITH_RAID" == "true" ]]; then
     brak_prog 70 "Stage 4/7: Btrfs RAID 10 Vault Provisioning" 0 "Launching rvdk mods/btrfs-raid..."
     log_step "4. RVDK Btrfs RAID 10 Vault Provisioning & Tablespace Binding"
-    RAID_FLAGS=()
+    RAID_FLAGS=(--json "$RAID_ARRAYS_JSON")
     [[ "$FORCE_WIPE_RAID" == "true" ]] && RAID_FLAGS+=(--force-wipe-raid)
-    run_rvdk mods/btrfs-raid ${RAID_FLAGS[@]+"${RAID_FLAGS[@]}"}
+    run_rvdk mods/btrfs-raid "${RAID_FLAGS[@]}"
 else
     brak_prog 74 "Stage 4/7: Btrfs RAID 10 Skipped (WITH_RAID=false)" 100 "mods/btrfs-raid skipped"
     log_step "4. Btrfs RAID 10 Vault Provisioning Skipped (WITH_RAID=false)"
@@ -533,6 +618,10 @@ if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
 else
     brak_prog 82 "Stage 5A/7: Mosquitto MQTT Skipped (ENABLE_MQTT_BROKER=false)" 100 "mods/mosquitto skipped"
     log_step "5A. Mosquitto MQTT Broker Skipped (ENABLE_MQTT_BROKER=false)"
+    if systemctl is-active --quiet mosquitto.service 2>/dev/null; then
+        systemctl disable --now mosquitto.service 2>/dev/null || true
+        log_ok "Disabled mosquitto.service for ${NODE_ROLE} isolation"
+    fi
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
@@ -544,11 +633,11 @@ else
     log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
     if systemctl is-active --quiet nfs-server.service 2>/dev/null || systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
         systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
-        log_ok "Disabled nfs-kernel-server for benchmark isolation"
+        log_ok "Disabled nfs-kernel-server for ${NODE_ROLE} isolation"
     fi
     if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
         systemctl disable --now nfs-ganesha.service 2>/dev/null || true
-        log_ok "Disabled nfs-ganesha for benchmark isolation"
+        log_ok "Disabled nfs-ganesha for ${NODE_ROLE} isolation"
     fi
 fi
 
@@ -563,7 +652,7 @@ if [[ "$CLI_WITH_TAILSCALE" == "true" ]]; then
 fi
 
 if [[ "$CLI_WITH_DEEPTUNE" == "true" ]]; then
-    RESOLVED_TUNE="${CLI_DEEPTUNE_TUNE:-$(role_to_rvdk_tune "$NODE_ROLE")}"
+    RESOLVED_TUNE="${CLI_DEEPTUNE_TUNE:-$RVDK_TUNE_PROFILE}"
     brak_prog 93 "Stage 5D: Silicon & OS Extreme DeepTune (--tune ${RESOLVED_TUNE})" 0 "Launching rvdk deeptune --tune ${RESOLVED_TUNE}..."
     log_step "5D. RVDK Silicon & OS Extreme DeepTune (Role: ${NODE_ROLE} -> --tune ${RESOLVED_TUNE})"
     run_rvdk deeptune --tune "$RESOLVED_TUNE"
@@ -605,12 +694,18 @@ fi
 NVME_SHORT="$(basename "$NVME_DEV")"
 LBA_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
 NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "unmounted")"
-PG_DATA_DIR="$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null | xargs || echo "unknown")"
-PG_IO_METHOD="$(sudo -u postgres psql -tAc "SHOW io_method;" 2>/dev/null | xargs || echo "unknown")"
-PG_SHBUF="$(sudo -u postgres psql -tAc "SHOW shared_buffers;" 2>/dev/null | xargs || echo "unknown")"
 HP_TOTAL="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 HP_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 HP_USED=$(( HP_TOTAL - HP_FREE ))
+if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+    PG_DATA_DIR="$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null | xargs || echo "unknown")"
+    PG_IO_METHOD="$(sudo -u postgres psql -tAc "SHOW io_method;" 2>/dev/null | xargs || echo "unknown")"
+    PG_SHBUF="$(sudo -u postgres psql -tAc "SHOW shared_buffers;" 2>/dev/null | xargs || echo "unknown")"
+else
+    PG_DATA_DIR="disabled (ENABLE_POSTGRES=false)"
+    PG_IO_METHOD="disabled"
+    PG_SHBUF="disabled"
+fi
 MQTT_STATE="$(systemctl is-active mosquitto 2>/dev/null || true)"
 [[ -z "$MQTT_STATE" ]] && MQTT_STATE="inactive"
 if systemctl is-active --quiet nfs-server.service 2>/dev/null; then
@@ -632,7 +727,8 @@ if [[ "$CLI_WITH_TAILSCALE" == "true" ]] || systemctl is-active --quiet tailscal
 fi
 
 log_step "6. Post-Flight Verification Summary (Pass ${FORGE_PASS})"
-printf "  • Hostname           : %s (Role: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$FORGE_PASS"
+printf "  • Hostname           : %s (Role: %s | Tune: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$RVDK_TUNE_PROFILE" "$FORGE_PASS"
+printf "  • HamStak Mesh Role  : %s\n" "$PIGEON_ROLE"
 printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
 printf "  • CPU Governor/Clock : %s\n" "$CPU_CLOCK_INFO"
 printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"
@@ -656,7 +752,11 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
         if [[ "$REAL_USER" == "$ADMIN_USER" ]]; then
             brak_prog 98 "Stage 7/7: Purging factory user '${FACTORY_USER}' -> '${ADMIN_USER}'" 50 "utils/purge-user.sh ${FACTORY_USER}"
             log_step "7. Migrating Artifacts & Purging Factory Default User ('${FACTORY_USER}' -> '${ADMIN_USER}')"
-            /usr/local/bin/rvdk utils/purge-user.sh "$FACTORY_USER" --to-user "$ADMIN_USER"
+            /usr/local/bin/rvdk utils/purge-user.sh "$FACTORY_USER" \
+                --to-user "$ADMIN_USER" \
+                --extra-dotdir .brakerrak \
+                --relink-bin /usr/local/bin/brakerrak:.brakerrak/engine/forge.sh \
+                --mount-point "$MOUNT_POINT"
             echo ""
         else
             log_brak "Factory user '${FACTORY_USER}' still exists (active session: '${REAL_USER}'). Log in as '${ADMIN_USER}' and re-run 'sudo brakerrak' to migrate ~/.brakerrak & purge '${FACTORY_USER}'."
@@ -667,4 +767,4 @@ fi
 rm -f "$APT_STAMP_FILE" 2>/dev/null || true
 brak_prog 100 "${TARGET_HOSTNAME} (${NODE_ROLE}) Forge Complete!" 100 "All RVDK stages complete"
 brak_prog_cleanup
-log_ok "${TARGET_HOSTNAME} PostgreSQL 18.6 (${NODE_ROLE}) Forge Complete!"
+log_ok "${TARGET_HOSTNAME} (${NODE_ROLE}) Forge Complete!"
