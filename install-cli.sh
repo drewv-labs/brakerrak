@@ -135,8 +135,10 @@ if [[ "$QUIET_MODE" == "false" ]]; then
 
  Usage:
    sudo brakerrak                           # Converge node using ~/.brakerrak/node.env
-   sudo brakerrak --role databroker         # Converge as BrakerBox (PG18 + MQTT + NFSv4)
-   sudo brakerrak --role databench          # Converge as BrakerBench (Isolated PG18)
+   sudo brakerrak --role databroker         # Converge as DataBroker (PG18 + MQTT + NFSv4)
+   sudo brakerrak --role databench          # Converge as DataBench (Isolated PG18)
+   sudo brakerrak deeptune                  # Apply role-mapped Kit DeepTune
+   sudo brakerrak storage [status|autotune] # Manage Dual-LVM elastic pool (grow-psql, grow-nfs, shrink-nfs)
    sudo brakerrak ort [--stage <tag>]       # Capture read-only ORT & CTD snapshot
    sudo brakerrak verify [--use-pkg-cache]  # Run 5-stage convergence & idempotency harness
    sudo brakerrak reset --confirm-destroy   # Roll back NVMe to factory 512e & Day-0 state

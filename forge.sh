@@ -10,6 +10,7 @@
 # Usage (Local CLI after bootstrap or install-cli.sh):
 #   sudo brakerrak [forge] [--role databroker|braksky|databench|visionferret|devbench|devsky] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak deeptune [--role databroker|braksky|databench|visionferret|devbench|devsky]
+#   sudo brakerrak storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
 #   sudo brakerrak verify [--role databroker|braksky|databench|visionferret|devbench|devsky] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
@@ -93,24 +94,23 @@ normalize_role() {
     esac
 }
 
-# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ml` | `ai`)
+# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ai`)
 role_to_rvdk_tune() {
     local canon
     canon="$(normalize_role "${1:-databroker}")"
     case "$canon" in
-        devbench|visionferret) echo "ml" ;;
-        braksky|devsky)        echo "ai" ;;
-        *)                     echo "data" ;;
+        devbench|visionferret|braksky|devsky) echo "ai" ;;
+        *)                                    echo "data" ;;
     esac
 }
 
 # ==============================================================================
-# 1. Parse Subcommand (forge | deeptune | ort | verify | reset | update)
+# 1. Parse Subcommand (forge | deeptune | storage | ort | verify | reset | update)
 # ==============================================================================
 ACTION="forge"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        forge|deeptune|deep-tune|ort|verify|reset|update|self-update)
+        forge|deeptune|deep-tune|storage|ort|verify|reset|update|self-update)
             ACTION="$1"
             shift
             ;;
@@ -200,7 +200,7 @@ install -d -m 0755 /usr/local/bin
 ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
 
 # ==============================================================================
-# 3. Route Shared Lifecycle Subcommands Immediately (deeptune | ort | verify | reset)
+# 3. Route Shared Lifecycle Subcommands Immediately (deeptune | storage | ort | verify | reset)
 # ==============================================================================
 case "$ACTION" in
     deeptune|deep-tune)
@@ -220,6 +220,10 @@ case "$ACTION" in
                 DT_ROLE="$(awk -F= '/^NODE_ROLE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$NODE_ENV" 2>/dev/null || true)"
             fi
             DT_EXPLICIT_TUNE="$(role_to_rvdk_tune "${DT_ROLE:-databroker}")"
+        else
+            case "$(tr '[:upper:]' '[:lower:]' <<< "$DT_EXPLICIT_TUNE")" in
+                ai|ml|edge-ai|edge-ml) DT_EXPLICIT_TUNE="ai" ;;
+            esac
         fi
         for a in ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}; do
             if [[ "$a" == "status" || "$a" == "--status" ]]; then
@@ -227,6 +231,18 @@ case "$ACTION" in
             fi
         done
         exec /usr/local/bin/rvdk deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
+        ;;
+    storage)
+        if [[ -f "$NODE_ENV" ]]; then
+            # shellcheck disable=SC1090
+            source "$NODE_ENV"
+            export RVDK_ENV_FILE="$NODE_ENV"
+        fi
+        VG_NAME="${VG_NAME:-vg_braker}"
+        MOUNT_POINT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
+        NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/mnt/nfs_vault}"
+        export VG_NAME MOUNT_POINT NFS_MOUNT_POINT
+        exec /usr/local/bin/rvdk storage "$@"
         ;;
     ort)
         exec bash "${LOCAL_ROOT}/scripts/ort-snapshot.sh" "$@"
@@ -249,6 +265,7 @@ CLI_USER=""
 CLI_SUBNET=""
 CLI_NVME_DEV=""
 CLI_MOUNT_POINT=""
+CLI_NFS_MOUNT=""
 CLI_WITH_RAID=""
 CLI_ENABLE_PG=""
 CLI_ENABLE_MQTT=""
@@ -273,6 +290,7 @@ while [[ $# -gt 0 ]]; do
         --subnet)                   CLI_SUBNET="${2:-}"; shift 2 ;;
         --nvme-dev)                 CLI_NVME_DEV="${2:-}"; shift 2 ;;
         --mount-point)              CLI_MOUNT_POINT="${2:-}"; shift 2 ;;
+        --nfs-mount)                CLI_NFS_MOUNT="${2:-}"; shift 2 ;;
         --with-raid)                CLI_WITH_RAID="true"; shift ;;
         --no-raid)                  CLI_WITH_RAID="false"; shift ;;
         --with-pg|--with-postgres)  CLI_ENABLE_PG="true"; shift ;;
@@ -493,6 +511,7 @@ ADMIN_USER="${CLI_USER:-${ADMIN_USER:-$REAL_USER}}"
 LAB_SUBNET="${CLI_SUBNET:-${LAB_SUBNET:-10.0.10.0/24}}"
 NVME_DEV="${CLI_NVME_DEV:-${NVME_DEV:-/dev/nvme0n1}}"
 MOUNT_POINT="${CLI_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nvme_pgdata}}"
+NFS_MOUNT_POINT="${CLI_NFS_MOUNT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
 VG_NAME="${VG_NAME:-vg_braker}"
 WITH_RAID="${CLI_WITH_RAID:-${WITH_RAID:-false}}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
@@ -503,6 +522,10 @@ ENABLE_NFS_SERVER="${CLI_ENABLE_NFS:-${ENABLE_NFS_SERVER:-false}}"
 NFS_BACKEND="${CLI_NFS_BACKEND:-${NFS_BACKEND:-ganesha}}"
 PIGEON_ROLE="${PIGEON_ROLE:-pigeoneer}"
 RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE:-$(role_to_rvdk_tune "$NODE_ROLE")}"
+case "$(tr '[:upper:]' '[:lower:]' <<< "$RVDK_TUNE_PROFILE")" in
+    ai|ml|edge-ai|edge-ml) RVDK_TUNE_PROFILE="ai" ;;
+    *)                     RVDK_TUNE_PROFILE="data" ;;
+esac
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT:-false}"
 
 NFS_BACKEND="$(tr '[:upper:]' '[:lower:]' <<< "$NFS_BACKEND")"
@@ -528,9 +551,10 @@ LAB_SUBNET="${LAB_SUBNET}"
 RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE}"
 PIGEON_ROLE="${PIGEON_ROLE}"
 
-# Hot NVMe Storage
+# Hot NVMe Storage (Dual-LVM carves NFS_MOUNT_POINT when ENABLE_NFS_SERVER=true & WITH_RAID=false)
 NVME_DEV="${NVME_DEV}"
 MOUNT_POINT="${MOUNT_POINT}"
+NFS_MOUNT_POINT="${NFS_MOUNT_POINT}"
 
 # Optional USB/SATA Btrfs RAID 10 Arrays (Default: false / empty array)
 WITH_RAID="${WITH_RAID}"
@@ -551,6 +575,9 @@ EOF
     chmod 0640 "$NODE_ENV"
     log_ok "Persisted node configuration (${NODE_ROLE} -> ${TARGET_HOSTNAME}): ${NODE_ENV}"
 else
+    if ! grep -q '^NFS_MOUNT_POINT=' "$NODE_ENV" 2>/dev/null; then
+        printf 'NFS_MOUNT_POINT="%s"\n' "$NFS_MOUNT_POINT" >> "$NODE_ENV"
+    fi
     if ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null; then
         printf '\n# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto\nNFS_BACKEND="%s"\n' "$NFS_BACKEND" >> "$NODE_ENV"
     fi
@@ -559,12 +586,14 @@ else
     fi
     if ! grep -q '^RVDK_TUNE_PROFILE=' "$NODE_ENV" 2>/dev/null; then
         printf 'RVDK_TUNE_PROFILE="%s"\n' "$RVDK_TUNE_PROFILE" >> "$NODE_ENV"
+    elif grep -qE '^RVDK_TUNE_PROFILE=["'\'']?ml["'\'']?$' "$NODE_ENV" 2>/dev/null; then
+        sed -i 's/^RVDK_TUNE_PROFILE=.*/RVDK_TUNE_PROFILE="ai"/' "$NODE_ENV" 2>/dev/null || true
     fi
 fi
 
 export BRAKERRAK_NODE_ENV="$NODE_ENV"
 export RVDK_ENV_FILE="$NODE_ENV"
-export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT VG_NAME WITH_RAID RAID_ARRAYS_JSON ENABLE_POSTGRES ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND PIGEON_ROLE RVDK_TUNE_PROFILE
+export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT NFS_MOUNT_POINT VG_NAME WITH_RAID RAID_ARRAYS_JSON ENABLE_POSTGRES ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND PIGEON_ROLE RVDK_TUNE_PROFILE
 
 # ==============================================================================
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
@@ -579,9 +608,15 @@ brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launchin
 log_step "1. RVDK Day-0 OS & Silicon BSP Convergence (Hostname: ${TARGET_HOSTNAME})"
 run_rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
 
-brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
-log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
 NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT" --vg "$VG_NAME")
+if [[ "$ENABLE_NFS_SERVER" == "true" && "$WITH_RAID" != "true" ]]; then
+    brak_prog 28 "Stage 2/7: Dual-LVM 4Kn NVMe (${MOUNT_POINT} XFS + ${NFS_MOUNT_POINT} Btrfs)" 0 "Launching rvdk mods/nvme-4kn --with-nfs-lv..."
+    log_step "2. RVDK Dual-LVM 4Kn NVMe Provisioning (${NVME_DEV} -> ${MOUNT_POINT} + ${NFS_MOUNT_POINT})"
+    NVME_FLAGS+=(--with-nfs-lv --nfs-mount "$NFS_MOUNT_POINT")
+else
+    brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
+    log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
+fi
 [[ "$FORCE_WIPE_NVME" == "true" ]] && NVME_FLAGS+=(--force-wipe)
 run_rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
 
@@ -653,6 +688,9 @@ fi
 
 if [[ "$CLI_WITH_DEEPTUNE" == "true" ]]; then
     RESOLVED_TUNE="${CLI_DEEPTUNE_TUNE:-$RVDK_TUNE_PROFILE}"
+    case "$(tr '[:upper:]' '[:lower:]' <<< "$RESOLVED_TUNE")" in
+        ai|ml|edge-ai|edge-ml) RESOLVED_TUNE="ai" ;;
+    esac
     brak_prog 93 "Stage 5D: Silicon & OS Extreme DeepTune (--tune ${RESOLVED_TUNE})" 0 "Launching rvdk deeptune --tune ${RESOLVED_TUNE}..."
     log_step "5D. RVDK Silicon & OS Extreme DeepTune (Role: ${NODE_ROLE} -> --tune ${RESOLVED_TUNE})"
     run_rvdk deeptune --tune "$RESOLVED_TUNE"
@@ -694,6 +732,16 @@ fi
 NVME_SHORT="$(basename "$NVME_DEV")"
 LBA_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
 NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "unmounted")"
+NFS_LV_MNT_INFO=""
+if mountpoint -q "$NFS_MOUNT_POINT" 2>/dev/null; then
+    NFS_LV_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$NFS_MOUNT_POINT" 2>/dev/null || true)"
+fi
+LVM_POOL_INFO=""
+if command -v vgs >/dev/null 2>&1 && vgs "$VG_NAME" >/dev/null 2>&1; then
+    VG_FREE="$(vgs --noheadings -o vg_free "$VG_NAME" 2>/dev/null | xargs || true)"
+    VG_TOTAL="$(vgs --noheadings -o vg_size "$VG_NAME" 2>/dev/null | xargs || true)"
+    [[ -n "$VG_FREE" && -n "$VG_TOTAL" ]] && LVM_POOL_INFO="${VG_NAME}: ${VG_FREE} free of ${VG_TOTAL} (online lvextend reserve)"
+fi
 HP_TOTAL="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 HP_FREE="$(awk '/HugePages_Free:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
 HP_USED=$(( HP_TOTAL - HP_FREE ))
@@ -733,6 +781,8 @@ printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
 printf "  • CPU Governor/Clock : %s\n" "$CPU_CLOCK_INFO"
 printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"
 printf "  • Hot NVMe Mount     : %s\n" "$NVME_MNT_INFO"
+[[ -n "$NFS_LV_MNT_INFO" ]] && printf "  • Dedicated NFS LV   : %s\n" "$NFS_LV_MNT_INFO"
+[[ -n "$LVM_POOL_INFO" ]]   && printf "  • LVM Elastic Pool   : %s\n" "$LVM_POOL_INFO"
 printf "  • PG Data Directory  : %s\n" "$PG_DATA_DIR"
 printf "  • PG 18 Async I/O    : io_method = %s\n" "$PG_IO_METHOD"
 printf "  • PG Shared Buffers  : %s (HugePages in use: %s / %s)\n" "$PG_SHBUF" "$HP_USED" "$HP_TOTAL"
@@ -756,7 +806,8 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
                 --to-user "$ADMIN_USER" \
                 --extra-dotdir .brakerrak \
                 --relink-bin /usr/local/bin/brakerrak:.brakerrak/engine/forge.sh \
-                --mount-point "$MOUNT_POINT"
+                --mount-point "$MOUNT_POINT" \
+                --nfs-mount "$NFS_MOUNT_POINT"
             echo ""
         else
             log_brak "Factory user '${FACTORY_USER}' still exists (active session: '${REAL_USER}'). Log in as '${ADMIN_USER}' and re-run 'sudo brakerrak' to migrate ~/.brakerrak & purge '${FACTORY_USER}'."

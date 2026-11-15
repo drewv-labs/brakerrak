@@ -30,9 +30,12 @@ USER_NODE_ENV="${BRAKERRAK_NODE_ENV:-${REAL_HOME}/.brakerrak/node.env}"
 
 NVME_DEV="/dev/nvme0n1"
 MOUNT_POINT="/mnt/nvme_pgdata"
+NFS_MOUNT_POINT="/mnt/nfs_vault"
 FS_LABEL="PGDATA_NVME"
+NFS_FS_LABEL="NFS_VAULT"
 VG_NAME="vg_braker"
 LV_NAME="lv_pgdata"
+NFS_LV_NAME="lv_nfsvault"
 RAID_ARRAYS_JSON='[]'
 
 if [[ -f "$USER_NODE_ENV" ]]; then
@@ -119,7 +122,7 @@ else
 fi
 
 echo "=== 2. Unmounting Storage Tiers & Handling Rotational RAID Disks ==="
-for mp in "$MOUNT_POINT" "${RAID_MOUNTS[@]}"; do
+for mp in "$NFS_MOUNT_POINT" "$MOUNT_POINT" "${RAID_MOUNTS[@]}"; do
     [[ -z "$mp" ]] && continue
     if mountpoint -q "$mp" 2>/dev/null; then
         fuser -km "$mp" 2>/dev/null || true
@@ -154,7 +157,7 @@ if [[ -b "$NVME_DEV" ]]; then
             vgchange -an "$cand_vg" 2>/dev/null || true
             vgremove -ff -y "$cand_vg" 2>/dev/null || true
         fi
-        dmsetup remove "${cand_vg}-${LV_NAME}" 2>/dev/null || true
+        dmsetup remove "${cand_vg}-${LV_NAME}" "${cand_vg}-${NFS_LV_NAME}" 2>/dev/null || true
     done
     pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
     for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
@@ -180,7 +183,7 @@ echo "=== 4. Purging PostgreSQL 18, RVDK/BrakerRak Drop-Ins & Mount Directories 
 apt-get -o DPkg::Lock::Timeout=120 purge -y "postgresql-18*" "postgresql-client-18*" "postgresql-common*" 2>/dev/null || true
 apt-get -o DPkg::Lock::Timeout=120 autoremove -y --purge >/dev/null 2>&1 || true
 rm -rf /etc/postgresql /etc/postgresql-common /var/lib/postgresql /var/log/postgresql
-rm -rf /opt/drewv-pgdg-riscv64 "$MOUNT_POINT"
+rm -rf /opt/drewv-pgdg-riscv64 "$MOUNT_POINT" "$NFS_MOUNT_POINT"
 
 if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
     for mp in "${RAID_MOUNTS[@]}"; do
@@ -195,6 +198,13 @@ rm -f /etc/mosquitto/conf.d/brakerrak.conf \
       /etc/mosquitto/conf.d/99-rvdk-broker.conf
 rm -f /etc/exports.d/rvdk-vaults.exports \
       /etc/exports.d/brakerrak-vaults.exports
+rm -f /etc/systemd/system/postgresql@.service.d/90-rvdk-qos.conf \
+      /etc/systemd/system/nfs-ganesha.service.d/90-rvdk-qos.conf \
+      /etc/systemd/system/nfs-server.service.d/90-rvdk-qos.conf
+rmdir --ignore-fail-on-non-empty \
+      /etc/systemd/system/postgresql@.service.d \
+      /etc/systemd/system/nfs-ganesha.service.d \
+      /etc/systemd/system/nfs-server.service.d 2>/dev/null || true
 if [[ -f /etc/ganesha/ganesha.conf ]] && grep -q "DREW-V Labs // RVDK" /etc/ganesha/ganesha.conf 2>/dev/null; then
     printf "# Reset by BrakerRak reset-day0.sh\n" > /etc/ganesha/ganesha.conf
 fi
@@ -212,7 +222,9 @@ apt-get -o DPkg::Lock::Timeout=120 update -q || true
 
 echo "=== 5. Reverting /etc/fstab, HugePages/DeepTune Sysctls & Hostname ==="
 sed -i "\|${FS_LABEL}|d" /etc/fstab 2>/dev/null || true
+sed -i "\|${NFS_FS_LABEL}|d" /etc/fstab 2>/dev/null || true
 sed -i "\|[[:space:]]${MOUNT_POINT}[[:space:]]|d" /etc/fstab 2>/dev/null || true
+sed -i "\|[[:space:]]${NFS_MOUNT_POINT}[[:space:]]|d" /etc/fstab 2>/dev/null || true
 if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
     for lbl in "${RAID_LABELS[@]}"; do
         [[ -n "$lbl" ]] && sed -i "\|${lbl}|d" /etc/fstab 2>/dev/null || true

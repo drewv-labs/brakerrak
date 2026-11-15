@@ -4,7 +4,7 @@
 
 *Optimized SiFive HiFive Premier P550 Data Broker Build*
 
-<img src="./assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="600"/>
+<img src="../assets/brakerbox-p550-ai-styled.jpg" alt="BrakerBox-P550" width="600"/>
 
 </div>
 
@@ -12,7 +12,7 @@
 
 ## 1. Architectural Overview
 
-DREW-V Labs presents this `brakerbox-p550` build as a 1U rackmount RISC-V high throughput data broker built around the **[SiFive HiFive Premier P550](https://www.sifive.com/development-platforms/hifive-premier-p550)** (`HF106-001`) Mini-DTX platform paired with a NVMe SSD (tested w/ WD_Black SN850X). Built on the latest PostgreSQL 18.6 `io_uring` functionality supporting up to 200 concurrent asynchronous NVMe disk I/O prefetch operations, 250 connected clients, and 4 parallel workers.
+[DREW-V Labs](https://github.com/drewv-labs) presents this `brakerbox-p550` build as a 1U rackmount RISC-V high throughput data broker built around the **[SiFive HiFive Premier P550](https://www.sifive.com/development-platforms/hifive-premier-p550)** (`HF106-001`) Mini-DTX platform paired with a NVMe SSD (tested w/ WD_Black SN850X). Built on the latest PostgreSQL 18.6 `io_uring` functionality supporting up to 200 concurrent asynchronous NVMe disk I/O prefetch operations, 250 connected clients, and 4 parallel workers.
 
 By switching to io_uring, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead.  
 
@@ -93,22 +93,91 @@ curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker
 
 Then edit `~/.brakerrak/node.env` to setup custom config and rerun to provision and validate the build...  
 ~~~bash
-sudo brakerrak verify --use-pkg-cache
+sudo brakerrak verify
 ~~~
 
 ---
 
 ## 1U Chassis Layout
 
-<img src="./assets/brakerbox-p550-topdown.jpg" alt="BrakerBox-P550-TopDown" width="600">  
+<div align="center">
 
+<img src="../assets/brakerbox-p550-topdown.jpg" alt="BrakerBox-P550-TopDown" width="600">  
+
+</div>
+
+---
+
+## Lab `.brakerrak/node.env` Config for Build Reproducibility
+
+~~~md
+# ==============================================================================
+# DREW-V Labs // BrakerBox-P550 Node Config (~/.brakerrak/node.env)
+# ==============================================================================
+NODE_ROLE="databroker"
+TARGET_HOSTNAME="brakerbox-p550"
+ADMIN_USER="drew"
+LAB_SUBNET="10.0.10.0/24"
+
+# Hot NVMe Storage
+NVME_DEV="/dev/nvme0n1"
+MOUNT_POINT="/mnt/nvme_pgdata"
+
+# Optional USB/SATA RAID 10 Arrays (Default: false / empty array)
+WITH_RAID="true"
+RAID_ARRAYS_JSON='[
+  {
+    "name": "BigRed",
+    "id": "bigred",
+    "type": "warm",
+    "label": "BIGRED_VAULT",
+    "mount": "/mnt/bigred_wdr48",
+    "md_dev": "/dev/md/bigred",
+    "disks": 4,
+    "min_bytes": 11000000000000,
+    "max_bytes": 13000000000000,
+    "tablespace": "ts_bigred_warm",
+    "nfs_fsid": 10,
+    "nfs_dirs": ["models/hailo8", "models/hailo8l", "sigmf", "fits", "pg_backups", "ctd-vault"]
+  },
+  {
+    "name": "LilBlu",
+    "id": "lilblu",
+    "type": "cold",
+    "label": "LILBLU_ARCH",
+    "mount": "/mnt/lilblu_wdb24",
+    "md_dev": "/dev/md/lilblu",
+    "disks": 4,
+    "min_bytes": 5500000000000,
+    "max_bytes": 6500000000000,
+    "tablespace": "ts_lilblu_cold",
+    "nfs_fsid": 20,
+    "nfs_dirs": ["archives"]
+  }
+]'
+
+# DataBroker Network Services (When ENABLE_NFS_SERVER=true and WITH_RAID=false, exports ${MOUNT_POINT}/nfs_vault)
+ENABLE_MQTT_BROKER="true"
+MQTT_PORT="1883"
+ENABLE_NFS_SERVER="true"
+
+# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto
+NFS_BACKEND="ganesha"
+
+~~~
 
 ---
 
 
 <div align="center">
 
-**DREW-V LABS** // **Drew Vandagriff** — *Dallas, TX*  
+**[DREW-V Labs](https://github.com/drewv-labs)** // **Drew Vandagriff** — *Dallas, TX*  
 `Simplicity in Architecture · Efficiency in Engineering · Purity in Science · Audacity in Art · Life in Logic`
 
 </div>
+
+
+---
+
+###### Trademarks & Non-Affiliation Notice
+> **BrakerRak** and **BrakerBox-P550** are independent open-source projects developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, or **Orange Pi**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
