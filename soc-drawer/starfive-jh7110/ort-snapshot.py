@@ -135,7 +135,9 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
             tz_name = read_sysfs(f"{tz}/type") or os.path.basename(tz)
             t_val = read_sysfs(f"{tz}/temp")
             if t_val and t_val.lstrip("-").isdigit():
-                thermals.setdefault(tz_name, []).append(round(int(t_val) / 1000.0, 2))
+                deg_c = round(int(t_val) / 1000.0, 2)
+                if 0.0 < deg_c < 150.0:
+                    thermals.setdefault(tz_name, []).append(deg_c)
 
         for hp in sorted(glob.glob("/sys/class/hwmon/hwmon*/temp*_input")):
             hw_dir = os.path.dirname(hp)
@@ -143,7 +145,9 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
             lbl = read_sysfs(hp.replace("_input", "_label")) or os.path.basename(hp).replace("_input", "")
             t_val = read_sysfs(hp)
             if t_val and t_val.lstrip("-").isdigit():
-                thermals.setdefault(f"{hw_name}:{lbl}", []).append(round(int(t_val) / 1000.0, 2))
+                deg_c = round(int(t_val) / 1000.0, 2)
+                if 0.0 < deg_c < 150.0:
+                    thermals.setdefault(f"{hw_name}:{lbl}", []).append(deg_c)
 
         for fp in fan_paths:
             f_val = read_sysfs(fp)
@@ -184,6 +188,22 @@ def sample_quiescent_metrics(duration_sec: float = 5.0, interval_sec: float = 0.
         "loadavg_1m": summarize(load_1m, "load"),
         "mem_available_kb": summarize(mem_avail_kb, "kB"),
     }
+
+
+def resolve_soc_peak_temp(thermals_summary: dict[str, dict[str, Any]]) -> float | None:
+    soc_peaks = [
+        float(v["max"])
+        for k, v in thermals_summary.items()
+        if v.get("max") is not None and not k.lower().startswith("nvme:")
+    ]
+    if soc_peaks:
+        return max(soc_peaks)
+    fallback_peaks = [
+        float(v["max"])
+        for k, v in thermals_summary.items()
+        if v.get("max") is not None and k.lower() in ("nvme:composite", "nvme:temp1")
+    ]
+    return max(fallback_peaks) if fallback_peaks else None
 
 
 def inspect_postgres_state() -> dict[str, Any]:
@@ -571,6 +591,7 @@ def main() -> None:
     }
 
     next_ort_idx = 4 + len(raid_ort_checks)
+    soc_peak_c = resolve_soc_peak_temp(quiescent["thermal_zones_celsius"])
     ort_checks = [
         {
             "id": "ORT-01_CPU_HARTS",
@@ -611,10 +632,8 @@ def main() -> None:
             "id": f"ORT-{next_ort_idx + 1:02d}_THERMAL_IDLE_FLOOR",
             "description": "Quiescent SoC Thermal Ceiling Below 55.0 C",
             "expected": "< 55.0 C",
-            "actual": f"{max([v['max'] for v in quiescent['thermal_zones_celsius'].values() if v['max'] is not None], default=0.0)} C",
-            "status": "PASS"
-            if max([v["max"] for v in quiescent["thermal_zones_celsius"].values() if v["max"] is not None], default=0.0) < 55.0
-            else "WARN",
+            "actual": f"{soc_peak_c} C" if soc_peak_c is not None else "no sensor",
+            "status": "PASS" if (soc_peak_c is not None and soc_peak_c < 55.0) else "WARN",
         },
         {
             "id": f"ORT-{next_ort_idx + 2:02d}_KERNEL_BUS_HEALTH",
