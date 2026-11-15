@@ -63,7 +63,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 
 <img src="./docs/assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="500"/>
 
-*HiFive Premier P550 [BrakerBox-P550 Setup](https://github.com/drewv-labs/brakerrak/docs/builds/brakerbox-p550.md)*
+*HiFive Premier P550 [BrakerBox-P550 Setup](https://github.com/drewv-labs/brakerrak/blob/main/docs/builds/brakerbox-p550.md)*
 
 </div>
 
