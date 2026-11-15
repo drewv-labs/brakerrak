@@ -8,7 +8,7 @@
 
 ---
 
-`BrakerRak` (named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker)) is a stateful bare-metal execution, diagnostic, and benchmarking harness designed to converge, profile, and orchestrate **Out-of-Order (`OoO`) vs. In-Order (`InO`) [RISC-V](https://riscv.org/) silicon** across high-throughput relational data brokering (`io_uring` PostgreSQL 18.6 + NFS Ganesha), Edge NPU ML, and discrete PCIe AI accelerators (Tenstorrent Blackhole / GPUs).
+[BrakerRak](https://github.com/drewv-labs/brakerrak) (named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker)) is a **stateful bare-metal execution, diagnostic, and benchmarking harness** designed to converge, profile, and orchestrate [Out-of-Order (OoO)](https://en.wikipedia.org/wiki/Out-of-order_execution) vs. [In-Order (InO)](https://en.wikipedia.org/wiki/Out-of-order_execution#In-order_processors) [RISC-V](https://en.wikipedia.org/wiki/RISC-V) silicon across high-throughput relational data brokering (`io_uring` [PostgreSQL](https://en.wikipedia.org/wiki/PostgreSQL) 18.6 + [NFS Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)), Edge NPU ML, and discrete PCIe AI accelerators ([Tenstorrent Blackhole](https://tenstorrent.com/en/hardware/cards) / GPUs).
 
 <div align="center">
 
@@ -47,14 +47,6 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 
 ### 2. Silicon Targets (`soc-drawer/`)
 
-<div align="center">
-
-<img src="./docs/assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="500"/>
-
-*HiFive Premier P550 [BrakerBox-P550 Setup](https://github.com/drewv-labs/brakerrak/docs/builds/brakerbox-p550.md)*
-
-</div>
-
 | SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
 | :--- | :--- | :--- | :--- |
 | ESWIN EIC7700X (HiFive Premier P550 / Milk-V Megrez) | `4x SiFive P550` (`3-Wide OoO @ 1.4–1.8GHz`) | `RVA20` (`-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550`) | **Active / Verified** |
@@ -64,6 +56,16 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 | SpacemiT K3 (Milk-V Jupiter 2 / Firefly AIBOX-K3) | `8x SpacemiT X100` (`4-Wide OoO @ 2.4GHz` + `60 TOPS`) | `RVA23` + `1024-bit RVV 1.0` | Planned |
 | SiFive Freedom U740 (HiFive Unmatched Rev B) | `4x SiFive U74` (`2-Wide InO @ 1.2GHz` + `PCIe Gen3 x8`) | `RVA20` (`RV64GC`) | Planned |
 | Tenstorrent Atlantis | `8x Tenstorrent Ascalon-X` (`Wide OoO` + `PCIe Gen5`) | `RVA23` + `256-bit RVV 1.0` | Planned |
+
+---
+
+<div align="center">
+
+<img src="./docs/assets/sifive-hifive-premier-p550-sn850x-server-layout.png" alt="BrakerBox-P550" width="500"/>
+
+*HiFive Premier P550 [BrakerBox-P550 Setup](https://github.com/drewv-labs/brakerrak/docs/builds/brakerbox-p550.md)*
+
+</div>
 
 ---
 
