@@ -278,12 +278,10 @@ riscv-data-kit/
 #### Industry
 - [SiFive](https://www.sifive.com/)
 - [Tenstorrent](https://tenstorrent.com/en)
-<br>
 - [Milk-V](https://milkv.io/)
 - [SpacemiT](https://www.spacemit.com/)
 - [StarFive](https://www.starfivetech.com/en/)
 - [UltraRISC](https://ultrarisc.com/en/)
-<br>
 - [BananaPi](https://banana-pi.org/)
 - [OrangePi RISC-V](https://orangepi.net/shop.html?tag=risc-v)
 - [Firefly RISC-V](https://www.t-firefly.com/pages/riscv)
