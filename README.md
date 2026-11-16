@@ -69,7 +69,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 
 ---
 
-## Zero-Touch Quickstart (`curl | sudo bash` & `brakerrak` CLI)
+## Quickstart (`curl | sudo bash` & `brakerrak` CLI)
 
 ### 1. Remote One-Liner Convergence
 
@@ -187,8 +187,7 @@ When `WITH_RAID="true"`, `BrakerRak` passes `RAID_ARRAYS_JSON` into `rvdk mods/b
 1. **Stage 0 — Clean-Room ORT Baseline (`brakerrak ort --stage day0-pre-forge`):** 
 
 Captures a zero-mutation JSON snapshot of factory PCIe link speeds, `512e` NVMe LBA formatting, rotational JBOD enumeration, and quiescent thermal/clock baselines.
-
----
+<br>
 
 2. **Stage 1 — Cold Convergence Forge (`brakerrak forge`):**
 
@@ -201,20 +200,17 @@ Dispatches
   * `nfs-vault`
   * `btrfs-raid`
   * `rvdk deeptune`
-
----
+<br>
 
 3. **Stage 2 — Idempotency Verification Pass (`brakerrak forge`):** 
 
 Re-executes the full pipeline against the live node, asserting `100% [SKIP]` across converged stages with zero destructive storage mutations or unnecessary `apt-get update` passes.
-
----
+<br>
 
 4. **Stage 3 — Post-Forge CTD Provenance (`brakerrak ort --stage day1-post-forge`):** 
 
 Emits a SHA-256 signed JSON manifest (`.json` + redacted `.public.json`) to `~/.brakerrak/snapshots/` verifying `4Kn` block alignment, active `io_uring` backend configuration, `Sv39` HugePage consumption, and tablespace/NFSv4 routing.
-
----
+<br>
 
 5. **Option A Rollback (`brakerrak reset --confirm-destroy`):** 
 
@@ -284,18 +280,18 @@ riscv-data-kit/
 #### Industry
 - [SiFive](https://www.sifive.com/)
 - [Tenstorrent](https://tenstorrent.com/en)
----
+<br>
 - [Milk-V](https://milkv.io/)
 - [SpacemiT](https://www.spacemit.com/)
 - [StarFive](https://www.starfivetech.com/en/)
 - [UltraRISC](https://ultrarisc.com/en/)
----
+<br>
 - [BananaPi](https://banana-pi.org/)
 - [OrangePi RISC-V](https://orangepi.net/shop.html?tag=risc-v)
 - [Firefly RISC-V](https://www.t-firefly.com/pages/riscv)
 
 #### Software
-- [PostgreSQL 18.6 Release Notes (`io_uring`)](https://www.postgresql.org/docs/18/release-18-6.html)
+- [PostgreSQL](https://www.postgresql.org/)
 - [NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)
 - [MQTT](https://mqtt.org/)
 - [Eclipse Mosquitto](https://mosquitto.org/)
@@ -313,4 +309,4 @@ riscv-data-kit/
 ---
 
 ###### Trademarks & Non-Affiliation Notice
-> **BrakerRak** is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, or **Orange Pi**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
+> **BrakerRak** is an independent open-source project developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, **Orange Pi**, or **PostgreSQL**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
