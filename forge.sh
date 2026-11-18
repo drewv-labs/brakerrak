@@ -8,11 +8,11 @@
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|braksky|databench|visionferret|devbench|devsky] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
-#   sudo brakerrak deeptune [--role databroker|braksky|databench|visionferret|devbench|devsky]
+#   sudo brakerrak [forge] [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak deeptune [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench]
 #   sudo brakerrak storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
-#   sudo brakerrak verify [--role databroker|braksky|databench|visionferret|devbench|devsky] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak verify [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
 #   sudo brakerrak update [--skip-rvdk]
 # ==============================================================================
@@ -84,13 +84,14 @@ normalize_role() {
     local raw
     raw="$(tr '[:upper:]' '[:lower:]' <<< "${1:-databroker}")"
     case "$raw" in
-        prod|broker|databroker|brakerbox)        echo "databroker" ;;
-        braksky|sky)                             echo "braksky" ;;
-        bench|databench|brakerbench)             echo "databench" ;;
-        visionferret|vferret|ferret|mlbench)     echo "visionferret" ;;
-        devbench|dev)                            echo "devbench" ;;
-        devsky|dsk|skunksky)                     echo "devsky" ;;
-        *)                                       echo "" ;;
+        prod|broker|databroker|brakerbox|brakbox|brx)                 echo "databroker" ;;
+        bench|databench|brakerbench|brakbnch|brh)                     echo "databench" ;;
+        babbagebox|babbox|bab|gpuprod)                                echo "babbagebox" ;;
+        babbagebench|babbnch|bah|gpubench)                            echo "babbagebench" ;;
+        visionbox|visbox|vx|npuprod)                                  echo "visionbox" ;;
+        visionbench|visbnch|vh|npubench|visionferret|vferret|mlbench) echo "visionbench" ;;
+        devbench|devbnch|dev)                                         echo "devbench" ;;
+        *)                                                            echo "" ;;
     esac
 }
 
@@ -99,8 +100,8 @@ role_to_rvdk_tune() {
     local canon
     canon="$(normalize_role "${1:-databroker}")"
     case "$canon" in
-        devbench|visionferret|braksky|devsky) echo "ai" ;;
-        *)                                    echo "data" ;;
+        babbagebox|babbagebench|visionbox|visionbench|devbench) echo "ai" ;;
+        *)                                                      echo "data" ;;
     esac
 }
 
@@ -482,13 +483,13 @@ if [[ -f "$NODE_ENV" ]]; then
 
     if [[ -n "$CLI_ROLE" ]]; then
         REQUESTED_ROLE="$(normalize_role "$CLI_ROLE")"
-        [[ -z "$REQUESTED_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | braksky | databench | visionferret | devbench | devsky)"
+        [[ -z "$REQUESTED_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench)"
         if [[ "$REQUESTED_ROLE" != "$SAVED_ROLE" ]]; then
             log_brak "Stateless Persona Flip: ${SAVED_ROLE} -> ${REQUESTED_ROLE}"
             NODE_ROLE="$REQUESTED_ROLE"
             WRITE_NODE_ENV="true"
             unset ENABLE_POSTGRES ENABLE_MQTT_BROKER ENABLE_NFS_SERVER PIGEON_ROLE RVDK_TUNE_PROFILE
-            if [[ -z "$CLI_HOSTNAME" && "${TARGET_HOSTNAME:-}" =~ ^(brakerbox|braksky|brakerbench|databroker|databench|vferret|visionferret|devbench|devsky)- ]]; then
+            if [[ -z "$CLI_HOSTNAME" && "${TARGET_HOSTNAME:-}" =~ ^(brakerbox|brakerbench|databroker|databench|babbagebox|babbagebench|visionbox|visionbench|vferret|visionferret|devbench)- ]]; then
                 unset TARGET_HOSTNAME
             fi
         fi
@@ -497,7 +498,7 @@ else
     FORGE_PASS="1"
     WRITE_NODE_ENV="true"
     NODE_ROLE="$(normalize_role "${CLI_ROLE:-databroker}")"
-    [[ -z "$NODE_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | braksky | databench | visionferret | devbench | devsky)"
+    [[ -z "$NODE_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench)"
 fi
 
 ROLE_ENV_FILE="${LOCAL_ROOT}/roles/${NODE_ROLE}.env"
@@ -542,7 +543,7 @@ if [[ "$WRITE_NODE_ENV" == "true" ]]; then
     cat <<EOF > "$NODE_ENV"
 # ==============================================================================
 # DREW-V Labs // BrakerRak User Node Config (~/.brakerrak/node.env)
-# Role Personas: databroker | braksky | databench | visionferret | devbench | devsky
+# Role Personas: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench
 # ==============================================================================
 NODE_ROLE="${NODE_ROLE}"
 TARGET_HOSTNAME="${TARGET_HOSTNAME}"

@@ -32,16 +32,21 @@ While **[RVDK](https://github.com/drewv-labs/brakerrak)** supplies the atomic pr
 
 ### 1. Role Personas (`roles/` & `node.env`)
 
-Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, isolated microarchitectural benchmarking, or Edge NPU development via `brakerrak --role <persona> --deeptune`:
+Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, Edge NPU inference, isolated microarchitectural benchmarking, or hybrid development via `brakerrak --role <persona> --deeptune`:
 
-| Role Persona | Default Hostname | `RVDK` DeepTune Profile | PostgreSQL 18.6 (`io_uring`) | Mosquitto MQTT (`:1883`) | NFSv4 Vault Server (`ganesha` / `kernel`) | Desc |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`databroker`** | `brakerbox-<tag>` | `--tune data` | Active + Warm/Cold RAID Tablespaces | Enabled (Persisted on `4Kn` NVMe) | Exports RAID Vaults (or Dedicated `lv_nfsvault` Btrfs LV when `WITH_RAID=false`) | Prod Databroker & NFS Host |
-| **`databench`** | `brakerbench-<tag>` | `--tune data` | Active (Isolated Benchmark Target) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Databroker |
-| **`braksky`** | `braksky-<tag>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; frees RAM/HugePages for Blackhole/GPU) | Disabled | Disabled | Prod GPU AI/ML Forge + Synthetic Swarm Provisioning |
-| **`devsky`** | `devsky-<tag>` | `--tune ai` | Active (Discrete GPU/Blackhole ML + High-Mem Data Bench) | Enabled (`:1883` + Unix Socket) | Disabled by Default | Dev BrakSky + databench hybrid |
-| **`devbench`** | `devbench-<tag>` | `--tune ai` | Active (Edge NPU ML + Edge Data Bench) | Enabled (`:1883` + Unix Socket) | Disabled by Default | Dev NPU + databench Hybrid |
-| **`visionferret`** | `vferret-<tag>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev VisionFive2 NPU Edge Inference |
+| Role (`--role`) | Persona (`Short` / `LilSnitch` Tag) | Default Hostname | `RVDK` DeepTune | PostgreSQL 18.6 (`io_uring`) | Mosquitto MQTT (`:1883`) | NFSv4 Vault Server (`ganesha` / `kernel`) | Desc |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **`databroker`** | **`BrakerBox`** (`BrakBox` / `brx`) | `brakerbox-<board>` | `--tune data` | Active + Warm/Cold RAID Tablespaces | Enabled (Persisted on `4Kn` NVMe) | Exports RAID Vaults (or Dedicated `lv_nfsvault` Btrfs LV when `WITH_RAID=false`) | Prod Data Broker & NFS Host |
+| **`databench`** | **`BrakerBench`** (`BrakBnch` / `brh`) | `brakerbench-<board>` | `--tune data` | Active (Isolated Benchmark Target) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Data Bench |
+| **`babbagebox`** | **`BabbageBox`** (`BabBox` / `bab`) | `babbagebox-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; frees RAM/HugePages for Blackhole/GPU) | Disabled | Disabled | Prod GPU / Blackhole Workhorse + `PigCan` |
+| **`babbagebench`** | **`BabbageBench`** (`BabBnch` / `bah`) | `babbagebench-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; pure GPU/Blackhole isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated GPU / Blackhole Bench |
+| **`visionbox`** | **`VisionBox`** (`VisBox` / `vx`) | `visionbox-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; full Edge NPU memory headroom) | Disabled | Disabled | Prod Edge NPU Inference Node |
+| **`visionbench`** | **`VisionBench`** (`VisBnch` / `vh`) | `visionbench-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated Edge NPU Bench |
+| **`devbench`** | **`DevBench`** (`DevBnch` / `dev`) | `devbench-<board>` | `--tune ai` | Active (Hybrid GPU/NPU + Data Bench) | Enabled (`:1883` + Unix Socket) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
+
+> **Out-of-Band Sensor Personas & Specialized Builds:**
+> * **`LilSnitch` / `SnitchBench`:** ESP32-P4 RISC-V sensor kits paired with rack units using the persona tag convention `lsp4-<tag><board>` (e.g., `lsp4-brxp550` for `BrakerBox-P550`, plus `SnitchBench-P4` for sensor development).
+> * **`VisionFerret`:** Specialized VisionFive 2 NPU inference engine build profile under `docs/builds/` (converged via `--role visionbench` / `--role visionbox`).
 
 ### 2. Silicon Targets (`soc-drawer/`)
 
@@ -80,24 +85,27 @@ curl -fsSL https://brakerrak.dev/install-cli.sh | sudo bash
 # Converge node as a BrakerBox DataBroker (default Pass 1 role: databroker, NVMe-only)
 curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker --deeptune
 
-# Converge node as an isolated BrakerBench testbed or DevSky GPU/Blackhole bench
+# Converge node as an isolated BrakerBench testbed, BabbageBox GPU workhorse, or hybrid DevBench
 curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench --deeptune
-curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role devsky --deeptune
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role babbagebox --deeptune
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role devbench --deeptune
 ```
 
 ### 2. Local `/usr/local/bin/brakerrak` Lifecycle & Stateless Persona Flipping
 
-Once bootstrapped, use `brakerrak` CLI to flip node personas statelessly (e.g., staging a `DevSky-Titan` bench and flipping it into `BrakSky-Titan` production), manage live Dual-LVM storage elasticity, apply role-mapped `RVDK` DeepTune profiles, capture signed ORT/CTD hardware snapshots, verify idempotency, run showdowns, or roll back to factory Day-0 state:
+Once bootstrapped, use `brakerrak` CLI to flip node personas statelessly (e.g., staging a `DevBench-TitanP150A` / `BabbageBench-TitanP150A` bench and flipping it into `BabbageBox-TitanP150A` production), manage live Dual-LVM storage elasticity, apply role-mapped `RVDK` DeepTune profiles, capture signed ORT/CTD hardware snapshots, verify idempotency, run showdowns, or roll back to factory Day-0 state:
 
 ```bash
 # Re-converge node from ~/.brakerrak/node.env (Pass 2) or flip node persona on the fly
 brakerrak
-brakerrak --role devsky --deeptune
-brakerrak --role braksky --deeptune
+brakerrak --role devbench --deeptune
+brakerrak --role babbagebench --deeptune
+brakerrak --role babbagebox --deeptune
+brakerrak --role visionbench --deeptune
 brakerrak --role databench --deeptune
 brakerrak --role databroker --with-tailscale --ts-ssh
 
-# Apply or inspect role-aware RVDK DeepTune (`databroker`/`databench` -> data, `braksky`/`devsky`/`devbench`/`visionferret` -> ai)
+# Apply or inspect role-aware RVDK DeepTune (`databroker`/`databench` -> data, `babbage*`/`vision*`/`devbench` -> ai)
 brakerrak deeptune
 brakerrak deeptune status
 

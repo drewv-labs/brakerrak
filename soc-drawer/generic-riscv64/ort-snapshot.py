@@ -87,11 +87,12 @@ SOC_PROFILES: dict[str, dict[str, Any]] = {
 
 ROLE_STEM_MAP: dict[str, str] = {
     "databroker": "brakerbox",
-    "braksky": "braksky",
     "databench": "brakerbench",
-    "visionferret": "vferret",
+    "babbagebox": "babbagebox",
+    "babbagebench": "babbagebench",
+    "visionbox": "visionbox",
+    "visionbench": "visionbench",
     "devbench": "devbench",
-    "devsky": "devsky",
 }
 
 

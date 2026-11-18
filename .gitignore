@@ -224,8 +224,7 @@ graphify-out/
 node.env
 *.local.env
 **/snapshots/
-brakerbox-snapshot-*.json
-brakerbench-snapshot-*.json
+*-snapshot-*.json
 pg*-forge-perf-*
 pg*-forge-meta-*
 .DS_Store
