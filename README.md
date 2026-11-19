@@ -4,6 +4,9 @@
   
   *...the Silicon is gonna Sing!*
 
+  > [!NOTE]
+  > ‼ Please note that this project is in active development.
+
 </div>
 
 [BrakerRak](https://github.com/drewv-labs/brakerrak) (named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker)) is a **stateful bare-metal execution, diagnostic, and benchmarking harness** designed to converge, profile, and orchestrate [Out-of-Order (OoO)](https://en.wikipedia.org/wiki/Out-of-order_execution) vs. [In-Order (InO)](https://en.wikipedia.org/wiki/Out-of-order_execution#In-order_processors) [RISC-V](https://en.wikipedia.org/wiki/RISC-V) silicon across high-throughput relational data brokering (`io_uring` [PostgreSQL](https://en.wikipedia.org/wiki/PostgreSQL) 18.6 + [NFS Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)), Edge NPU ML, and discrete PCIe AI accelerators ([Tenstorrent Blackhole](https://tenstorrent.com/en/hardware/cards) / GPUs).
