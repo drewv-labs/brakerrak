@@ -26,7 +26,7 @@ Current Data System Software focus anchors represent the default choices used by
 **[PostgreSQL](https://www.postgresql.org/)**<br>
 Named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker), BrakerRak's primary core objective is accelerating latest versions of **PostgreSQL** on RISC-V bare-metal silicon. At the edge or in a server rack, this system is dedicated to rigorous, deep **PSQL** systems benchmarking & analysis toward studying how **PSQL** performs across various RISC-V profiles & ratifications, compiling optimized [riscv64 builds of the latest PSQL versions & features](https://github.com/drewv-labs/riscv-data-kit/releases), and setting up RISC-V nodes as [PSQL Buildfarms](https://wiki.postgresql.org/wiki/PostgreSQL_Buildfarm_Howto). 
 
-Simply put, BrakerRak seeks to unshackle *"the world's most advanced open source database"* for *"the future of compute"*! 
+> Simply put, BrakerRak seeks to unshackle *"the world's most advanced open source database"* for *"the future of compute"*! 
 
 **[NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)**<br>
 Operating as a versatile userspace NFS system, **NFS-Ganesha** is the BrakerRak NFS standard. **Ganesha's** major super power for an R&D system is that it's shielded from crusty vendor BSP kernel modules across the variety of RISC-V boards out in the wild. Also... more elephants! NFSv4 kernel system is supported by BrakerRak via optional flags and config.
