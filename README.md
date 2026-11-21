@@ -6,7 +6,7 @@
 
 </div>
 
-BrakerRak combines [RVDK (riscv-data-kit)](https://github.com/drewv-labs/rvdk) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) into a powerful RISC-V data Systems & AI/ML Engineering R&D platform.
+**BrakerRak** combines [riscv-data-kit (RVDK)](https://github.com/drewv-labs/rvdk) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) into a powerful **RISC-V data Systems & AI/ML Engineering R&D Platform**.
 
 ---
 
@@ -16,17 +16,17 @@ BrakerRak combines [RVDK (riscv-data-kit)](https://github.com/drewv-labs/rvdk) a
 
 </div>
 
-As a R&D platform, some of BrakerRak's core objectives are building & tuning data systems and benchmarking software & hardware accelerators across [Out-of-Order (OoO)](https://en.wikipedia.org/wiki/Out-of-order_execution) vs. [In-Order (InO)](https://en.wikipedia.org/wiki/Out-of-order_execution#In-order_processors) execution profiles found on various [RISC-V](https://en.wikipedia.org/wiki/RISC-V) hardware. To provide the highest signal-to-noise results and to ensure this project matures into a solid product we can all be proud of, BrakerRak is designed around inital "anchors of focus" that will expand in time:
+As a R&D platform, some of BrakerRak's core objectives are to turbocharge building & tuning data systems and scientifically benchmarking software & hardware accelerators across [Out-of-Order (OoO)](https://en.wikipedia.org/wiki/Out-of-order_execution) vs. [In-Order (InO)](https://en.wikipedia.org/wiki/Out-of-order_execution#In-order_processors) execution profiles found on [RISC-V](https://en.wikipedia.org/wiki/RISC-V) hardware. To provide the highest signal-to-noise results and to ensure this project matures into a solid product we can all rely on, BrakerRak is designed around inital "anchors of focus" that will expand in time:
 
 ### Data System Software Anchors
 
-Current Data System Software focus anchors represent the default choices used by BrakerRak. These focus anchors are not an exhaustive list of various data systems software supported and used by BrakerRak as aim is to grow into a rich RISC-V Data Systems & AI/ML Engineering R&D ecosystem.
+Current Data System Software focus anchors represent the default choices used by BrakerRak. These focus anchors are not an exhaustive list of various data systems software supported and used by BrakerRak as the aim is to grow into a rich RISC-V Data Systems & AI/ML ecosystem.
 
 **[PostgreSQL](https://www.postgresql.org/)**<br>
-Named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker), BrakerRak's primary core objective is accelerating latest versions of PostgreSQL on RISC-V bare-metal silicon. At the edge or in a server rack, this framework is dedicated to rigorous, deep PSQL systems benchmarking & analysis toward studying how PSQL performs across various RISC-V profiles & ratifications, compiling optimized [riscv64 builds of the latest PSQL versions & features](https://github.com/drewv-labs/riscv-data-kit/releases), and setting up RISC-V nodes as [PSQL Buildfarms](https://wiki.postgresql.org/wiki/PostgreSQL_Buildfarm_Howto). BrakerRak seeks to unshackle "the world's most advanced open source database" for "the future of compute"! 
+Named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker), BrakerRak's primary core objective is accelerating latest versions of **PostgreSQL** on RISC-V bare-metal silicon. At the edge or in a server rack, this system is dedicated to rigorous, deep **PSQL** systems benchmarking & analysis toward studying how **PSQL** performs across various RISC-V profiles & ratifications, compiling optimized [riscv64 builds of the latest PSQL versions & features](https://github.com/drewv-labs/riscv-data-kit/releases), and setting up RISC-V nodes as [PSQL Buildfarms](https://wiki.postgresql.org/wiki/PostgreSQL_Buildfarm_Howto). BrakerRak seeks to unshackle *"the world's most advanced open source database"* for *"the future of compute"*! 
 
 **[NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)**<br>
-Operating as a versatile userspace NFS system, Ganesha is the BrakerRak NFS standard. Ganesha's major super power for an R&D system is that it's shielded from crusty vendor BSP kernel modules across the variety of RISC-V boards out in the wild. Also... elephants! NFSv4 kernel system is supported by BrakerRak via optional flags and config.
+Operating as a versatile userspace NFS system, **NFS-Ganesha** is the BrakerRak NFS standard. **Ganesha's** major super power for an R&D system is that it's shielded from crusty vendor BSP kernel modules across the variety of RISC-V boards out in the wild. Also... more elephants! NFSv4 kernel system is supported by BrakerRak via optional flags and config.
 
 ---
 
@@ -35,10 +35,10 @@ Operating as a versatile userspace NFS system, Ganesha is the BrakerRak NFS stan
 Current Hardware Accelerator focus anchors are for phase 1 BrakerRak development with plans of expanding Hardware Accelerator support.
 
 **[Hailo AI Accelerators](https://hailo.ai/products/ai-accelerators/)**<br>
-The Hailo-8 (26 TOPS) and Hailo-8L (13 TOPS) M.2 NVMe NPU modules provide astounding power per watt making them word class accelerators for int8 or int4 operations. The Hailo-10H is rated at 40 TOPS int4 (20 TOPS int8) with 8gb onboard memory. As such, the Hailo 8 and 10 series modules are the NPU focus anchor.   
+The **Hailo-8** (26 TOPS) and **Hailo-8L** (13 TOPS) M.2 NVMe NPU modules provide astounding power per watt making them word class accelerators for int8 or int4 operations. The *Hailo-10H* is rated at 40 TOPS int4 (20 TOPS int8) with 8gb onboard memory. As such, the *Hailo* *8* and *10* series modules are the NPU focus anchor.   
 
 **[Tenstorrent Blackhole p150a Accelerator](https://tenstorrent.com/hardware/cards)**<br>
-As a RISC-V R&D platform, BrakerRak is initially designed and optimized around Tenstorrent's Blackhole p150a card powered by SiFive X280 RISC-V cores as the PCIe GPU accelerater core focus.
+As a RISC-V R&D platform, BrakerRak is initially designed and optimized around **Tenstorrent's Blackhole p150a** card powered by *SiFive X280 RISC-V cores* as the PCIe GPU accelerater core focus.
 
 ---
 
@@ -50,30 +50,30 @@ As a RISC-V R&D platform, BrakerRak is initially designed and optimized around T
 
 * [RVDK (riscv-data-kit)](https://github.com/drewv-labs/riscv-data-kit) 
 
-Provides the foundational idempotent day-0 media flashers, bare-metal bootstrapper, multi-layer kernel tuner, & prebuilt package catalog. BrakerRak leverages RVDK to deterministically provide controlled, consistent environments necessary for efficient node provisioning, hot-swappable system tuning (data brokering vs ML use cases), and performance "sensor" unlocks (e.g., `perf` counters) to use for observability pipelines.   
+Provides the foundational idempotent day-0 media flashers, bare-metal bootstrapper, multi-layer kernel tuner, & prebuilt package catalog. BrakerRak leverages **RVDK** to deterministically provide controlled, consistent environments necessary for efficient node provisioning, hot-swappable system tuning (data brokering vs ML use cases), and performance "sensor" unlocks (e.g., `perf` counters) to use for observability pipelines.   
 
 * [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons)
 <!-- TODO: Swap the CTD link below to the dedicated CTD architecture writeup URL once published -->
 
-Provides a configurable Go-driven Continuous Telemetric Documentation (CTD) mesh, distributed systems orchestration platform, Runner execution dispatch network, plug-and-play analytics layer, AI powered diagnostics & support, and an MCP service that can be plugged into modern agent harnesses. 
+Provides a configurable Go-driven **Continuous Telemetric Documentation (CTD)** mesh, distributed systems orchestration platform, **Runner** execution dispatch network, plug-and-play analytics layer, AI powered diagnostics & support, and an MCP service that can be plugged into modern agent harnesses. 
 
-> The lightweight high-throughput CTD mesh provides passive hardware-bound wide event observability that captures deep system measurements without interferring with latency sensitive experiments and delivers document blobs to the unified PSQL-powered CTD Ledger over MQTT network. Collects and streams bare-metal metric readings from each node with minimal observer effects creating clean, reliabale systems information that's immediately ready for insight mining or deep systems analysis. 
+> The lightweight high-throughput **CTD** mesh provides passive hardware-bound wide event observability that captures deep system measurements without interferring with latency sensitive experiments and delivers document blobs to the unified *PSQL-powered* **CTD Ledger** over *MQTT network*. Collects and streams bare-metal metric readings from each node with minimal observer effects creating clean, reliabale systems information that's immediately ready for insight mining or deep systems analysis. 
 
-> CarrierPigeons also provides a distributed systems orchestration platform to reduce friction of managing a R&D cluster so we can spend more time on the science & engineering. 
+> **CarrierPigeons** also provides a distributed systems orchestration platform to reduce friction of managing a R&D cluster so we can spend more time on the science & engineering. 
 
-> Tap into CarrierPigeon's Runner system to deploy prebuilt Go or ephemeral shell/Python executable functions to a single node or batch tagged groups or chained combinations, a real cheatcode for tasks like cluster maintenance or organizing selective multi-node benchmarks.  
+> Tap into **CarrierPigeon's** **Runner** system to deploy prebuilt Go or ephemeral shell/Python executable functions to a single node or batch tagged groups or chained combinations, a real cheatcode for tasks like cluster maintenance or organizing selective multi-node benchmarks.  
 
-> Collecting data is one piece of the puzzle, PigeonMath provides the analytics layer, interface, and toolkit to expand CTD Ledger analysis to your specific use case. Use PigeonMath to develop certified views to feed custom analytic pipelines or to enrich AI Agent support & diagnostic context. PigeonMath also constructs live system DAGs to model your cluster and provide layered lenses to explore your system and data.
+> Collecting data is one piece of the puzzle, **PigeonMath** provides the analytics layer, interface, and toolkit to expand **CTD Ledger** analysis to your specific use case. Use **PigeonMath** to develop certified views to feed custom analytic pipelines or to enrich AI Agent support & diagnostic context. **PigeonMath** also constructs live system DAGs to model your cluster and provide layered lenses to explore your system and data.
 
-> Having a context-aware AI buddy to help diagnose issues, provide insights around abnormal node metrics, or to run an ad-hoc ephemeral Runner on your behalf can help keep focus on the science and engineering or to provide support when sh!t hits the fan. PigeonCare is here for us all!
+> Having a context-aware AI buddy to help diagnose issues, provide insights around abnormal node metrics, or to run an ad-hoc ephemeral Runner on your behalf can help keep focus on the science and engineering or to provide support when sh!t hits the fan. **PigeonCare** is here for us all!
 
-> Lastly, CarrierPigeons gives us a MCP service allowing devs & researchers to plug their favorite harnesses and tools directly to the mesh. Work in the environment you're most comfortable with and empowered by. 
+> Lastly, **CarrierPigeons** gives us a *MCP service* allowing devs & researchers to plug their favorite harnesses and tools directly to the mesh. Work in the environment you're most comfortable with and empowered by. 
 
 * [BrakerRak](https://github.com/drewv-labs/brakerrak)
 
-BrakerRak combines the superpowers of **RVDK** & **CarrierPigeons** into a single RISC-V data systems & ML engineering R&D force-multiplier platform that can be used as-is or integrated as a framework into other applications using a variety of interface surfaces. 
+**BrakerRak** combines the superpowers of **RVDK** & **CarrierPigeons** into a single RISC-V data systems & ML engineering R&D force-multiplier platform that can be used as-is or integrated as a framework into other applications using a variety of interface surfaces. 
 
-Developed with over 12 years of Linux-based data systems, platform & infrastructure, and frameworks engineering experience, BrakerRak further builds out the ecosystem by integrating other cutting edge benchmarking tools and powerful open source pioneer projects.
+Developed with over 12 years of Linux-based data systems, platform & infrastructure, and frameworks engineering experience, **BrakerRak** further builds out the ecosystem by integrating other cutting edge benchmarking tools and powerful open source pioneer projects.
 
 ---
 
@@ -91,7 +91,7 @@ While **BrakerRak** provides the complete package, devs may only be interested i
 
 * **Use [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) standalone** if you want a lightweight-but-mighty Go-powered distributed telemetry, orchestration, execution, and analytics suite with baked in AI Agent + MCP power. Note: **CarrierPigeons** is designed to run on and support heterogenous architectures, **CarrierPigeons is not RISC-V exclusive** like **RVDK** and **BrakerRak** are designed to be.
 
-* **Use [`BrakerRak`](https://github.com/drewv-labs/brakerrak) (`brakerrak`)** if you want the full turnkey bare-metal RISC-V data systems, telemetry, & edge AI R&D engine combining the might of `RVDK` & `CarrierPigeons`. Note: **BrakerRak**, while designed to be a R&D platform, can easily be used to converge production ready machines deterministically & idempotently making it a great tool for provisioning reliable & performant RISC-V data brokers & AI systems into production.
+* **Use [`BrakerRak`](https://github.com/drewv-labs/brakerrak) (`brakerrak`)** if you want the full turnkey bare-metal RISC-V data systems, telemetry, & edge AI R&D engine combining the might of **RVDK** & **CarrierPigeons**. Note: **BrakerRak**, while designed to be a R&D platform, can easily be used to converge production ready machines deterministically & idempotently making it a great tool for provisioning reliable & performant RISC-V data brokers & AI systems into production.
 
 <div align="center">
 
@@ -111,28 +111,28 @@ While **BrakerRak** provides the complete package, devs may only be interested i
 
 Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, Edge NPU inference, isolated microarchitectural benchmarking, or hybrid development via `brakerrak --role <persona> --deeptune`:
 
-| Role (`--role`) | Persona (`Short` / `LilSnitch` Tag) | Default Hostname | `RVDK` DeepTune | PostgreSQL 18.6 (`io_uring`) | Mosquitto MQTT (`:1883`) | NFSv4 Vault Server (`ganesha` / `kernel`) | Desc |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`databroker`** | **`BrakerBox`** (`BrakBox` / `brx`) | `brakerbox-<board>` | `--tune data` | Active + Warm/Cold RAID Tablespaces | Enabled (Persisted on `4Kn` NVMe) | Exports RAID Vaults (or Dedicated `lv_nfsvault` Btrfs LV when `WITH_RAID=false`) | Prod Data Broker & NFS Host |
-| **`databench`** | **`BrakerBench`** (`BrakBnch` / `brh`) | `brakerbench-<board>` | `--tune data` | Active (Isolated Benchmark Target) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Data Bench |
-| **`babbagebox`** | **`BabbageBox`** (`BabBox` / `bab`) | `babbagebox-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; frees RAM/HugePages for Blackhole/GPU) | Disabled | Disabled | Prod GPU / Blackhole Workhorse + `PigCan` |
-| **`babbagebench`** | **`BabbageBench`** (`BabBnch` / `bah`) | `babbagebench-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; pure GPU/Blackhole isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated GPU / Blackhole Bench |
-| **`visionbox`** | **`VisionBox`** (`VisBox` / `vx`) | `visionbox-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; full Edge NPU memory headroom) | Disabled | Disabled | Prod Edge NPU Inference Node |
-| **`visionbench`** | **`VisionBench`** (`VisBnch` / `vh`) | `visionbench-<board>` | `--tune ai` | Disabled by Default (`--with-pg` opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated Edge NPU Bench |
-| **`devbench`** | **`DevBench`** (`DevBnch` / `dev`) | `devbench-<board>` | `--tune ai` | Active (Hybrid GPU/NPU + Data Bench) | Enabled (`:1883` + Unix Socket) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
+| Role (--role) | RVDK DeepTune | PostgreSQL 18.6 (io_uring) | Mosquitto MQTT (:1883) | NFSv4 Vault Server (ganesha / kernel) | Desc |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **databroker** | --tune data | Active + Warm/Cold RAID Tablespaces | Enabled (Persisted on 4Kn NVMe) | Exports RAID Vaults (or Dedicated lv_nfsvault Btrfs LV when WITH_RAID=false) | Prod Data Broker & NFS Host |
+| **databench** | --tune data | Active (Isolated Benchmark Target) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Data Bench |
+| **babbagebox** | --tune ai | Disabled by Default (--with-pg opt-in; frees RAM/HugePages for Blackhole/GPU) | Disabled | Disabled | Prod GPU / Blackhole Workhorse + PigCan |
+| **babbagebench** | --tune ai | Disabled by Default (--with-pg opt-in; pure GPU/Blackhole isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated GPU / Blackhole Bench |
+| **visionbox** | --tune ai | Disabled by Default (--with-pg opt-in; full Edge NPU memory headroom) | Disabled | Disabled | Prod Edge NPU Inference Node |
+| **visionbench** | --tune ai | Disabled by Default (--with-pg opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated Edge NPU Bench |
+| **devbench** | --tune ai | Active (Hybrid GPU/NPU + Data Bench) | Enabled (:1883 + Unix Socket) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
 
 
-### 2. Silicon Targets (`soc-drawer/`)
+### 2. Silicon Targets (soc-drawer/)
 
 | SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
 | :--- | :--- | :--- | :--- |
-| ESWIN EIC7700X (HiFive Premier P550 / Milk-V Megrez) | `4x SiFive P550` (`3-Wide OoO @ 1.4–1.8GHz`) | `RVA20` (`-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550`) | **Active / Verified** |
-| StarFive JH7110 / JH7110S (VF2 / VF2 Lite / Mars / OPi RV) | `4x SiFive U74` (`2-Wide InO @ 1.25–1.5GHz`) | `RVA20` (`-O3 -march=rv64gc -mcpu=sifive-u74`) | **Active / Verified** |
-| SpacemiT K1/M1 (OPi RV2 / OPi R2S / Jupiter / BPI-F3 / CM6) | `8x SpacemiT X60` (`2-Wide InO @ 1.6–1.8GHz`) | `RVA22` + `256-bit RVV 1.0` | **Active / Bring-Up** |
-| UltraRISC UR-DP1000 (Milk-V Titan) | `8x UR-CP100` (`4-Wide OoO @ 2.0GHz` + `PCIe Gen4 x16`) | `RVA22` + `H-Ext 1.0` | **Active / Bring-Up** |
-| SpacemiT K3 (Milk-V Jupiter 2 / Firefly AIBOX-K3) | `8x SpacemiT X100` (`4-Wide OoO @ 2.4GHz` + `60 TOPS`) | `RVA23` + `1024-bit RVV 1.0` | Planned |
-| SiFive Freedom U740 (HiFive Unmatched Rev B) | `4x SiFive U74` (`2-Wide InO @ 1.2GHz` + `PCIe Gen3 x8`) | `RVA20` (`RV64GC`) | Planned |
-| Tenstorrent Atlantis | `8x Tenstorrent Ascalon-X` (`Wide OoO` + `PCIe Gen5`) | `RVA23` + `256-bit RVV 1.0` | Planned |
+| ESWIN EIC7700X (HiFive Premier P550 / Milk-V Megrez) | 4x SiFive P550 (3-Wide OoO @ 1.4–1.8GHz) | RVA20 (-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550) | **Active / Verified** |
+| StarFive JH7110 / JH7110S (VF2 / VF2 Lite / Mars / OPi RV) | 4x SiFive U74 (2-Wide InO @ 1.25–1.5GHz) | RVA20 (-O3 -march=rv64gc -mcpu=sifive-u74) | **Active / Verified** |
+| SpacemiT K1/M1 (OPi RV2 / OPi R2S / Jupiter / BPI-F3 / CM6) | 8x SpacemiT X60 (2-Wide InO @ 1.6–1.8GHz) | RVA22 + 256-bit RVV 1.0 | **Active / Bring-Up** |
+| UltraRISC UR-DP1000 (Milk-V Titan) | 8x UR-CP100 (4-Wide OoO @ 2.0GHz + PCIe Gen4 x16) | RVA22 + H-Ext 1.0 | **Active / Bring-Up** |
+| SpacemiT K3 (Milk-V Jupiter 2 / Firefly AIBOX-K3) | 8x SpacemiT X100 (4-Wide OoO @ 2.4GHz + 60 TOPS) | RVA23 + 1024-bit RVV 1.0 | Planned |
+| SiFive Freedom U740 (HiFive Unmatched Rev B) | 4x SiFive U74 (2-Wide InO @ 1.2GHz + PCIe Gen3 x8) | RVA20 (RV64GC) | Planned |
+| Tenstorrent Atlantis | 8x Tenstorrent Ascalon-X (Wide OoO + PCIe Gen5) | RVA23 + 256-bit RVV 1.0 | Planned |
 
 ---
 
@@ -154,7 +154,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 
 ### 1. Remote One-Liner Convergence
 
-`BrakerRak`'s root `forge.sh` reads `/etc/rvdk/kit.env` (or probes `/proc/device-tree/model`), installs/updates `/usr/local/bin/brakerrak` and `/usr/local/bin/rvdk`, generates `~/.brakerrak/node.env` on Pass 1, and orchestrates the full `RVDK` convergence pipeline (formatting secondary NVMe to `4Kn` with `vg_braker` LVM, converging role-gated PostgreSQL 18.6 / MQTT / NFSv4 services, and applying workload-matched `rvdk deeptune`):
+**BrakerRak's** root `forge.sh` reads `/etc/rvdk/kit.env` (or probes `/proc/device-tree/model`), installs/updates `/usr/local/bin/brakerrak` and `/usr/local/bin/rvdk`, generates `~/.brakerrak/node.env` on Pass 1, and orchestrates the full **RVDK** convergence pipeline (formatting secondary NVMe to `4Kn` with `vg_braker` LVM, converging role-gated PostgreSQL 18.6 / MQTT / NFSv4 services, and applying workload-matched `rvdk deeptune`):
 
 ```bash
 # Install the brakerrak CLI & engine without running the convergence forge
@@ -171,7 +171,7 @@ curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role devbench --de
 
 ### 2. Local `/usr/local/bin/brakerrak` Lifecycle & Stateless Persona Flipping
 
-Once bootstrapped, use `brakerrak` CLI to flip node personas statelessly (e.g., staging a `DevBench-TitanP150A` / `BabbageBench-TitanP150A` bench and flipping it into `BabbageBox-TitanP150A` production), manage live Dual-LVM storage elasticity, apply role-mapped `RVDK` DeepTune profiles, capture signed ORT/CTD hardware snapshots, verify idempotency, run showdowns, or roll back to factory Day-0 state:
+Once bootstrapped, use `brakerrak` CLI to flip node personas statelessly (e.g., staging a `DevBench-TitanP150A` / `BabbageBench-TitanP150A` bench and flipping it into `BabbageBox-TitanP150A` production), manage live Dual-LVM storage elasticity, apply role-mapped **RVDK DeepTune** profiles, capture signed ORT/CTD hardware snapshots, verify idempotency, run showdowns, or roll back to factory Day-0 state:
 
 ```bash
 # Re-converge node from ~/.brakerrak/node.env (Pass 2) or flip node persona on the fly
@@ -312,7 +312,7 @@ Tears down services and LVM volumes, hardware-reformats the NVMe back to factory
 
 <div align="center">
 
-**[DREW-V Labs Indie Data Systems R&D](https://github.com/drewv-labs)**  // Drew Vandagriff   
+**[DREW-V Labs](https://github.com/drewv-labs)**  // Indie Data Systems R&D   
 `Simplicity in Architecture · Efficiency in Engineering · Purity in Science · Audacity in Art · Life in Logic`
 
 </div>
