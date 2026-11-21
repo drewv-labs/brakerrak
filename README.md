@@ -4,9 +4,10 @@
 
   > ‼ Please note that this project is in active development.
 
-</div>
+**BrakerRak** combines [riscv-data-kit (RVDK)](https://github.com/drewv-labs/rvdk) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) into a<br>
+powerful **RISC-V data Systems & AI/ML Engineering R&D Platform**.
 
-**BrakerRak** combines [riscv-data-kit (RVDK)](https://github.com/drewv-labs/rvdk) and [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) into a powerful **RISC-V data Systems & AI/ML Engineering R&D Platform**.
+</div>
 
 ---
 
