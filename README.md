@@ -29,8 +29,6 @@ Named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.
 **[NFS-Ganesha](https://github.com/nfs-ganesha/nfs-ganesha)**<br>
 Operating as a versatile userspace NFS system, **NFS-Ganesha** is the BrakerRak NFS standard. **Ganesha's** major super power for an R&D system is that it's shielded from crusty vendor BSP kernel modules across the variety of RISC-V boards out in the wild. Also... more elephants! NFSv4 kernel system is supported by BrakerRak via optional flags and config.
 
----
-
 ### Hardware Accelerator Anchors
 
 Current Hardware Accelerator focus anchors are for phase 1 BrakerRak development with plans of expanding Hardware Accelerator support.
