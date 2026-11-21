@@ -80,11 +80,11 @@ Developed with over 12 years of Linux-based data systems, platform & infrastruct
 
 <div align="center">
 
-## Tool Selection: `RVDK` vs. `BrakerRak`
+## Tool Selection
 
 </div>
 
-While **RVDK** supplies the atomic provisioning primitives and prebuilt binary catalog and `CarrierPigeons` supplies the telemetry, execution, and interface mesh surfaces, **BrakerRak** builds on top of both **RVDK** and **CarrierPigeons** as a stateful execution system.
+While **RVDK** supplies the atomic provisioning primitives & prebuilt binary catalog and **CarrierPigeons** supplies the telemetry, execution, & interface mesh surfaces, **BrakerRak** builds on top of both **RVDK** and **CarrierPigeons** as a stateful execution system.
 
 While **BrakerRak** provides the complete package, devs may only be interested in certain aspects to integrate into their worflows and applications. The following provides a guide for which tool is right for your use case.
 
