@@ -21,7 +21,7 @@ As a R&D platform, some of BrakerRak's core objectives are to turbocharge buildi
 
 ### Data System Software Anchors
 
-Current Data System Software focus anchors represent the default choices used by BrakerRak. These focus anchors are not an exhaustive list of various data systems software supported and used by BrakerRak as the aim is to grow into a rich RISC-V Data Systems & AI/ML ecosystem.
+> Current Data System Software focus anchors represent the default choices used by BrakerRak. These focus anchors are not an exhaustive list of various data systems software supported and used by BrakerRak as the aim is to grow into a rich RISC-V Data Systems & AI/ML ecosystem.
 
 **[PostgreSQL](https://www.postgresql.org/)**<br>
 Named in tribute to database pioneer [Michael Stonebraker](https://en.wikipedia.org/wiki/Michael_Stonebraker), BrakerRak's primary core objective is accelerating latest versions of **PostgreSQL** on RISC-V bare-metal silicon. At the edge or in a server rack, this system is dedicated to rigorous, deep **PSQL** systems benchmarking & analysis toward studying how **PSQL** performs across various RISC-V profiles & ratifications, compiling optimized [riscv64 builds of the latest PSQL versions & features](https://github.com/drewv-labs/riscv-data-kit/releases), and setting up RISC-V nodes as [PSQL Buildfarms](https://wiki.postgresql.org/wiki/PostgreSQL_Buildfarm_Howto). 
@@ -33,7 +33,7 @@ Operating as a versatile userspace NFS system, **NFS-Ganesha** is the BrakerRak 
 
 ### Hardware Accelerator Anchors
 
-Current Hardware Accelerator focus anchors are for phase 1 BrakerRak development with plans of expanding Hardware Accelerator support.
+> Current Hardware Accelerator focus anchors are for phase 1 BrakerRak development with plans of expanding Hardware Accelerator support.
 
 **[Hailo AI Accelerators](https://hailo.ai/products/ai-accelerators/)**<br>
 The **Hailo-8** (26 TOPS) and **Hailo-8L** (13 TOPS) M.2 NVMe NPU modules provide astounding power per watt making them word class accelerators for int8 or int4 operations. The *Hailo-10H* is rated at 40 TOPS int4 (20 TOPS int8) with 8gb onboard memory. As such, the *Hailo* *8* and *10* series modules are the NPU focus anchor.   
