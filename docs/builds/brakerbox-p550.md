@@ -117,7 +117,7 @@ sudo brakerrak verify
 NODE_ROLE="databroker"
 TARGET_HOSTNAME="brakerbox-p550"
 ADMIN_USER="drew"
-LAB_SUBNET="10.0.10.0/24"
+LAB_SUBNET=""
 
 # Hot NVMe Storage
 NVME_DEV="/dev/nvme0n1"
