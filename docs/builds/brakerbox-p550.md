@@ -168,16 +168,9 @@ NFS_BACKEND="ganesha"
 
 ---
 
-
 <div align="center">
 
-**[DREW-V Labs](https://github.com/drewv-labs)** // **Drew Vandagriff** — *Dallas, TX*  
+**[DREW-V Labs](https://github.com/drewv-labs)**  // Indie Data Systems R&D   
 `Simplicity in Architecture · Efficiency in Engineering · Purity in Science · Audacity in Art · Life in Logic`
 
 </div>
-
-
----
-
-###### Trademarks & Non-Affiliation Notice
-> **BrakerRak** and **BrakerBox-P550** are independent open-source projects developed and maintained by **DREW-V Labs** and is not affiliated with, endorsed by, or sponsored by **RISC-V International**, the **Linux Foundation**, the **RISE Project**, **SiFive**, **Tenstorrent**, **StarFive**, **Milk-V**, **SpacemiT**, **UltraRISC**, or **Orange Pi**. "RISC-V" is a registered trademark of RISC-V International. All other product names, logos, and brands are property of their respective owners and are used strictly for identification and hardware compatibility purposes under nominative fair use.
