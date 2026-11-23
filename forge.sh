@@ -294,10 +294,32 @@ case "$ACTION" in
             export RVDK_ENV_FILE="$NODE_ENV"
         fi
         VG_NAME="${VG_NAME:-vg_braker}"
+        LV_NAME="${LV_NAME:-lv_pgdata}"
+        NFS_LV_NAME="${NFS_LV_NAME:-lv_nfsvault}"
         MOUNT_POINT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
         NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/mnt/nfs_vault}"
-        export VG_NAME MOUNT_POINT NFS_MOUNT_POINT
-        exec "$RVDK_BIN" storage "$@"
+        if [[ ! -b "/dev/${VG_NAME}/${LV_NAME}" && -b "/dev/${VG_NAME}/lv_data" ]]; then
+            LV_NAME="lv_data"
+        fi
+        export VG_NAME LV_NAME NFS_LV_NAME MOUNT_POINT NFS_MOUNT_POINT
+        STORAGE_SUB="${1:-}"
+        case "$STORAGE_SUB" in
+            grow-psql|extend-psql|add-psql)
+                shift
+                exec "$RVDK_BIN" storage grow --lv "$LV_NAME" "$@"
+                ;;
+            grow-nfs|extend-nfs|add-nfs)
+                shift
+                exec "$RVDK_BIN" storage grow --lv "$NFS_LV_NAME" "$@"
+                ;;
+            shrink-nfs|reduce-nfs|reclaim-nfs)
+                shift
+                exec "$RVDK_BIN" storage shrink --lv "$NFS_LV_NAME" "$@"
+                ;;
+            *)
+                exec "$RVDK_BIN" storage "$@"
+                ;;
+        esac
         ;;
     ort)
         exec bash "${LOCAL_ROOT}/scripts/ort-snapshot.sh" "$@"
@@ -353,7 +375,7 @@ while [[ $# -gt 0 ]]; do
         --with-mqtt)                CLI_ENABLE_MQTT="true"; shift ;;
         --no-mqtt)                  CLI_ENABLE_MQTT="false"; shift ;;
         --with-nfs)                 CLI_ENABLE_NFS="true"; shift ;;
-        --no-nfs)                   CLI_ENABLE_NFS="false"; shift ;;
+        --no-nfs)                  CLI_ENABLE_NFS="false"; shift ;;
         --nfs-backend)              CLI_NFS_BACKEND="${2:-}"; shift 2 ;;
         --nfs-ganesha)              CLI_NFS_BACKEND="ganesha"; shift ;;
         --nfs-kernel|--nfs-kernal)  CLI_NFS_BACKEND="kernel"; shift ;;
@@ -568,6 +590,10 @@ NVME_DEV="${CLI_NVME_DEV:-${NVME_DEV:-/dev/nvme0n1}}"
 MOUNT_POINT="${CLI_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nvme_pgdata}}"
 NFS_MOUNT_POINT="${CLI_NFS_MOUNT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
 VG_NAME="${VG_NAME:-vg_braker}"
+LV_NAME="${LV_NAME:-lv_pgdata}"
+FS_LABEL="${FS_LABEL:-PGDATA_NVME}"
+NFS_LV_NAME="${NFS_LV_NAME:-lv_nfsvault}"
+NFS_FS_LABEL="${NFS_FS_LABEL:-NFS_VAULT}"
 WITH_RAID="${CLI_WITH_RAID:-${WITH_RAID:-false}}"
 RAID_ARRAYS_JSON="${RAID_ARRAYS_JSON:-[]}"
 ENABLE_POSTGRES="${CLI_ENABLE_PG:-${ENABLE_POSTGRES:-true}}"
@@ -648,7 +674,7 @@ fi
 
 export BRAKERRAK_NODE_ENV="$NODE_ENV"
 export RVDK_ENV_FILE="$NODE_ENV"
-export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT NFS_MOUNT_POINT VG_NAME WITH_RAID RAID_ARRAYS_JSON ENABLE_POSTGRES ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND PIGEON_ROLE RVDK_TUNE_PROFILE
+export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT NFS_MOUNT_POINT VG_NAME LV_NAME FS_LABEL NFS_LV_NAME NFS_FS_LABEL WITH_RAID RAID_ARRAYS_JSON ENABLE_POSTGRES ENABLE_MQTT_BROKER MQTT_PORT ENABLE_NFS_SERVER NFS_BACKEND PIGEON_ROLE RVDK_TUNE_PROFILE
 
 # ==============================================================================
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
@@ -664,11 +690,24 @@ brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launchin
 log_step "1. RVDK Day-0 OS & Silicon BSP Convergence (Hostname: ${TARGET_HOSTNAME})"
 run_rvdk day0 --user "$ADMIN_USER" --hostname "$TARGET_HOSTNAME" --nopasswd
 
-NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT" --vg "$VG_NAME")
+NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT" --vg "$VG_NAME" --lv "$LV_NAME" --label "$FS_LABEL")
+USE_DUAL_NFS_LV="false"
 if [[ "$ENABLE_NFS_SERVER" == "true" && "$WITH_RAID" != "true" ]]; then
+    # Preserve brownfield single-LV nodes whose NFS vault already lives at ${MOUNT_POINT}/nfs_vault
+    # while enabling Dual-LVM on fresh builds, --force-wipe-nvme, existing Dual-LVM nodes, and role flips.
+    if [[ "$FORCE_WIPE_NVME" == "true" ]] \
+       || mountpoint -q "$NFS_MOUNT_POINT" 2>/dev/null \
+       || [[ -b "/dev/${VG_NAME}/${NFS_LV_NAME}" ]] \
+       || ! mountpoint -q "$MOUNT_POINT" 2>/dev/null \
+       || [[ ! -d "${MOUNT_POINT}/nfs_vault" ]]; then
+        USE_DUAL_NFS_LV="true"
+    fi
+fi
+
+if [[ "$USE_DUAL_NFS_LV" == "true" ]]; then
     brak_prog 28 "Stage 2/7: Dual-LVM 4Kn NVMe (${MOUNT_POINT} XFS + ${NFS_MOUNT_POINT} Btrfs)" 0 "Launching rvdk mods/nvme-4kn --with-nfs-lv..."
     log_step "2. RVDK Dual-LVM 4Kn NVMe Provisioning (${NVME_DEV} -> ${MOUNT_POINT} + ${NFS_MOUNT_POINT})"
-    NVME_FLAGS+=(--with-nfs-lv --nfs-mount "$NFS_MOUNT_POINT")
+    NVME_FLAGS+=(--with-nfs-lv --nfs-mount "$NFS_MOUNT_POINT" --nfs-lv "$NFS_LV_NAME" --nfs-label "$NFS_FS_LABEL")
 else
     brak_prog 28 "Stage 2/7: Hot NVMe 4Kn Storage (${NVME_DEV} -> ${MOUNT_POINT})" 0 "Launching rvdk mods/nvme-4kn..."
     log_step "2. RVDK Hot NVMe 4Kn Storage Provisioning (${NVME_DEV} -> ${MOUNT_POINT})"
@@ -862,6 +901,7 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
                 --to-user "$ADMIN_USER" \
                 --extra-dotdir .brakerrak \
                 --relink-bin /usr/local/bin/brakerrak:.brakerrak/engine/forge.sh \
+                --relink-bin /usr/bin/brakerrak:.brakerrak/engine/forge.sh \
                 --mount-point "$MOUNT_POINT" \
                 --nfs-mount "$NFS_MOUNT_POINT"
             echo ""
