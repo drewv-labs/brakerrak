@@ -110,7 +110,7 @@ fi
 echo "=== 1. Stopping DataBroker Services & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
 systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
 systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
-systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
+systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service mosquitto.service 2>/dev/null || true
 pkill -9 -u postgres 2>/dev/null || true
 
 RVDK_PG_DEBS="/var/lib/rvdk/pgdg-riscv64/debs"
@@ -205,10 +205,12 @@ rm -f /etc/mosquitto/conf.d/brakerrak.conf \
       /etc/mosquitto/conf.d/99-rvdk-broker.conf
 rm -f /etc/exports.d/rvdk-vaults.exports \
       /etc/exports.d/brakerrak-vaults.exports
-rm -f /etc/systemd/system/postgresql@.service.d/90-rvdk-qos.conf \
+rm -f /etc/systemd/system/mosquitto.service.d/90-rvdk-runtime.conf \
+      /etc/systemd/system/postgresql@.service.d/90-rvdk-qos.conf \
       /etc/systemd/system/nfs-ganesha.service.d/90-rvdk-qos.conf \
       /etc/systemd/system/nfs-server.service.d/90-rvdk-qos.conf
 rmdir --ignore-fail-on-non-empty \
+      /etc/systemd/system/mosquitto.service.d \
       /etc/systemd/system/postgresql@.service.d \
       /etc/systemd/system/nfs-ganesha.service.d \
       /etc/systemd/system/nfs-server.service.d 2>/dev/null || true

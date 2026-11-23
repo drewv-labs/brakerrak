@@ -744,6 +744,7 @@ fi
 if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
     brak_prog 78 "Stage 5A/7: Eclipse Mosquitto MQTT Broker (:${MQTT_PORT})" 0 "Launching rvdk mods/mosquitto..."
     log_step "5A. RVDK Eclipse Mosquitto MQTT Broker (:${MQTT_PORT} + Unix Socket)"
+    rm -f /etc/mosquitto/conf.d/brakerrak.conf /etc/mosquitto/conf.d/99-brakerrak.conf 2>/dev/null || true
     run_rvdk mods/mosquitto --port "$MQTT_PORT" --data-mount "$MOUNT_POINT"
 else
     brak_prog 82 "Stage 5A/7: Mosquitto MQTT Skipped (ENABLE_MQTT_BROKER=false)" 100 "mods/mosquitto skipped"
@@ -757,6 +758,7 @@ fi
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
     brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})" 0 "Launching rvdk mods/nfs-vault..."
     log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})"
+    rm -f /etc/exports.d/brakerrak-vaults.exports 2>/dev/null || true
     run_rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
 else
     brak_prog 90 "Stage 5B/7: NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)" 100 "mods/nfs-vault skipped"
