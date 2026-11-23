@@ -113,8 +113,10 @@ systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosqu
 systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service 2>/dev/null || true
 pkill -9 -u postgres 2>/dev/null || true
 
+RVDK_PG_DEBS="/var/lib/rvdk/pgdg-riscv64/debs"
 if [[ "$KEEP_CACHE" == "true" ]]; then
     mkdir -p /tmp/pgdg-deb-backup
+    cp -a "${RVDK_PG_DEBS}/"*.deb /tmp/pgdg-deb-backup/ 2>/dev/null || \
     cp -a /opt/drewv-pgdg-riscv64/debs/*.deb /tmp/pgdg-deb-backup/ 2>/dev/null || \
     cp -a "${MOUNT_POINT}/.pkg-cache/pgdg-riscv64/"*.deb /tmp/pgdg-deb-backup/ 2>/dev/null || true
 else
@@ -183,7 +185,7 @@ echo "=== 4. Purging PostgreSQL 18, RVDK/BrakerRak Drop-Ins & Mount Directories 
 apt-get -o DPkg::Lock::Timeout=120 purge -y "postgresql-18*" "postgresql-client-18*" "postgresql-common*" 2>/dev/null || true
 apt-get -o DPkg::Lock::Timeout=120 autoremove -y --purge >/dev/null 2>&1 || true
 rm -rf /etc/postgresql /etc/postgresql-common /var/lib/postgresql /var/log/postgresql
-rm -rf /opt/drewv-pgdg-riscv64 "$MOUNT_POINT" "$NFS_MOUNT_POINT"
+rm -rf /var/lib/rvdk/pgdg-riscv64 /opt/drewv-pgdg-riscv64 "$MOUNT_POINT" "$NFS_MOUNT_POINT"
 
 if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
     for mp in "${RAID_MOUNTS[@]}"; do
@@ -191,8 +193,13 @@ if [[ "$SKIP_RAID_WIPE" == "false" ]]; then
     done
 fi
 
-rm -f /etc/apt/sources.list.d/pgdg.list /etc/apt/sources.list.d/drewv-local-pgdg.list
+rm -f /etc/apt/sources.list.d/pgdg.list \
+      /etc/apt/sources.list.d/rvdk-local-pgdg.list \
+      /etc/apt/sources.list.d/drewv-local-pgdg.list \
+      /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* \
+      /var/lib/apt/lists/_var_lib_rvdk_pgdg-riscv64*
 rm -f /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+rm -f /etc/needrestart/conf.d/90-rvdk-stateful.conf
 rm -f /etc/mosquitto/conf.d/brakerrak.conf \
       /etc/mosquitto/conf.d/99-brakerrak.conf \
       /etc/mosquitto/conf.d/99-rvdk-broker.conf
@@ -214,9 +221,12 @@ fi
 exportfs -ra 2>/dev/null || true
 
 if [[ "$KEEP_CACHE" == "true" ]] && ls /tmp/pgdg-deb-backup/*.deb >/dev/null 2>&1; then
-    mkdir -p /opt/drewv-pgdg-riscv64/debs
-    cp -a /tmp/pgdg-deb-backup/*.deb /opt/drewv-pgdg-riscv64/debs/
-    echo "  [OK] Restored cached PostgreSQL .deb packages to /opt/drewv-pgdg-riscv64/debs"
+    mkdir -p /var/lib/rvdk /var/lib/rvdk/pgdg-riscv64 "$RVDK_PG_DEBS"
+    chmod 0755 /var/lib/rvdk /var/lib/rvdk/pgdg-riscv64 "$RVDK_PG_DEBS"
+    cp -a /tmp/pgdg-deb-backup/*.deb "$RVDK_PG_DEBS/"
+    chmod 0644 "${RVDK_PG_DEBS}/"*.deb 2>/dev/null || true
+    rm -rf /tmp/pgdg-deb-backup
+    echo "  [OK] Restored cached PostgreSQL .deb packages to ${RVDK_PG_DEBS}"
 fi
 apt-get -o DPkg::Lock::Timeout=120 update -q || true
 

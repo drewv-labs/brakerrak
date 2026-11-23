@@ -105,6 +105,9 @@ role_to_rvdk_tune() {
     esac
 }
 
+RVDK_BIN="/usr/local/bin/rvdk"
+[[ ! -x "$RVDK_BIN" && -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk"
+
 # ==============================================================================
 # 1. Parse Subcommand (forge | deeptune | storage | ort | verify | reset | update)
 # ==============================================================================
@@ -119,7 +122,7 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # ==============================================================================
-# 2. Sync ~/.brakerrak/engine & Link /usr/local/bin/brakerrak
+# 2. Sync ~/.brakerrak/engine & Link /usr/local/bin/brakerrak (+ /usr/bin/brakerrak)
 # ==============================================================================
 if [[ -n "$SCRIPT_SELF" ]]; then
     SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
@@ -141,10 +144,10 @@ if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
     done
 
     if [[ "$SKIP_RVDK_UPDATE" != "true" ]]; then
-        if [[ -x /usr/local/bin/rvdk ]]; then
-            /usr/local/bin/rvdk update ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
-        elif [[ -f "${REAL_HOME}/.rvdk/engine/install-cli.sh" ]]; then
-            bash "${REAL_HOME}/.rvdk/engine/install-cli.sh" ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+        if [[ -x "$RVDK_BIN" ]]; then
+            "$RVDK_BIN" update ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+        elif [[ -f "/usr/local/share/rvdk/engine/install-cli.sh" ]]; then
+            bash "/usr/local/share/rvdk/engine/install-cli.sh" ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
         else
             curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
         fi
@@ -199,6 +202,57 @@ fi
 chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh "${LOCAL_ROOT}"/benchmarks/*.sh 2>/dev/null || true
 install -d -m 0755 /usr/local/bin
 ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
+if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
+    ln -sf "${LOCAL_ROOT}/forge.sh" /usr/bin/brakerrak
+fi
+
+# Migrate pre-FHS `/opt/drewv-pgdg-riscv64` local APT repo -> `/var/lib/rvdk/pgdg-riscv64`
+# so `apt update` stops failing with `Method gave a blank filename` on legacy nodes.
+if [[ "$ACTION" != "ort" && "$ACTION" != "reset" ]] && [[ -d /opt/drewv-pgdg-riscv64 || -f /etc/apt/sources.list.d/drewv-local-pgdg.list ]]; then
+    _RVDK_PG_ROOT="/var/lib/rvdk/pgdg-riscv64"
+    _RVDK_PG_DEBS="${_RVDK_PG_ROOT}/debs"
+    if compgen -G "/opt/drewv-pgdg-riscv64/debs/*.deb" >/dev/null 2>&1; then
+        mkdir -p /var/lib/rvdk "$_RVDK_PG_ROOT" "$_RVDK_PG_DEBS"
+        chmod 0755 /var/lib/rvdk "$_RVDK_PG_ROOT" "$_RVDK_PG_DEBS"
+        cp -a /opt/drewv-pgdg-riscv64/debs/*.deb "$_RVDK_PG_DEBS/" 2>/dev/null || true
+        rm -f "${_RVDK_PG_DEBS}"/*-dbgsym_*.deb
+        if command -v dpkg-scanpackages >/dev/null 2>&1; then
+            (
+                cd "$_RVDK_PG_DEBS"
+                rm -f InRelease Release Release.gpg Packages Packages.gz Packages.xz Packages.bz2 Packages.lzma Packages.zst
+                dpkg-scanpackages . /dev/null > Packages 2>/dev/null
+                gzip -9cn Packages > Packages.gz
+                chmod 0644 Packages Packages.gz ./*.deb 2>/dev/null || true
+                if command -v apt-ftparchive >/dev/null 2>&1; then
+                    apt-ftparchive release . > Release 2>/dev/null
+                else
+                    {
+                        printf 'Origin: RVDK\nLabel: RVDK-PGDG\nSuite: local\nCodename: local\nDate: %s\nSHA256:\n' \
+                            "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
+                        for _idx in Packages Packages.gz; do
+                            printf ' %s %16d %s\n' \
+                                "$(sha256sum "$_idx" | awk '{print $1}')" \
+                                "$(wc -c < "$_idx" | tr -d '[:space:]')" \
+                                "$_idx"
+                        done
+                    } > Release
+                fi
+                chmod 0644 Release
+            )
+            printf 'deb [trusted=yes check-date=no lang=none] file://%s ./\n' "$_RVDK_PG_DEBS" > /etc/apt/sources.list.d/rvdk-local-pgdg.list
+            chmod 0644 /etc/apt/sources.list.d/rvdk-local-pgdg.list
+        fi
+    fi
+    rm -f /etc/apt/sources.list.d/drewv-local-pgdg.list /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* 2>/dev/null || true
+    rm -rf /opt/drewv-pgdg-riscv64
+    if [[ -f /etc/apt/sources.list.d/rvdk-local-pgdg.list ]] && command -v apt-get >/dev/null 2>&1; then
+        apt-get update \
+            -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/rvdk-local-pgdg.list" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0" -q 2>/dev/null || true
+    fi
+    log_ok "Migrated legacy /opt/drewv-pgdg-riscv64 APT repo -> ${_RVDK_PG_DEBS}"
+fi
 
 # ==============================================================================
 # 3. Route Shared Lifecycle Subcommands Immediately (deeptune | storage | ort | verify | reset)
@@ -228,10 +282,10 @@ case "$ACTION" in
         fi
         for a in ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}; do
             if [[ "$a" == "status" || "$a" == "--status" ]]; then
-                exec /usr/local/bin/rvdk deeptune "${DT_PASS_ARGS[@]}"
+                exec "$RVDK_BIN" deeptune "${DT_PASS_ARGS[@]}"
             fi
         done
-        exec /usr/local/bin/rvdk deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
+        exec "$RVDK_BIN" deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
         ;;
     storage)
         if [[ -f "$NODE_ENV" ]]; then
@@ -243,7 +297,7 @@ case "$ACTION" in
         MOUNT_POINT="${MOUNT_POINT:-/mnt/nvme_pgdata}"
         NFS_MOUNT_POINT="${NFS_MOUNT_POINT:-/mnt/nfs_vault}"
         export VG_NAME MOUNT_POINT NFS_MOUNT_POINT
-        exec /usr/local/bin/rvdk storage "$@"
+        exec "$RVDK_BIN" storage "$@"
         ;;
     ort)
         exec bash "${LOCAL_ROOT}/scripts/ort-snapshot.sh" "$@"
@@ -345,9 +399,9 @@ run_rvdk() {
     local subcmd="$1"
     shift
     if [[ "$APT_UPDATED" == "true" ]]; then
-        /usr/local/bin/rvdk "$subcmd" --no-apt-update "$@"
+        "$RVDK_BIN" "$subcmd" --no-apt-update "$@"
     else
-        /usr/local/bin/rvdk "$subcmd" "$@"
+        "$RVDK_BIN" "$subcmd" "$@"
         if [[ -f "$APT_STAMP_FILE" ]]; then
             APT_UPDATED="true"
         fi
@@ -403,9 +457,9 @@ if [[ -z "$TARGET_BOARD" ]]; then
             TARGET_BOARD="spacemit-k3"; TARGET_TAG="aiboxk3" ;;
         *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
             TARGET_BOARD="spacemit-k3"; TARGET_TAG="jptr2" ;;
-        *"BPI-F3"*|*"Banana Pi BPI-F3"*)
+        *"BPI-F3"*)
             TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpif3" ;;
-        *"BPI-CM6"*|*"Banana Pi BPI-CM6"*)
+        *"BPI-CM6"*)
             TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpicm6" ;;
         *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
             TARGET_BOARD="spacemit-k1"; TARGET_TAG="jptr1" ;;
@@ -599,10 +653,11 @@ export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT NFS_
 # ==============================================================================
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
 # ==============================================================================
-if [[ ! -x /usr/local/bin/rvdk ]]; then
+if [[ ! -x "$RVDK_BIN" ]]; then
     brak_prog 5 "Stage 0A: Installing RVDK CLI..." 0 "Cloning RVDK engine..."
     log_step "0A. Installing RVDK Package Manager CLI (${RVDK_BASE_URL}/install-cli.sh)"
     curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+    [[ -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk" || RVDK_BIN="/usr/local/bin/rvdk"
 fi
 
 brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launching rvdk day0..."
@@ -803,7 +858,7 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
         if [[ "$REAL_USER" == "$ADMIN_USER" ]]; then
             brak_prog 98 "Stage 7/7: Purging factory user '${FACTORY_USER}' -> '${ADMIN_USER}'" 50 "utils/purge-user.sh ${FACTORY_USER}"
             log_step "7. Migrating Artifacts & Purging Factory Default User ('${FACTORY_USER}' -> '${ADMIN_USER}')"
-            /usr/local/bin/rvdk utils/purge-user.sh "$FACTORY_USER" \
+            "$RVDK_BIN" utils/purge-user.sh "$FACTORY_USER" \
                 --to-user "$ADMIN_USER" \
                 --extra-dotdir .brakerrak \
                 --relink-bin /usr/local/bin/brakerrak:.brakerrak/engine/forge.sh \

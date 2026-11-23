@@ -3,7 +3,8 @@
 # DREW-V Labs // BrakerRak CLI & Engine Installer
 # Path: brakerrak/install-cli.sh
 # Description: Clones or updates the brakerrak engine in ~/.brakerrak/engine
-#              and links /usr/local/bin/brakerrak without modifying OS/PG18 state.
+#              and links /usr/local/bin/brakerrak (+ /usr/bin/brakerrak on Linux)
+#              without modifying OS/PG18 state.
 #
 # Usage:
 #   curl -fsSL https://brakerrak.dev/install-cli.sh | sudo bash
@@ -95,9 +96,12 @@ fi
 
 chmod +x "${ENGINE_DIR}/forge.sh" "${ENGINE_DIR}/install-cli.sh" "${ENGINE_DIR}"/scripts/*.sh "${ENGINE_DIR}"/benchmarks/*.sh 2>/dev/null || true
 
-# 3. Link /usr/local/bin/brakerrak
+# 3. Link /usr/local/bin/brakerrak (plus /usr/bin/brakerrak on Linux for Debian sudo secure_path)
 install -d -m 0755 /usr/local/bin
 ln -sf "${ENGINE_DIR}/forge.sh" /usr/local/bin/brakerrak
+if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
+    ln -sf "${ENGINE_DIR}/forge.sh" /usr/bin/brakerrak
+fi
 COMMIT_SHA="$(git -C "$ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
 log_ok "Linked /usr/local/bin/brakerrak -> ${ENGINE_DIR}/forge.sh (${COMMIT_SHA})"
 
@@ -116,7 +120,7 @@ if [[ "$QUIET_MODE" == "false" ]]; then
         OS_PRETTY="$(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null) ($(uname -m))"
     fi
 
-    RVDK_ENGINE_DIR="${REAL_HOME}/.rvdk/engine"
+    RVDK_ENGINE_DIR="/usr/local/share/rvdk/engine"
     if [[ -d "${RVDK_ENGINE_DIR}/.git" ]]; then
         RVDK_SHA="$(git -C "$RVDK_ENGINE_DIR" rev-parse --short HEAD 2>/dev/null || echo "main")"
         RVDK_STATUS="${RVDK_ENGINE_DIR} (${RVDK_SHA})"
