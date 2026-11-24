@@ -4,81 +4,100 @@
 # Path: brakerrak/scripts/ort-snapshot.sh
 #
 # Usage:
-#   ./scripts/ort-snapshot.sh [--stage day0-pre-forge|day1-post-forge] [--out-dir ~/.brakerrak/snapshots]
-#   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
+#   ./scripts/ort-snapshot.sh [--target <soc>] [--stage day0-pre-forge|day1-post-forge] [--out-dir ~/.brakerrak/snapshots]
+#   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge] [--no-public] [--no-fail-exit]
 # ==============================================================================
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRAKERRAK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-log_brak()  { printf "\033[1;35m[BRAKERRAK:ORT]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[BRAKERRAK:ORT:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib-common.sh"
+brak_log_init "BRAKERRAK:ORT"
+
+usage() {
+    cat <<'EOF'
+Usage: brakerrak ort [options]
+
+Options:
+  --target, --soc <slug>   Override silicon target (e.g. eswin-eic7700x, starfive-jh7110, generic-riscv64)
+  --stage <tag>            ORT stage tag (default: day0-pre-forge | day1-post-forge)
+  --out-dir <dir>          Snapshot output directory (default: ~/.brakerrak/snapshots)
+  --config <path>          Explicit node.env config path (default: /etc/brakerrak/node.env)
+  --window <seconds>       Quiescent baseline profiling window (default: 5.0)
+  --no-public              Skip generating redacted .public.json artifact
+  --no-fail-exit           Exit 0 even if overall_status == "FAIL"
+  -h, --help               Show this help message and exit
+EOF
+}
 
 TARGET_BOARD="${BRAKERRAK_TARGET:-}"
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)
-            TARGET_BOARD="${2:-}"
+        --target|--soc)
+            brak_require_arg "$1" "${2:-}"
+            TARGET_BOARD="$2"
             shift 2
             ;;
-        *)
+        --target=*|--soc=*)
+            TARGET_BOARD="${1#*=}"
+            brak_require_arg "${1%%=*}" "$TARGET_BOARD"
+            shift
+            ;;
+        --stage|--out-dir|--config|--window)
+            brak_require_arg "$1" "${2:-}"
+            FORWARD_ARGS+=("$1" "$2")
+            shift 2
+            ;;
+        --stage=*|--out-dir=*|--config=*|--window=*)
+            _flag="${1%%=*}"
+            _val="${1#*=}"
+            brak_require_arg "$_flag" "$_val"
+            FORWARD_ARGS+=("$_flag" "$_val")
+            shift
+            ;;
+        --no-public|--no-fail-exit)
             FORWARD_ARGS+=("$1")
             shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            log_fatal "Unknown argument: $1 (try 'brakerrak ort --help')"
             ;;
     esac
 done
 
-# Auto-Detect Silicon Target from /etc/rvdk/kit.env -> /proc/device-tree/model
-DT_MODEL="Unknown"
-if [[ -z "$TARGET_BOARD" && -r /etc/rvdk/kit.env ]]; then
-    # shellcheck disable=SC1091
-    source /etc/rvdk/kit.env
-    [[ -n "${RVDK_SOC_SLUG:-}" ]] && TARGET_BOARD="$RVDK_SOC_SLUG"
-    [[ -n "${RVDK_DT_MODEL:-}" ]] && DT_MODEL="$RVDK_DT_MODEL"
+# Auto-detect silicon target via unified vendor-qualified resolver
+if ! brak_resolve_silicon "$TARGET_BOARD"; then
+    log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>."
 fi
 
-if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
-    DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
+# Prefer unified stdlib-only `brakerrak_ort` package:
+#   1. `uv run --no-sync` when uv + pyproject.toml + usable .venv are present
+#   2. Stock stdlib `python3 -m brakerrak_ort` fallback for bare Day-0 Stage 0 runs before `uv`
+if [[ -d "${BRAKERRAK_ROOT}/brakerrak_ort" ]]; then
+    if command -v uv >/dev/null 2>&1 \
+       && [[ -f "${BRAKERRAK_ROOT}/pyproject.toml" && -x "${BRAKERRAK_ROOT}/.venv/bin/python" ]]; then
+        log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) -> uv run python -m brakerrak_ort"
+        exec uv run --project "${BRAKERRAK_ROOT}" --no-sync python -m brakerrak_ort \
+            --soc "$TARGET_BOARD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_fatal "python3 not found; cannot execute brakerrak_ort collector."
+    fi
+    log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) -> python3 -m brakerrak_ort"
+    export PYTHONPATH="${BRAKERRAK_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+    exec python3 -m brakerrak_ort --soc "$TARGET_BOARD" ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
 fi
 
-if [[ -z "$TARGET_BOARD" ]]; then
-    case "$DT_MODEL" in
-        *"Premier P550"*|*"Megrez"*|*"StarPro64"*|*"EIC7700"*)
-            TARGET_BOARD="eswin-eic7700x" ;;
-        *"Unmatched"*|*"FU740"*)
-            TARGET_BOARD="sifive-fu740" ;;
-        *"OrangePi RV2"*|*"Orange Pi RV2"*|*"OrangePi R2S"*|*"Orange Pi R2S"*|*"BPI-F3"*|*"BPI-CM6"*)
-            TARGET_BOARD="spacemit-k1" ;;
-        *"VisionFive 2 Lite"*|*"VF2 Lite"*|*"JH7110S"*|*"JH-7110S"*|*"VisionFive 2"*|*"VF2"*|*"Mars"*|*"Star64"*|*"OrangePi RV"*|*"Orange Pi RV"*|*"JH7110"*)
-            TARGET_BOARD="starfive-jh7110" ;;
-        *"AIBOX-K3"*|*"Firefly"*K3*|*"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
-            TARGET_BOARD="spacemit-k3" ;;
-        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
-            TARGET_BOARD="spacemit-k1" ;;
-        *"Titan"*|*"DP1000"*)
-            TARGET_BOARD="ultrarisc-dp1000" ;;
-        *"Atlantis"*|*"Ascalon"*)
-            TARGET_BOARD="tenstorrent-atlantis" ;;
-        *)
-            log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>." ;;
-    esac
-else
-    case "$TARGET_BOARD" in
-        eswin-eic7700x|sifive-p550|milkv-megrez)      TARGET_BOARD="eswin-eic7700x" ;;
-        sifive-fu740|sifive-unmatched)                TARGET_BOARD="sifive-fu740" ;;
-        starfive-jh7110|starfive-vf2|starfive-vf2-lite|milkv-mars|orangepi-rv)
-                                                      TARGET_BOARD="starfive-jh7110" ;;
-        spacemit-k1|milkv-jupiter|orangepi-rv2|orangepi-r2s|bananapi-f3|bananapi-cm6)
-                                                      TARGET_BOARD="spacemit-k1" ;;
-        spacemit-k3|milkv-jupiter2|firefly-aibox-k3)  TARGET_BOARD="spacemit-k3" ;;
-        ultrarisc-dp1000|milkv-titan)                 TARGET_BOARD="ultrarisc-dp1000" ;;
-        tenstorrent-atlantis)                         TARGET_BOARD="tenstorrent-atlantis" ;;
-    esac
-fi
-
+# Legacy shim fallback if brakerrak_ort package directory is absent
 ORT_SCRIPT="${BRAKERRAK_ROOT}/soc-drawer/${TARGET_BOARD}/ort-snapshot.py"
 ORT_SOC_ARGS=()
 if [[ ! -f "$ORT_SCRIPT" ]]; then

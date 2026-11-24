@@ -15,9 +15,21 @@
 # ==============================================================================
 
 if [[ "${_BRAKERRAK_PROGBAR_SOURCED:-0}" == "1" ]]; then
-    return 0 2>/dev/null || true
+    return 0
 fi
 _BRAKERRAK_PROGBAR_SOURCED="1"
+
+if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" != "1" ]]; then
+    _BRAK_PROG_SCRIPT_DIR=""
+    if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+        _BRAK_PROG_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    fi
+    if [[ -n "$_BRAK_PROG_SCRIPT_DIR" && -f "${_BRAK_PROG_SCRIPT_DIR}/lib-common.sh" ]]; then
+        # shellcheck disable=SC1091
+        source "${_BRAK_PROG_SCRIPT_DIR}/lib-common.sh"
+    fi
+    unset _BRAK_PROG_SCRIPT_DIR
+fi
 
 # Literal ESC byte (0x1B). Never pass `\0337` through `printf "%b"`, because
 # bash parses `\0` + 3 octal digits (`\0337` -> 0xDF) instead of ESC + '7'!
@@ -211,12 +223,24 @@ brak_prog_init() {
     _BRAK_SUB_PCT=0
     _BRAK_SUB_MSG="Standing by..."
 
+    local prog_rt_dir=""
+    if declare -F brak_runtime_dir >/dev/null 2>&1; then
+        prog_rt_dir="$(brak_runtime_dir)"
+    elif [[ "$(uname -s)" == "Linux" && "${EUID:-$(id -u)}" -eq 0 && -d /run ]]; then
+        prog_rt_dir="/run/brakerrak"
+        install -d -m 0700 -o 0 -g 0 "$prog_rt_dir"
+    else
+        prog_rt_dir="$(mktemp -d "${TMPDIR:-/tmp}/brakerrak.XXXXXX")"
+        chmod 0700 "$prog_rt_dir"
+    fi
+    _BRAK_PROG_RT_DIR="$prog_rt_dir"
+
     export RVDK_PARENT_PROGBAR="1"
     export RVDK_PARENT_LABEL="BrakerRak"
     export RVDK_PARENT_BADGE_SGR="$_BRAK_MASTER_BADGE_SGR"
     export RVDK_PARENT_BAR_SGR="$_BRAK_MASTER_BAR_SGR"
-    export RVDK_PARENT_STATE="/tmp/.brakerrak-progbar.$$.master"
-    export RVDK_SUB_STATE="/tmp/.brakerrak-progbar.$$.sub"
+    export RVDK_PARENT_STATE="${prog_rt_dir}/progbar.$$.master"
+    export RVDK_SUB_STATE="${prog_rt_dir}/progbar.$$.sub"
 
     (
         umask 077
@@ -293,6 +317,10 @@ brak_prog_cleanup() {
     if [[ -n "${RVDK_APT_STAMP_FILE:-}" ]]; then
         rm -f "${RVDK_APT_STAMP_FILE}" 2>/dev/null || true
     fi
+    if [[ -n "${_BRAK_PROG_RT_DIR:-}" && "$_BRAK_PROG_RT_DIR" != "/run/brakerrak" && "$_BRAK_PROG_RT_DIR" != "${BRAKERRAK_RUNTIME_DIR:-}" ]]; then
+        rmdir "${_BRAK_PROG_RT_DIR}" 2>/dev/null || true
+    fi
+    _BRAK_PROG_RT_DIR=""
     unset RVDK_PARENT_PROGBAR RVDK_PARENT_LABEL RVDK_PARENT_BADGE_SGR RVDK_PARENT_BAR_SGR RVDK_PARENT_STATE RVDK_SUB_STATE 2>/dev/null || true
     return "$rc"
 }

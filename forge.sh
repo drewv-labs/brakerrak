@@ -4,17 +4,18 @@
 # Path: brakerrak/forge.sh
 #
 # Usage (Remote Curl Bootstrap):
-#   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker --hostname jakebase-vf2
+#   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker --hostname brakerbox-vf2
 #   curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 #
 # Usage (Local CLI after bootstrap or install-cli.sh):
-#   sudo brakerrak [forge] [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
+#   sudo brakerrak [forge] [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--hostname <name>] [--with-pg|--no-pg] [--nfs-kernel|--nfs-ganesha|--nfs-auto] [--deeptune] [--with-tailscale] [--tailscale-authkey-file <path>] [--no-apt-update] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak deeptune [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench]
 #   sudo brakerrak storage [status|grow-psql|grow-nfs|shrink-nfs|autotune] [--gb <N>|--mb <N>]
 #   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge]
+#   sudo brakerrak bench [seed|showdown|analyze] [args...]
 #   sudo brakerrak verify [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--force-rebuild-pg] [--noprogbar]
 #   sudo brakerrak reset --confirm-destroy [--keep-pg-cache] [--skip-raid-wipe] [--purge-config]
-#   sudo brakerrak update [--skip-rvdk]
+#   sudo brakerrak update [--force] [--skip-rvdk]
 # ==============================================================================
 
 # Ensure compatibility when invoked via `zsh` or `bash`
@@ -25,9 +26,138 @@ else
     set -Eeuo pipefail
 fi
 
-SCRIPT_SELF="${BASH_SOURCE[0]:-}"
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    SCRIPT_SELF="${BASH_SOURCE[0]}"
+elif [[ -n "${ZSH_VERSION:-}" && "${0:-}" != "zsh" && "${0:-}" != "-zsh" && -f "${0:-}" ]]; then
+    SCRIPT_SELF="$0"
+else
+    SCRIPT_SELF=""
+fi
+
+if [[ -n "$SCRIPT_SELF" ]]; then
+    SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
+    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
+else
+    CANDIDATE_ROOT=""
+fi
+
+print_usage() {
+    cat <<'EOF'
+Usage: sudo brakerrak [subcommand] [options]
+
+Subcommands:
+  forge (default)                     Converge OS/BSP, 4Kn NVMe, PG18, MQTT, NFSv4 & role services
+  deeptune [--role <r>] [--tune <t>]  Apply role-mapped RVDK silicon & OS DeepTune
+  storage [status|grow-psql|grow-nfs|shrink-nfs|autotune]
+                                      Manage Dual-LVM elastic pool via RVDK
+  ort [--stage <tag>] [--out-dir <d>] Capture read-only Day-0/Day-1 ORT & CTD provenance snapshot
+  bench [seed|showdown|analyze]       Run PG18 io_uring torture benchmarks & PyArrow telemetry analysis
+  verify [forge-options]              Run end-to-end convergence & Pass-2 idempotency harness
+  reset --confirm-destroy [options]   Roll back NVMe to factory 512e & Day-0 state
+  update [--force] [--skip-rvdk]      Pull latest RVDK + BrakerRak engine from GitHub
+
+Forge Options (all value flags also accept --flag=value):
+  --target <slug>                     Override silicon target (e.g. eswin-eic7700x, starfive-jh7110)
+  --role <role>                       databroker | databench | babbagebox | babbagebench |
+                                      visionbox | visionbench | devbench
+  --hostname <name>                   Target RFC-1123 node hostname
+  --user <username>                   Target admin POSIX user
+  --subnet <CIDR>                     Authorized LAN CIDR (default: 10.0.0.0/24; empty "" preserved from node.env)
+  --nvme-dev <device>                 Hot NVMe block device (default: /dev/nvme0n1)
+  --mount-point <path>                Primary NVMe mountpoint (default: /mnt/nvme_pgdata)
+  --nfs-mount <path>                  Dedicated Dual-LVM NFS mountpoint (default: /mnt/nfs_vault)
+  --with-raid | --no-raid             Enable or disable USB/SATA Btrfs RAID 10 provisioning
+  --with-pg | --no-pg                 Enable or disable PostgreSQL 18.6 (+ Sv39 HugePages reclamation on --no-pg)
+  --with-mqtt | --no-mqtt             Enable or disable Eclipse Mosquitto broker
+  --with-nfs | --no-nfs               Enable or disable NFSv4 vault exports
+  --nfs-backend <ganesha|kernel|auto> Select NFSv4 backend (aliases: --nfs-ganesha, --nfs-kernel, --nfs-auto)
+  --deeptune | --tune <data|ai>       Run RVDK DeepTune at end of forge (persists tune profile on --tune)
+  --with-tailscale                    Install & configure Tailscale mesh VPN
+  --tailscale-up | --tailscale-ssh    Run `tailscale up` / enable Tailscale SSH
+  --tailscale-authkey-file <path>     Read Tailscale auth key from a 0600 file (recommended)
+  --tailscale-authkey <key>           Pass Tailscale auth key via argv (deprecated; exposes secret in /proc)
+  --tailscale-routes <CIDRs>          Advertise subnet routes via Tailscale
+  --tailscale-userspace               Force userspace networking for Tailscale
+  --no-apt-update                     Skip redundant apt-get update calls
+  --force-wipe-nvme                   Force wipe/reformat hot NVMe block device
+  --force-wipe-raid                   Force wipe/recreate declared Btrfs RAID arrays
+  --force-rebuild-pg | --use-pkg-cache
+                                      Compile PG18 from source vs prebuilt bundle cache
+  --noprogbar                         Disable 2-row stacked VT100 progress bar
+  --version                           Print BrakerRak engine version and exit
+  -h, --help                          Show this help message and exit
+
+Paths:
+  Engine : /usr/local/share/brakerrak/engine (0755)
+  Config : /etc/brakerrak/node.env (0640, root:$REAL_GRP; override via BRAKERRAK_NODE_ENV)
+  Snaps  : ~/.brakerrak/snapshots (0750)
+EOF
+}
+
+print_bench_help() {
+    cat <<'EOF'
+Usage:
+  sudo brakerrak bench seed [options]      Seed deterministic PG18 I/O torture table
+                                           (/usr/local/share/brakerrak/engine/benchmarks/seed-io-torture.sh)
+  sudo brakerrak bench [showdown] [opts]   Run cold-cache sync/worker/io_uring ablation showdown
+                                           (/usr/local/share/brakerrak/engine/benchmarks/run-iouring-showdown.sh)
+  brakerrak bench analyze <run_dir> [opts] Aggregate showdown telemetry via PyArrow to Parquet/IPC
+                                           (/usr/local/share/brakerrak/engine/benchmarks/analyze_showdown.py)
+EOF
+}
+
+print_version() {
+    local engine_root="${CANDIDATE_ROOT:-/usr/local/share/brakerrak/engine}"
+    local commit_sha="unknown"
+    if [[ -d "${engine_root}/.git" ]] && command -v git >/dev/null 2>&1; then
+        commit_sha="$(git -C "$engine_root" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+    fi
+    printf "brakerrak (%s) [%s]\n" "$commit_sha" "$engine_root"
+}
+
+# Handle unprivileged --help / --version and read-only `bench analyze` before sudo escalation
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        --version|-V)
+            print_version
+            exit 0
+            ;;
+        forge)
+            for _fa in "${@:2}"; do
+                case "$_fa" in
+                    -h|--help)    print_usage; exit 0 ;;
+                    --version|-V) print_version; exit 0 ;;
+                esac
+            done
+            ;;
+        bench)
+            case "${2:-}" in
+                -h|--help|help)
+                    print_bench_help
+                    exit 0
+                    ;;
+                analyze|report)
+                    _BENCH_ROOT="${CANDIDATE_ROOT:-/usr/local/share/brakerrak/engine}"
+                    shift 2
+                    if command -v uv >/dev/null 2>&1 && [[ -f "${_BENCH_ROOT}/pyproject.toml" && -x "${_BENCH_ROOT}/.venv/bin/python" ]]; then
+                        exec uv run --project "$_BENCH_ROOT" --no-sync python "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                    elif command -v uv >/dev/null 2>&1 && [[ -f "${_BENCH_ROOT}/pyproject.toml" ]]; then
+                        exec uv run --project "$_BENCH_ROOT" python "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                    else
+                        exec python3 "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+fi
+
 if [[ $EUID -ne 0 ]]; then
-    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]]; then
+    if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
         exec sudo -E bash "$SCRIPT_SELF" "$@"
     else
         echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://brakerrak.dev/forge.sh | sudo bash" >&2
@@ -35,31 +165,68 @@ if [[ $EUID -ne 0 ]]; then
     fi
 fi
 
-# Sanitize SSH-forwarded LC_* (e.g. ZedBook / macOS SendEnv) before Day-0 locale-gen
-if { locale -a 2>/dev/null || true; } | grep -qiE '^en_US\.utf-?8$'; then
-    export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
-elif { locale -a 2>/dev/null || true; } | grep -qiE '^C\.utf-?8$'; then
-    export LANG="C.UTF-8" LC_ALL="C.UTF-8"
-else
-    export LANG="C" LC_ALL="C"
+# Re-exec under bash if invoked directly as a file under zsh
+if [[ -n "${ZSH_VERSION:-}" && -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v bash >/dev/null 2>&1; then
+    exec bash "$SCRIPT_SELF" "$@"
 fi
 
-REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
-REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
-
-if command -v getent >/dev/null 2>&1; then
-    REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
-elif command -v dscl >/dev/null 2>&1; then
-    REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+# Load shared core library if local checkout is already available; otherwise provide
+# minimal bootstrap helpers (ZERO `eval`) until the engine is staged.
+if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/scripts/lib-common.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${CANDIDATE_ROOT}/scripts/lib-common.sh"
 else
-    REAL_HOME=""
+    BRAKERRAK_SYSTEM_ENGINE_DIR="/usr/local/share/brakerrak/engine"
+    brak_log_init() { :; }
+    log_brak()  { printf "\033[1;35m[BRAKERRAK]\033[0m %s\n" "$1"; }
+    log_step()  { printf "\n\033[1;36m=== [%s] %s ===\033[0m\n" "$(date +%H:%M:%S)" "$1"; }
+    log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
+    log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
+    log_warn()  { printf "\033[1;33m[WARN]\033[0m %s\n" "$1" >&2; }
+    log_fatal() { printf "\033[1;31m[BRAKERRAK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
+    brak_sanitize_locale() {
+        local avail
+        avail="$(locale -a 2>/dev/null || true)"
+        if grep -qiE '^en_US\.utf-?8$' <<< "$avail"; then
+            export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
+        elif grep -qiE '^C\.utf-?8$' <<< "$avail"; then
+            export LANG="C.UTF-8" LC_ALL="C.UTF-8"
+        else
+            export LANG="C" LC_ALL="C"
+        fi
+    }
+    brak_resolve_user() {
+        REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || id -un 2>/dev/null || echo root)}"
+        [[ ! "$REAL_USER" =~ ^[a-zA-Z0-9._-]+$ ]] && REAL_USER="root"
+        REAL_GRP="$(id -gn "$REAL_USER" 2>/dev/null || echo "$REAL_USER")"
+        REAL_HOME=""
+        if command -v getent >/dev/null 2>&1; then
+            REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6 || true)"
+        elif command -v dscl >/dev/null 2>&1; then
+            REAL_HOME="$(dscl . -read "/Users/${REAL_USER}" NFSHomeDirectory 2>/dev/null | awk '{print $2}' || true)"
+        fi
+        if [[ -z "$REAL_HOME" ]]; then
+            if [[ "$REAL_USER" == "root" ]]; then
+                REAL_HOME="/root"
+            elif [[ -d "/Users/${REAL_USER}" ]]; then
+                REAL_HOME="/Users/${REAL_USER}"
+            elif [[ -d "/home/${REAL_USER}" ]]; then
+                REAL_HOME="/home/${REAL_USER}"
+            else
+                REAL_HOME="/root"
+            fi
+        fi
+        export REAL_USER REAL_GRP REAL_HOME
+    }
 fi
-[[ -z "$REAL_HOME" ]] && REAL_HOME="$(eval echo "~${REAL_USER}" 2>/dev/null || true)"
-[[ -z "$REAL_HOME" || "$REAL_HOME" == "~"* ]] && REAL_HOME="/root"
+
+brak_log_init "BRAKERRAK"
+brak_sanitize_locale
+brak_resolve_user
 
 BRAKER_DIR="${REAL_HOME}/.brakerrak"
-ENGINE_DIR="${BRAKER_DIR}/engine"
-NODE_ENV="${BRAKER_DIR}/node.env"
+SNAP_DIR="${BRAKER_DIR}/snapshots"
+ENGINE_DIR="${BRAKERRAK_ENGINE_DIR:-${BRAKERRAK_SYSTEM_ENGINE_DIR:-/usr/local/share/brakerrak/engine}}"
 REPO_URL="${BRAKERRAK_REPO_URL:-https://github.com/drewv-labs/brakerrak.git}"
 REPO_BRANCH="${BRAKERRAK_BRANCH:-main}"
 BRAKERRAK_BASE_URL="${BRAKERRAK_BASE_URL:-https://brakerrak.dev}"
@@ -73,48 +240,16 @@ case "$APT_UPDATED" in
     *)                   APT_UPDATED="false" ;;
 esac
 
-log_brak()  { printf "\033[1;35m[BRAKERRAK]\033[0m %s\n" "$1"; }
-log_step()  { printf "\n\033[1;36m=== [%s] %s ===\033[0m\n" "$(date +%H:%M:%S)" "$1"; }
-log_ok()    { printf "\033[1;32m  [OK]\033[0m %s\n" "$1"; }
-log_skip()  { printf "\033[1;33m[SKIP]\033[0m %s\n" "$1"; }
-log_fatal() { printf "\033[1;31m[BRAKERRAK:FATAL]\033[0m %s\n" "$1" >&2; exit 1; }
-
-# Normalize role alias -> canonical role name in `roles/<role>.env`
-normalize_role() {
-    local raw
-    raw="$(tr '[:upper:]' '[:lower:]' <<< "${1:-databroker}")"
-    case "$raw" in
-        prod|broker|databroker|brakerbox|brakbox|brx)                 echo "databroker" ;;
-        bench|databench|brakerbench|brakbnch|brh)                     echo "databench" ;;
-        babbagebox|babbox|bab|gpuprod)                                echo "babbagebox" ;;
-        babbagebench|babbnch|bah|gpubench)                            echo "babbagebench" ;;
-        visionbox|visbox|vx|npuprod)                                  echo "visionbox" ;;
-        visionbench|visbnch|vh|npubench|visionferret|vferret|mlbench) echo "visionbench" ;;
-        devbench|devbnch|dev)                                         echo "devbench" ;;
-        *)                                                            echo "" ;;
-    esac
-}
-
-# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ai`)
-role_to_rvdk_tune() {
-    local canon
-    canon="$(normalize_role "${1:-databroker}")"
-    case "$canon" in
-        babbagebox|babbagebench|visionbox|visionbench|devbench) echo "ai" ;;
-        *)                                                      echo "data" ;;
-    esac
-}
-
 RVDK_BIN="/usr/local/bin/rvdk"
 [[ ! -x "$RVDK_BIN" && -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk"
 
 # ==============================================================================
-# 1. Parse Subcommand (forge | deeptune | storage | ort | verify | reset | update)
+# 1. Parse Subcommand (forge | deeptune | storage | ort | bench | verify | reset | update)
 # ==============================================================================
 ACTION="forge"
 if [[ $# -gt 0 ]]; then
     case "$1" in
-        forge|deeptune|deep-tune|storage|ort|verify|reset|update|self-update)
+        forge|deeptune|deep-tune|storage|ort|bench|verify|reset|update|self-update)
             ACTION="$1"
             shift
             ;;
@@ -122,15 +257,8 @@ if [[ $# -gt 0 ]]; then
 fi
 
 # ==============================================================================
-# 2. Sync ~/.brakerrak/engine & Link /usr/local/bin/brakerrak (+ /usr/bin/brakerrak)
+# 2. Resolve Engine Path (/usr/local/share/brakerrak/engine) & Handle `update`
 # ==============================================================================
-if [[ -n "$SCRIPT_SELF" ]]; then
-    SCRIPT_REAL="$(readlink -f "$SCRIPT_SELF" 2>/dev/null || realpath "$SCRIPT_SELF" 2>/dev/null || echo "$SCRIPT_SELF")"
-    CANDIDATE_ROOT="$(cd "$(dirname "$SCRIPT_REAL")" && pwd)"
-else
-    CANDIDATE_ROOT=""
-fi
-
 if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
     RVDK_QUIET_ARGS=("--quiet")
     SKIP_RVDK_UPDATE="false"
@@ -139,7 +267,23 @@ if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
         case "$uarg" in
             --skip-rvdk|--only-brakerrak) SKIP_RVDK_UPDATE="true" ;;
             -v|--verbose)                 RVDK_QUIET_ARGS=() ;;
-            *)                            BRAK_UPDATE_ARGS+=("$uarg") ;;
+            -q|--quiet|--force)           BRAK_UPDATE_ARGS+=("$uarg") ;;
+            -h|--help)
+                cat <<'EOF'
+Usage: sudo brakerrak update [options]
+
+Options:
+  --skip-rvdk   Only update BrakerRak engine (skip RVDK update)
+  --force       Discard uncommitted local changes in /usr/local/share/brakerrak/engine
+  -q, --quiet   Suppress post-update banner
+  -v, --verbose Show verbose RVDK update banner
+  -h, --help    Show this help message and exit
+EOF
+                exit 0
+                ;;
+            *)
+                log_fatal "Unknown update option: ${uarg} (try 'brakerrak update --help')"
+                ;;
         esac
     done
 
@@ -153,62 +297,87 @@ if [[ "$ACTION" == "update" || "$ACTION" == "self-update" ]]; then
         fi
     fi
 
-    if [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
+    if [[ -n "$CANDIDATE_ROOT" && -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
         exec bash "${CANDIDATE_ROOT}/install-cli.sh" ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
+    elif [[ -f "${ENGINE_DIR}/install-cli.sh" ]]; then
+        exec bash "${ENGINE_DIR}/install-cli.sh" ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
     else
         curl -fsSL "${BRAKERRAK_BASE_URL}/install-cli.sh" | bash -s -- ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
         exit 0
     fi
 fi
 
-# If symlinked into a different user's ~/.brakerrak/engine (e.g. factory 'user' after switching to admin user),
-# clone/copy into the active user's ~/.brakerrak/engine so purging the factory user never breaks /usr/local/bin/brakerrak.
-if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" ]] && ! [[ "$CANDIDATE_ROOT" == */.brakerrak/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
-    LOCAL_ROOT="$CANDIDATE_ROOT"
-else
-    if [[ "$CANDIDATE_ROOT" == */.brakerrak/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" && -d "${CANDIDATE_ROOT}/.git" && ! -d "${ENGINE_DIR}/.git" ]]; then
-        install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR" "${BRAKER_DIR}/snapshots"
-        cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
-        chown -R "${REAL_USER}:${REAL_GRP}" "$ENGINE_DIR"
-    elif [[ -f "${CANDIDATE_ROOT}/install-cli.sh" ]]; then
-        bash "${CANDIDATE_ROOT}/install-cli.sh" --quiet
-    else
-        if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
-            if command -v apt-get >/dev/null 2>&1; then
-                export DEBIAN_FRONTEND=noninteractive
-                if [[ "$APT_UPDATED" != "true" ]]; then
-                    apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
-                    APT_UPDATED="true"
-                fi
-                apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
-            else
-                log_fatal "Missing git or curl."
-            fi
-        fi
-        install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
-        if [[ -d "${ENGINE_DIR}/.git" ]]; then
-            log_brak "Syncing BrakerRak engine in ${ENGINE_DIR}..."
-            sudo -u "$REAL_USER" git -C "$ENGINE_DIR" fetch origin "$REPO_BRANCH" -q
-            sudo -u "$REAL_USER" git -C "$ENGINE_DIR" reset --hard "origin/${REPO_BRANCH}" -q
-        else
-            log_brak "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
+# Resolve LOCAL_ROOT without ever running `git fetch`/`git reset --hard` outside `update`/`install-cli.sh`.
+if [[ -n "$CANDIDATE_ROOT" && -d "${CANDIDATE_ROOT}/soc-drawer" && -f "${CANDIDATE_ROOT}/scripts/lib-common.sh" ]]; then
+    if [[ "$CANDIDATE_ROOT" == */.brakerrak/engine && "$CANDIDATE_ROOT" != "$ENGINE_DIR" ]]; then
+        # Promote legacy ~/.brakerrak/engine into system-wide /usr/local/share/brakerrak/engine
+        if [[ ! -d "${ENGINE_DIR}/.git" ]]; then
+            install -d -m 0755 -o 0 -g 0 "$(dirname "$ENGINE_DIR")"
             rm -rf "$ENGINE_DIR"
-            sudo -u "$REAL_USER" git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
+            cp -a "$CANDIDATE_ROOT" "$ENGINE_DIR"
+            chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+            chmod -R a+rX "$ENGINE_DIR" 2>/dev/null || true
+            chmod 0755 "$ENGINE_DIR"
+            log_ok "Promoted legacy checkout ${CANDIDATE_ROOT} -> ${ENGINE_DIR}"
+        fi
+        LOCAL_ROOT="$ENGINE_DIR"
+    else
+        LOCAL_ROOT="$CANDIDATE_ROOT"
+    fi
+elif [[ -d "${ENGINE_DIR}/.git" && -f "${ENGINE_DIR}/scripts/lib-common.sh" ]]; then
+    LOCAL_ROOT="$ENGINE_DIR"
+else
+    # First-time bootstrap (e.g. `curl -fsSL https://brakerrak.dev/forge.sh | sudo bash`)
+    if ! command -v git >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            if [[ "$APT_UPDATED" != "true" ]]; then
+                apt-get -o Acquire::Check-Valid-Until=false -o DPkg::Lock::Timeout=120 update -q || true
+                APT_UPDATED="true"
+            fi
+            apt-get -o DPkg::Lock::Timeout=120 install -y git ca-certificates curl
+        else
+            log_fatal "Missing git or curl."
         fi
     fi
+    install -d -m 0755 -o 0 -g 0 "$(dirname "$ENGINE_DIR")"
+    log_brak "Cloning ${REPO_URL} into ${ENGINE_DIR}..."
+    rm -rf "$ENGINE_DIR"
+    git clone --branch "$REPO_BRANCH" "$REPO_URL" "$ENGINE_DIR" -q
+    chown -R 0:0 "$ENGINE_DIR" 2>/dev/null || true
+    chmod -R a+rX "$ENGINE_DIR" 2>/dev/null || true
+    chmod 0755 "$ENGINE_DIR"
     LOCAL_ROOT="$ENGINE_DIR"
 fi
 
-chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh "${LOCAL_ROOT}"/benchmarks/*.sh 2>/dev/null || true
-install -d -m 0755 /usr/local/bin
-ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
-if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
-    ln -sf "${LOCAL_ROOT}/forge.sh" /usr/bin/brakerrak
+# Ensure shared core library is sourced from LOCAL_ROOT
+if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" != "1" ]]; then
+    if [[ ! -f "${LOCAL_ROOT}/scripts/lib-common.sh" ]]; then
+        log_fatal "Core library missing: ${LOCAL_ROOT}/scripts/lib-common.sh"
+    fi
+    # shellcheck disable=SC1091
+    source "${LOCAL_ROOT}/scripts/lib-common.sh"
+    brak_log_init "BRAKERRAK"
+    brak_resolve_user
 fi
 
+# Refresh CLI symlinks on forge, if missing, or if pointing into a legacy ~/.brakerrak/engine path
+_cur_bin_target="$(readlink -f /usr/local/bin/brakerrak 2>/dev/null || true)"
+if [[ "$ACTION" == "forge" || ! -L /usr/local/bin/brakerrak || "$_cur_bin_target" == */.brakerrak/engine/* ]]; then
+    chmod +x "${LOCAL_ROOT}/forge.sh" "${LOCAL_ROOT}/install-cli.sh" "${LOCAL_ROOT}"/scripts/*.sh "${LOCAL_ROOT}"/benchmarks/*.sh 2>/dev/null || true
+    install -d -m 0755 /usr/local/bin
+    ln -sf "${LOCAL_ROOT}/forge.sh" /usr/local/bin/brakerrak
+    if [[ "$(uname -s)" == "Linux" && -d /usr/bin ]]; then
+        ln -sf "${LOCAL_ROOT}/forge.sh" /usr/bin/brakerrak
+    fi
+fi
+
+# Resolve /etc/brakerrak/node.env (transparently migrating legacy ~/.brakerrak/node.env)
+brak_resolve_node_env --migrate
+
 # Migrate pre-FHS `/opt/drewv-pgdg-riscv64` local APT repo -> `/var/lib/rvdk/pgdg-riscv64`
-# so `apt update` stops failing with `Method gave a blank filename` on legacy nodes.
-if [[ "$ACTION" != "ort" && "$ACTION" != "reset" ]] && [[ -d /opt/drewv-pgdg-riscv64 || -f /etc/apt/sources.list.d/drewv-local-pgdg.list ]]; then
+# Strictly gated behind `ACTION == "forge"` so read-only/utility commands never mutate APT state.
+if [[ "$ACTION" == "forge" ]] && [[ -d /opt/drewv-pgdg-riscv64 || -f /etc/apt/sources.list.d/drewv-local-pgdg.list ]]; then
     _RVDK_PG_ROOT="/var/lib/rvdk/pgdg-riscv64"
     _RVDK_PG_DEBS="${_RVDK_PG_ROOT}/debs"
     if compgen -G "/opt/drewv-pgdg-riscv64/debs/*.deb" >/dev/null 2>&1; then
@@ -255,7 +424,7 @@ if [[ "$ACTION" != "ort" && "$ACTION" != "reset" ]] && [[ -d /opt/drewv-pgdg-ris
 fi
 
 # ==============================================================================
-# 3. Route Shared Lifecycle Subcommands Immediately (deeptune | storage | ort | verify | reset)
+# 3. Route Shared Lifecycle Subcommands Immediately (deeptune | storage | ort | bench | verify | reset)
 # ==============================================================================
 case "$ACTION" in
     deeptune|deep-tune)
@@ -264,20 +433,25 @@ case "$ACTION" in
         DT_PASS_ARGS=()
         while [[ $# -gt 0 ]]; do
             case "$1" in
-                --role)    DT_ROLE="${2:-}"; shift 2 ;;
-                -t|--tune) DT_EXPLICIT_TUNE="${2:-}"; shift 2 ;;
-                --tune=*)  DT_EXPLICIT_TUNE="${1#*=}"; shift ;;
+                --role)    brak_require_arg "$1" "${2:-}"; DT_ROLE="$2"; shift 2 ;;
+                --role=*)  DT_ROLE="${1#*=}"; brak_require_arg "--role" "$DT_ROLE"; shift ;;
+                -t|--tune) brak_require_arg "$1" "${2:-}"; DT_EXPLICIT_TUNE="$2"; shift 2 ;;
+                --tune=*)  DT_EXPLICIT_TUNE="${1#*=}"; brak_require_arg "--tune" "$DT_EXPLICIT_TUNE"; shift ;;
                 *)         DT_PASS_ARGS+=("$1"); shift ;;
             esac
         done
         if [[ -z "$DT_EXPLICIT_TUNE" ]]; then
-            if [[ -z "$DT_ROLE" && -f "$NODE_ENV" ]]; then
-                DT_ROLE="$(awk -F= '/^NODE_ROLE=/ {gsub(/["'\''[:space:]]/, "", $2); print $2; exit}' "$NODE_ENV" 2>/dev/null || true)"
+            if [[ -z "$DT_ROLE" && -r "$NODE_ENV" ]]; then
+                NODE_ROLE=""
+                brak_load_kv_env "$NODE_ENV" NODE_ROLE || true
+                DT_ROLE="$NODE_ROLE"
             fi
-            DT_EXPLICIT_TUNE="$(role_to_rvdk_tune "${DT_ROLE:-databroker}")"
+            DT_EXPLICIT_TUNE="$(brak_role_to_rvdk_tune "${DT_ROLE:-databroker}")"
         else
             case "$(tr '[:upper:]' '[:lower:]' <<< "$DT_EXPLICIT_TUNE")" in
                 ai|ml|edge-ai|edge-ml) DT_EXPLICIT_TUNE="ai" ;;
+                data)                  DT_EXPLICIT_TUNE="data" ;;
+                *)                     log_fatal "Unknown --tune profile '${DT_EXPLICIT_TUNE}' (expected: data | ai)" ;;
             esac
         fi
         for a in ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}; do
@@ -288,9 +462,8 @@ case "$ACTION" in
         exec "$RVDK_BIN" deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
         ;;
     storage)
-        if [[ -f "$NODE_ENV" ]]; then
-            # shellcheck disable=SC1090
-            source "$NODE_ENV"
+        if [[ -r "$NODE_ENV" ]]; then
+            brak_load_kv_env "$NODE_ENV" VG_NAME LV_NAME NFS_LV_NAME MOUNT_POINT NFS_MOUNT_POINT || true
             export RVDK_ENV_FILE="$NODE_ENV"
         fi
         VG_NAME="${VG_NAME:-vg_braker}"
@@ -324,6 +497,39 @@ case "$ACTION" in
     ort)
         exec bash "${LOCAL_ROOT}/scripts/ort-snapshot.sh" "$@"
         ;;
+    bench)
+        BENCH_SUB="${1:-showdown}"
+        case "$BENCH_SUB" in
+            -h|--help|help)
+                print_bench_help
+                exit 0
+                ;;
+            seed|seed-io-torture)
+                shift
+                exec bash "${LOCAL_ROOT}/benchmarks/seed-io-torture.sh" "$@"
+                ;;
+            showdown|run|io-showdown)
+                shift
+                exec bash "${LOCAL_ROOT}/benchmarks/run-iouring-showdown.sh" "$@"
+                ;;
+            analyze|report)
+                shift
+                if command -v uv >/dev/null 2>&1 && [[ -f "${LOCAL_ROOT}/pyproject.toml" && -x "${LOCAL_ROOT}/.venv/bin/python" ]]; then
+                    exec uv run --project "$LOCAL_ROOT" --no-sync python "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                elif command -v uv >/dev/null 2>&1 && [[ -f "${LOCAL_ROOT}/pyproject.toml" ]]; then
+                    exec uv run --project "$LOCAL_ROOT" python "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                else
+                    exec python3 "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
+                fi
+                ;;
+            -*)
+                exec bash "${LOCAL_ROOT}/benchmarks/run-iouring-showdown.sh" "$@"
+                ;;
+            *)
+                log_fatal "Unknown bench subcommand '${BENCH_SUB}' (expected: seed | showdown | analyze)"
+                ;;
+        esac
+        ;;
     verify)
         exec bash "${LOCAL_ROOT}/scripts/verify-convergence.sh" "$@"
         ;;
@@ -333,7 +539,7 @@ case "$ACTION" in
 esac
 
 # ==============================================================================
-# 4. Parse CLI Flags & Overrides for 'forge'
+# 4. Parse CLI Flags & Overrides for 'forge' (Strict Fail-Fast Validation)
 # ==============================================================================
 TARGET_BOARD="${BRAKERRAK_TARGET:-}"
 CLI_ROLE=""
@@ -352,65 +558,259 @@ CLI_WITH_DEEPTUNE="false"
 CLI_DEEPTUNE_TUNE=""
 CLI_WITH_TAILSCALE="false"
 CLI_TS_AUTHKEY=""
+CLI_TS_AUTHKEY_FILE=""
 CLI_TS_FLAGS=()
+CLI_TOPOLOGY_OVERRIDE="false"
 FORCE_WIPE_NVME="false"
 FORCE_WIPE_RAID="false"
 FORCE_REBUILD_PG="false"
-FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --target)                   TARGET_BOARD="${2:-}"; shift 2 ;;
-        --role)                     CLI_ROLE="${2:-}"; shift 2 ;;
-        --hostname)                 CLI_HOSTNAME="${2:-}"; shift 2 ;;
-        --user)                     CLI_USER="${2:-}"; shift 2 ;;
-        --subnet)                   CLI_SUBNET="${2:-}"; shift 2 ;;
-        --nvme-dev)                 CLI_NVME_DEV="${2:-}"; shift 2 ;;
-        --mount-point)              CLI_MOUNT_POINT="${2:-}"; shift 2 ;;
-        --nfs-mount)                CLI_NFS_MOUNT="${2:-}"; shift 2 ;;
-        --with-raid)                CLI_WITH_RAID="true"; shift ;;
-        --no-raid)                  CLI_WITH_RAID="false"; shift ;;
-        --with-pg|--with-postgres)  CLI_ENABLE_PG="true"; shift ;;
-        --no-pg|--no-postgres)      CLI_ENABLE_PG="false"; shift ;;
-        --with-mqtt)                CLI_ENABLE_MQTT="true"; shift ;;
-        --no-mqtt)                  CLI_ENABLE_MQTT="false"; shift ;;
-        --with-nfs)                 CLI_ENABLE_NFS="true"; shift ;;
-        --no-nfs)                  CLI_ENABLE_NFS="false"; shift ;;
-        --nfs-backend)              CLI_NFS_BACKEND="${2:-}"; shift 2 ;;
-        --nfs-ganesha)              CLI_NFS_BACKEND="ganesha"; shift ;;
-        --nfs-kernel|--nfs-kernal)  CLI_NFS_BACKEND="kernel"; shift ;;
-        --nfs-auto)                 CLI_NFS_BACKEND="auto"; shift ;;
+        --target)
+            brak_require_arg "$1" "${2:-}"
+            TARGET_BOARD="$2"
+            shift 2 ;;
+        --target=*)
+            TARGET_BOARD="${1#*=}"
+            brak_require_arg "--target" "$TARGET_BOARD"
+            shift ;;
+        --role)
+            brak_require_arg "$1" "${2:-}"
+            CLI_ROLE="$2"
+            shift 2 ;;
+        --role=*)
+            CLI_ROLE="${1#*=}"
+            brak_require_arg "--role" "$CLI_ROLE"
+            shift ;;
+        --hostname)
+            brak_require_arg "$1" "${2:-}"
+            CLI_HOSTNAME="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --hostname=*)
+            CLI_HOSTNAME="${1#*=}"
+            brak_require_arg "--hostname" "$CLI_HOSTNAME"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --user)
+            brak_require_arg "$1" "${2:-}"
+            CLI_USER="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --user=*)
+            CLI_USER="${1#*=}"
+            brak_require_arg "--user" "$CLI_USER"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --subnet)
+            brak_require_arg "$1" "${2:-}"
+            CLI_SUBNET="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --subnet=*)
+            CLI_SUBNET="${1#*=}"
+            brak_require_arg "--subnet" "$CLI_SUBNET"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nvme-dev)
+            brak_require_arg "$1" "${2:-}"
+            CLI_NVME_DEV="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --nvme-dev=*)
+            CLI_NVME_DEV="${1#*=}"
+            brak_require_arg "--nvme-dev" "$CLI_NVME_DEV"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --mount-point)
+            brak_require_arg "$1" "${2:-}"
+            CLI_MOUNT_POINT="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --mount-point=*)
+            CLI_MOUNT_POINT="${1#*=}"
+            brak_require_arg "--mount-point" "$CLI_MOUNT_POINT"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nfs-mount)
+            brak_require_arg "$1" "${2:-}"
+            CLI_NFS_MOUNT="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --nfs-mount=*)
+            CLI_NFS_MOUNT="${1#*=}"
+            brak_require_arg "--nfs-mount" "$CLI_NFS_MOUNT"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --with-raid)
+            CLI_WITH_RAID="true"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --no-raid)
+            CLI_WITH_RAID="false"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --with-pg|--with-postgres)
+            CLI_ENABLE_PG="true"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --no-pg|--no-postgres)
+            CLI_ENABLE_PG="false"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --with-mqtt)
+            CLI_ENABLE_MQTT="true"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --no-mqtt)
+            CLI_ENABLE_MQTT="false"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --with-nfs)
+            CLI_ENABLE_NFS="true"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --no-nfs)
+            CLI_ENABLE_NFS="false"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nfs-backend)
+            brak_require_arg "$1" "${2:-}"
+            CLI_NFS_BACKEND="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --nfs-backend=*)
+            CLI_NFS_BACKEND="${1#*=}"
+            brak_require_arg "--nfs-backend" "$CLI_NFS_BACKEND"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nfs-ganesha)
+            CLI_NFS_BACKEND="ganesha"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nfs-kernel|--nfs-kernal)
+            CLI_NFS_BACKEND="kernel"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
+        --nfs-auto)
+            CLI_NFS_BACKEND="auto"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
         --deeptune|--deep-tune|--with-deeptune)
-                                    CLI_WITH_DEEPTUNE="true"; shift ;;
-        --tune)                     CLI_WITH_DEEPTUNE="true"; CLI_DEEPTUNE_TUNE="${2:-}"; shift 2 ;;
-        --tune=*)                   CLI_WITH_DEEPTUNE="true"; CLI_DEEPTUNE_TUNE="${1#*=}"; shift ;;
+            CLI_WITH_DEEPTUNE="true"
+            shift ;;
+        --tune|-t)
+            brak_require_arg "$1" "${2:-}"
+            CLI_WITH_DEEPTUNE="true"
+            CLI_DEEPTUNE_TUNE="$2"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift 2 ;;
+        --tune=*)
+            CLI_DEEPTUNE_TUNE="${1#*=}"
+            brak_require_arg "--tune" "$CLI_DEEPTUNE_TUNE"
+            CLI_WITH_DEEPTUNE="true"
+            CLI_TOPOLOGY_OVERRIDE="true"
+            shift ;;
         --with-tailscale|--tailscale)
-                                    CLI_WITH_TAILSCALE="true"; shift ;;
+            CLI_WITH_TAILSCALE="true"
+            shift ;;
         --tailscale-up|--ts-up)
-                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--up"); shift ;;
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_FLAGS+=("--up")
+            shift ;;
         --tailscale-ssh|--ts-ssh)
-                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--ssh"); shift ;;
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_FLAGS+=("--ssh")
+            shift ;;
         --tailscale-authkey|--ts-authkey)
-                                    CLI_WITH_TAILSCALE="true"; CLI_TS_AUTHKEY="${2:-}"; shift 2 ;;
+            brak_require_arg "$1" "${2:-}"
+            log_warn "Passing $1 on CLI argv exposes secrets in /proc/<pid>/cmdline. Prefer --tailscale-authkey-file <path> (0600) or TS_AUTHKEY env."
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_AUTHKEY="$2"
+            shift 2 ;;
+        --tailscale-authkey=*|--ts-authkey=*)
+            CLI_TS_AUTHKEY="${1#*=}"
+            brak_require_arg "${1%%=*}" "$CLI_TS_AUTHKEY"
+            log_warn "Passing ${1%%=*} on CLI argv exposes secrets in /proc/<pid>/cmdline. Prefer --tailscale-authkey-file <path> (0600) or TS_AUTHKEY env."
+            CLI_WITH_TAILSCALE="true"
+            shift ;;
+        --tailscale-authkey-file|--ts-authkey-file)
+            brak_require_arg "$1" "${2:-}"
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_AUTHKEY_FILE="$2"
+            shift 2 ;;
+        --tailscale-authkey-file=*|--ts-authkey-file=*)
+            CLI_TS_AUTHKEY_FILE="${1#*=}"
+            brak_require_arg "${1%%=*}" "$CLI_TS_AUTHKEY_FILE"
+            CLI_WITH_TAILSCALE="true"
+            shift ;;
         --tailscale-routes)
-                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--advertise-routes" "${2:-}"); shift 2 ;;
+            brak_require_arg "$1" "${2:-}"
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_FLAGS+=("--advertise-routes" "$2")
+            shift 2 ;;
+        --tailscale-routes=*)
+            _ts_routes="${1#*=}"
+            brak_require_arg "--tailscale-routes" "$_ts_routes"
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_FLAGS+=("--advertise-routes" "$_ts_routes")
+            shift ;;
         --tailscale-userspace)
-                                    CLI_WITH_TAILSCALE="true"; CLI_TS_FLAGS+=("--userspace"); shift ;;
+            CLI_WITH_TAILSCALE="true"
+            CLI_TS_FLAGS+=("--userspace")
+            shift ;;
         --no-apt-update|--skip-apt-update)
-                                    APT_UPDATED="true"; shift ;;
-        --force-wipe-nvme)          FORCE_WIPE_NVME="true"; shift ;;
-        --force-wipe-raid)          FORCE_WIPE_RAID="true"; shift ;;
+            APT_UPDATED="true"
+            shift ;;
+        --force-wipe-nvme)
+            FORCE_WIPE_NVME="true"
+            shift ;;
+        --force-wipe-raid)
+            FORCE_WIPE_RAID="true"
+            shift ;;
         --force-rebuild-pg|--force-build|--compile-pg|--no-pkg-cache)
-                                    FORCE_REBUILD_PG="true"; shift ;;
-        --use-pkg-cache)            FORCE_REBUILD_PG="false"; shift ;;
-        --noprogbar|--no-progbar)   export BRAKERRAK_NO_PROGBAR="1"
-                                    export RVDK_NO_PROGBAR="1"
-                                    shift ;;
-        *)                          FORWARD_ARGS+=("$1"); shift ;;
+            FORCE_REBUILD_PG="true"
+            shift ;;
+        --use-pkg-cache)
+            FORCE_REBUILD_PG="false"
+            shift ;;
+        --noprogbar|--no-progbar)
+            export BRAKERRAK_NO_PROGBAR="1"
+            export RVDK_NO_PROGBAR="1"
+            shift ;;
+        --version|-V)
+            print_version
+            exit 0 ;;
+        -h|--help)
+            print_usage
+            exit 0 ;;
+        *)
+            log_fatal "Unknown argument: $1 (run 'brakerrak --help' for usage)" ;;
     esac
 done
 
-APT_STAMP_FILE="/run/brakerrak-apt-$$.stamp"
+# Validate and read --tailscale-authkey-file (enforcing 0600 permissions)
+if [[ -n "$CLI_TS_AUTHKEY_FILE" ]]; then
+    if [[ -n "$CLI_TS_AUTHKEY" ]]; then
+        log_fatal "Cannot specify both --tailscale-authkey and --tailscale-authkey-file."
+    fi
+    if [[ ! -f "$CLI_TS_AUTHKEY_FILE" || ! -r "$CLI_TS_AUTHKEY_FILE" ]]; then
+        log_fatal "Tailscale authkey file not found or unreadable: ${CLI_TS_AUTHKEY_FILE}"
+    fi
+    _ts_mode="$(stat -c '%a' "$CLI_TS_AUTHKEY_FILE" 2>/dev/null || stat -f '%Lp' "$CLI_TS_AUTHKEY_FILE" 2>/dev/null || echo "")"
+    if [[ "$_ts_mode" != "600" && "$_ts_mode" != "400" ]]; then
+        log_fatal "Refusing --tailscale-authkey-file '${CLI_TS_AUTHKEY_FILE}': permissions must be 0600 (found: ${_ts_mode:-unknown}). Run: chmod 0600 '${CLI_TS_AUTHKEY_FILE}'"
+    fi
+    CLI_TS_AUTHKEY="$(tr -d '\r\n' < "$CLI_TS_AUTHKEY_FILE")"
+    if [[ -z "$CLI_TS_AUTHKEY" ]]; then
+        log_fatal "Tailscale authkey file is empty: ${CLI_TS_AUTHKEY_FILE}"
+    fi
+fi
+
+RUNTIME_DIR="$(brak_runtime_dir)"
+export BRAKERRAK_RUNTIME_DIR="$RUNTIME_DIR"
+APT_STAMP_FILE="${RUNTIME_DIR}/apt-$$.stamp"
 export RVDK_APT_STAMP_FILE="$APT_STAMP_FILE"
 if [[ "$APT_UPDATED" != "true" ]]; then
     rm -f "$APT_STAMP_FILE" 2>/dev/null || true
@@ -431,93 +831,10 @@ run_rvdk() {
 }
 
 # ==============================================================================
-# 5. Resolve Silicon Target & Short Tag (RVDK Kit Cache -> Device Tree Fallback)
+# 5. Resolve Silicon Target & Short Tag (Unified `brak_resolve_silicon`)
 # ==============================================================================
-DT_MODEL="Unknown"
-FACTORY_USER=""
-
-if [[ -z "$TARGET_BOARD" && -r /etc/rvdk/kit.env ]]; then
-    # shellcheck disable=SC1091
-    source /etc/rvdk/kit.env
-    if [[ -n "${RVDK_SOC_SLUG:-}" ]]; then
-        DT_MODEL="${RVDK_DT_MODEL:-Unknown}"
-        TARGET_BOARD="$RVDK_SOC_SLUG"
-        TARGET_TAG="${RVDK_BOARD_TAG:-node}"
-        FACTORY_USER="${RVDK_FACTORY_USER:-}"
-    fi
-fi
-
-if [[ "$DT_MODEL" == "Unknown" && -r /proc/device-tree/model ]]; then
-    DT_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Unknown")"
-fi
-
-if [[ -z "$TARGET_BOARD" ]]; then
-    case "$DT_MODEL" in
-        *"Premier P550"*)
-            TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
-        *"Megrez"*)
-            TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="megrez" ;;
-        *"StarPro64"*|*"EIC7700"*)
-            TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
-        *"Unmatched"*|*"FU740"*)
-            TARGET_BOARD="sifive-fu740"; TARGET_TAG="unmatched" ;;
-        *"VisionFive 2 Lite"*|*"VF2 Lite"*|*"JH7110S"*|*"JH-7110S"*)
-            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2lite" ;;
-        *"VisionFive 2"*|*"VF2"*)
-            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
-        *"Mars"*)
-            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="mars" ;;
-        *"OrangePi RV2"*|*"Orange Pi RV2"*)
-            TARGET_BOARD="spacemit-k1"; TARGET_TAG="rv2" ;;
-        *"OrangePi R2S"*|*"Orange Pi R2S"*)
-            TARGET_BOARD="spacemit-k1"; TARGET_TAG="r2s" ;;
-        *"OrangePi RV"*|*"Orange Pi RV"*)
-            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="opirv" ;;
-        *"JH7110"*|*"Star64"*)
-            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
-        *"AIBOX-K3"*|*"Firefly"*K3*)
-            TARGET_BOARD="spacemit-k3"; TARGET_TAG="aiboxk3" ;;
-        *"Jupiter 2"*|*"SpacemiT K3"*|*"K3"*)
-            TARGET_BOARD="spacemit-k3"; TARGET_TAG="jptr2" ;;
-        *"BPI-F3"*)
-            TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpif3" ;;
-        *"BPI-CM6"*)
-            TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpicm6" ;;
-        *"Jupiter"*|*"SpacemiT"*|*"K1"*|*"M1"*|*"Ky X1"*)
-            TARGET_BOARD="spacemit-k1"; TARGET_TAG="jptr1" ;;
-        *"Titan"*|*"DP1000"*)
-            TARGET_BOARD="ultrarisc-dp1000"; TARGET_TAG="titan" ;;
-        *"Atlantis"*|*"Ascalon"*)
-            TARGET_BOARD="tenstorrent-atlantis"; TARGET_TAG="atlantis" ;;
-        *)
-            log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>." ;;
-    esac
-elif [[ -z "${TARGET_TAG:-}" ]]; then
-    case "$TARGET_BOARD" in
-        eswin-eic7700x|sifive-p550)   TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="p550" ;;
-        milkv-megrez)                 TARGET_BOARD="eswin-eic7700x"; TARGET_TAG="megrez" ;;
-        sifive-fu740|sifive-unmatched) TARGET_BOARD="sifive-fu740"; TARGET_TAG="unmatched" ;;
-        starfive-vf2-lite)            TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2lite" ;;
-        milkv-mars)                   TARGET_BOARD="starfive-jh7110"; TARGET_TAG="mars" ;;
-        orangepi-rv)                  TARGET_BOARD="starfive-jh7110"; TARGET_TAG="opirv" ;;
-        starfive-jh7110|starfive-vf2) TARGET_BOARD="starfive-jh7110"; TARGET_TAG="vf2" ;;
-        orangepi-rv2)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="rv2" ;;
-        orangepi-r2s)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="r2s" ;;
-        bananapi-f3)                  TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpif3" ;;
-        bananapi-cm6)                 TARGET_BOARD="spacemit-k1"; TARGET_TAG="bpicm6" ;;
-        spacemit-k1|milkv-jupiter)    TARGET_BOARD="spacemit-k1"; TARGET_TAG="jptr1" ;;
-        firefly-aibox-k3)             TARGET_BOARD="spacemit-k3"; TARGET_TAG="aiboxk3" ;;
-        spacemit-k3|milkv-jupiter2)   TARGET_BOARD="spacemit-k3"; TARGET_TAG="jptr2" ;;
-        ultrarisc-dp1000|milkv-titan) TARGET_BOARD="ultrarisc-dp1000"; TARGET_TAG="titan" ;;
-        tenstorrent-atlantis)         TARGET_TAG="atlantis" ;;
-        *)                            TARGET_TAG="node" ;;
-    esac
-fi
-
-if [[ -z "$FACTORY_USER" ]]; then
-    case "$TARGET_BOARD" in
-        starfive-jh7110) FACTORY_USER="user" ;;
-    esac
+if ! brak_resolve_silicon "$TARGET_BOARD"; then
+    log_fatal "Could not auto-detect silicon target from Device Tree: '${DT_MODEL}'. Pass --target <board>."
 fi
 
 if [[ -f "${LOCAL_ROOT}/scripts/lib-progbar.sh" ]]; then
@@ -535,30 +852,33 @@ log_brak "Silicon Target: ${TARGET_BOARD} (${DT_MODEL}) | Action: ${ACTION}"
 # ==============================================================================
 # 6. CONFIG RESOLUTION (Pass 1 Template Generation, Pass 2 Load & Role Flipping)
 # ==============================================================================
-install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR"
+install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$BRAKER_DIR" "$SNAP_DIR"
 
 # If Pass 1 was run from the factory default user (e.g. 'user' on JH7110) and we are now
-# running as the designated admin user before purging 'user', pre-seed node.env from /home/<factory_user>
-if [[ -n "$FACTORY_USER" && "$REAL_USER" != "$FACTORY_USER" && ! -f "$NODE_ENV" && -f "/home/${FACTORY_USER}/.brakerrak/node.env" ]]; then
-    cp -a "/home/${FACTORY_USER}/.brakerrak/node.env" "$NODE_ENV"
-    sed -i "s/^ADMIN_USER=\"${FACTORY_USER}\"/ADMIN_USER=\"${REAL_USER}\"/" "$NODE_ENV" 2>/dev/null || true
-    chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
-    chmod 0640 "$NODE_ENV"
+# running as the designated admin user before purging 'user', pre-seed /etc/brakerrak/node.env
+# from /home/<factory_user>/.brakerrak/node.env when no node.env exists yet.
+if [[ -z "${BRAKERRAK_NODE_ENV:-}" && -n "$FACTORY_USER" && "$REAL_USER" != "$FACTORY_USER" && ! -f "$NODE_ENV" && -f "/home/${FACTORY_USER}/.brakerrak/node.env" ]]; then
+    install -d -m 0755 -o 0 -g 0 "$(dirname "$NODE_ENV")"
+    sed "s/^ADMIN_USER=\"${FACTORY_USER}\"/ADMIN_USER=\"${REAL_USER}\"/" "/home/${FACTORY_USER}/.brakerrak/node.env" \
+        | brak_atomic_write "$NODE_ENV" 0640 "0:${REAL_GRP}"
     log_ok "Adopted Pass 1 node.env from /home/${FACTORY_USER}/.brakerrak/node.env -> ${NODE_ENV}"
 fi
+
+# Ensure LAB_SUBNET starts unset so an explicit LAB_SUBNET="" in node.env is distinguishable
+# from an absent key (${CLI_SUBNET:-${LAB_SUBNET-10.0.0.0/24}}).
+unset LAB_SUBNET
 
 WRITE_NODE_ENV="false"
 if [[ -f "$NODE_ENV" ]]; then
     FORGE_PASS="2"
     log_brak "Pass 2 Detected: Loading node configuration from ${NODE_ENV}"
-    # shellcheck disable=SC1090
-    source "$NODE_ENV"
-    SAVED_ROLE="$(normalize_role "${NODE_ROLE:-databroker}")"
+    brak_load_kv_env "$NODE_ENV" || log_fatal "Failed to read node configuration: ${NODE_ENV}"
+    SAVED_ROLE="$(brak_normalize_role "${NODE_ROLE:-databroker}")"
     [[ -z "$SAVED_ROLE" ]] && SAVED_ROLE="databroker"
     NODE_ROLE="$SAVED_ROLE"
 
     if [[ -n "$CLI_ROLE" ]]; then
-        REQUESTED_ROLE="$(normalize_role "$CLI_ROLE")"
+        REQUESTED_ROLE="$(brak_normalize_role "$CLI_ROLE")"
         [[ -z "$REQUESTED_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench)"
         if [[ "$REQUESTED_ROLE" != "$SAVED_ROLE" ]]; then
             log_brak "Stateless Persona Flip: ${SAVED_ROLE} -> ${REQUESTED_ROLE}"
@@ -570,10 +890,14 @@ if [[ -f "$NODE_ENV" ]]; then
             fi
         fi
     fi
+
+    if [[ "$CLI_TOPOLOGY_OVERRIDE" == "true" ]]; then
+        WRITE_NODE_ENV="true"
+    fi
 else
     FORGE_PASS="1"
     WRITE_NODE_ENV="true"
-    NODE_ROLE="$(normalize_role "${CLI_ROLE:-databroker}")"
+    NODE_ROLE="$(brak_normalize_role "${CLI_ROLE:-databroker}")"
     [[ -z "$NODE_ROLE" ]] && log_fatal "Unknown role '${CLI_ROLE}' (expected: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench)"
 fi
 
@@ -583,9 +907,8 @@ ROLE_ENV_FILE="${LOCAL_ROOT}/roles/${NODE_ROLE}.env"
 source "$ROLE_ENV_FILE"
 
 TARGET_HOSTNAME="${CLI_HOSTNAME:-${TARGET_HOSTNAME:-${NODE_ROLE}-${TARGET_TAG}}}"
-[[ -n "$CLI_HOSTNAME" && "$FORGE_PASS" == "2" ]] && WRITE_NODE_ENV="true"
 ADMIN_USER="${CLI_USER:-${ADMIN_USER:-$REAL_USER}}"
-LAB_SUBNET="${CLI_SUBNET:-${LAB_SUBNET:-10.0.10.0/24}}"
+LAB_SUBNET="${CLI_SUBNET:-${LAB_SUBNET-10.0.0.0/24}}"
 NVME_DEV="${CLI_NVME_DEV:-${NVME_DEV:-/dev/nvme0n1}}"
 MOUNT_POINT="${CLI_MOUNT_POINT:-${MOUNT_POINT:-/mnt/nvme_pgdata}}"
 NFS_MOUNT_POINT="${CLI_NFS_MOUNT:-${NFS_MOUNT_POINT:-/mnt/nfs_vault}}"
@@ -602,10 +925,16 @@ MQTT_PORT="${MQTT_PORT:-1883}"
 ENABLE_NFS_SERVER="${CLI_ENABLE_NFS:-${ENABLE_NFS_SERVER:-false}}"
 NFS_BACKEND="${CLI_NFS_BACKEND:-${NFS_BACKEND:-ganesha}}"
 PIGEON_ROLE="${PIGEON_ROLE:-pigeoneer}"
-RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE:-$(role_to_rvdk_tune "$NODE_ROLE")}"
+RVDK_TUNE_PROFILE="${CLI_DEEPTUNE_TUNE:-${RVDK_TUNE_PROFILE:-$(brak_role_to_rvdk_tune "$NODE_ROLE")}}"
 case "$(tr '[:upper:]' '[:lower:]' <<< "$RVDK_TUNE_PROFILE")" in
     ai|ml|edge-ai|edge-ml) RVDK_TUNE_PROFILE="ai" ;;
-    *)                     RVDK_TUNE_PROFILE="data" ;;
+    data)                  RVDK_TUNE_PROFILE="data" ;;
+    *)
+        if [[ -n "$CLI_DEEPTUNE_TUNE" ]]; then
+            log_fatal "Unknown --tune profile '${CLI_DEEPTUNE_TUNE}' (expected: data | ai)"
+        fi
+        RVDK_TUNE_PROFILE="data"
+        ;;
 esac
 SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT:-false}"
 
@@ -619,57 +948,20 @@ case "$NFS_BACKEND" in
         ;;
 esac
 
+# Upgrade legacy node.env schemas atomically if required keys are missing or use deprecated 'ml'
+if [[ "$WRITE_NODE_ENV" != "true" && -f "$NODE_ENV" ]]; then
+    if ! grep -q '^NFS_MOUNT_POINT=' "$NODE_ENV" 2>/dev/null \
+       || ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null \
+       || ! grep -q '^ENABLE_POSTGRES=' "$NODE_ENV" 2>/dev/null \
+       || ! grep -q '^RVDK_TUNE_PROFILE=' "$NODE_ENV" 2>/dev/null \
+       || grep -qE '^RVDK_TUNE_PROFILE=["'\'']?ml["'\'']?$' "$NODE_ENV" 2>/dev/null; then
+        WRITE_NODE_ENV="true"
+    fi
+fi
+
 if [[ "$WRITE_NODE_ENV" == "true" ]]; then
-    cat <<EOF > "$NODE_ENV"
-# ==============================================================================
-# DREW-V Labs // BrakerRak User Node Config (~/.brakerrak/node.env)
-# Role Personas: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench
-# ==============================================================================
-NODE_ROLE="${NODE_ROLE}"
-TARGET_HOSTNAME="${TARGET_HOSTNAME}"
-ADMIN_USER="${ADMIN_USER}"
-LAB_SUBNET="${LAB_SUBNET}"
-RVDK_TUNE_PROFILE="${RVDK_TUNE_PROFILE}"
-PIGEON_ROLE="${PIGEON_ROLE}"
-
-# Hot NVMe Storage (Dual-LVM carves NFS_MOUNT_POINT when ENABLE_NFS_SERVER=true & WITH_RAID=false)
-NVME_DEV="${NVME_DEV}"
-MOUNT_POINT="${MOUNT_POINT}"
-NFS_MOUNT_POINT="${NFS_MOUNT_POINT}"
-
-# Optional USB/SATA Btrfs RAID 10 Arrays (Default: false / empty array)
-WITH_RAID="${WITH_RAID}"
-RAID_ARRAYS_JSON='${RAID_ARRAYS_JSON}'
-
-# Role Services (Toggle via role flip or explicit overrides)
-ENABLE_POSTGRES="${ENABLE_POSTGRES}"
-ENABLE_MQTT_BROKER="${ENABLE_MQTT_BROKER}"
-MQTT_PORT="${MQTT_PORT}"
-ENABLE_NFS_SERVER="${ENABLE_NFS_SERVER}"
-# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto
-NFS_BACKEND="${NFS_BACKEND}"
-
-# Opt-In Community RISC-V Telemetry Commons
-SHARE_ORT_SNAPSHOT="${SHARE_ORT_SNAPSHOT}"
-EOF
-    chown "${REAL_USER}:${REAL_GRP}" "$NODE_ENV"
-    chmod 0640 "$NODE_ENV"
+    brak_write_node_env "$NODE_ENV" "0:${REAL_GRP}" 0640
     log_ok "Persisted node configuration (${NODE_ROLE} -> ${TARGET_HOSTNAME}): ${NODE_ENV}"
-else
-    if ! grep -q '^NFS_MOUNT_POINT=' "$NODE_ENV" 2>/dev/null; then
-        printf 'NFS_MOUNT_POINT="%s"\n' "$NFS_MOUNT_POINT" >> "$NODE_ENV"
-    fi
-    if ! grep -q '^NFS_BACKEND=' "$NODE_ENV" 2>/dev/null; then
-        printf '\n# NFSv4 Server Backend: ganesha (default) | kernel (nfs-kernel-server override) | auto\nNFS_BACKEND="%s"\n' "$NFS_BACKEND" >> "$NODE_ENV"
-    fi
-    if ! grep -q '^ENABLE_POSTGRES=' "$NODE_ENV" 2>/dev/null; then
-        printf 'ENABLE_POSTGRES="%s"\n' "$ENABLE_POSTGRES" >> "$NODE_ENV"
-    fi
-    if ! grep -q '^RVDK_TUNE_PROFILE=' "$NODE_ENV" 2>/dev/null; then
-        printf 'RVDK_TUNE_PROFILE="%s"\n' "$RVDK_TUNE_PROFILE" >> "$NODE_ENV"
-    elif grep -qE '^RVDK_TUNE_PROFILE=["'\'']?ml["'\'']?$' "$NODE_ENV" 2>/dev/null; then
-        sed -i 's/^RVDK_TUNE_PROFILE=.*/RVDK_TUNE_PROFILE="ai"/' "$NODE_ENV" 2>/dev/null || true
-    fi
 fi
 
 export BRAKERRAK_NODE_ENV="$NODE_ENV"
@@ -718,7 +1010,8 @@ run_rvdk mods/nvme-4kn "${NVME_FLAGS[@]}"
 if [[ "$ENABLE_POSTGRES" == "true" ]]; then
     brak_prog 45 "Stage 3/7: PostgreSQL 18.6 (io_uring + Sv39 HugePages)" 0 "Launching rvdk postgresql..."
     log_step "3. RVDK PostgreSQL 18.6 Convergence (io_uring + Sv39 HugePages)"
-    PG_FLAGS=(--data-mount "$MOUNT_POINT" --subnet "$LAB_SUBNET")
+    PG_FLAGS=(--data-mount "$MOUNT_POINT")
+    [[ -n "$LAB_SUBNET" ]] && PG_FLAGS+=(--subnet "$LAB_SUBNET")
     [[ "$FORCE_REBUILD_PG" == "true" ]] && PG_FLAGS+=(--force-build)
     run_rvdk postgresql "${PG_FLAGS[@]}"
 else
@@ -727,6 +1020,16 @@ else
     if systemctl is-active --quiet postgresql.service 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
         systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
         log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE} workloads"
+    fi
+    _hp_reclaimed="false"
+    if [[ -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf ]]; then
+        rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
+        _hp_reclaimed="true"
+    fi
+    _cur_hp="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ "$_hp_reclaimed" == "true" ]] || { [[ "$_cur_hp" =~ ^[0-9]+$ ]] && (( _cur_hp > 0 )); }; then
+        sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
+        log_ok "Reclaimed static 2MB Sv39 HugePages (removed 90-rvdk-pg18-hugepages.conf & set vm.nr_hugepages=0)"
     fi
 fi
 
@@ -756,10 +1059,16 @@ else
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
-    brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})" 0 "Launching rvdk mods/nfs-vault..."
-    log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET})"
+    brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET:-auto-subnet})" 0 "Launching rvdk mods/nfs-vault..."
+    log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET:-auto-subnet})"
     rm -f /etc/exports.d/brakerrak-vaults.exports 2>/dev/null || true
-    run_rvdk mods/nfs-vault --subnet "$LAB_SUBNET" --data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND"
+    NFS_FLAGS=(--data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND")
+    if [[ -n "$LAB_SUBNET" ]]; then
+        NFS_FLAGS+=(--subnet "$LAB_SUBNET")
+    else
+        NFS_FLAGS+=(--auto-subnet)
+    fi
+    run_rvdk mods/nfs-vault "${NFS_FLAGS[@]}"
 else
     brak_prog 90 "Stage 5B/7: NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)" 100 "mods/nfs-vault skipped"
     log_step "5B. NFSv4 Vault Server Skipped (ENABLE_NFS_SERVER=false)"
@@ -787,6 +1096,7 @@ if [[ "$CLI_WITH_DEEPTUNE" == "true" ]]; then
     RESOLVED_TUNE="${CLI_DEEPTUNE_TUNE:-$RVDK_TUNE_PROFILE}"
     case "$(tr '[:upper:]' '[:lower:]' <<< "$RESOLVED_TUNE")" in
         ai|ml|edge-ai|edge-ml) RESOLVED_TUNE="ai" ;;
+        *)                     RESOLVED_TUNE="data" ;;
     esac
     brak_prog 93 "Stage 5D: Silicon & OS Extreme DeepTune (--tune ${RESOLVED_TUNE})" 0 "Launching rvdk deeptune --tune ${RESOLVED_TUNE}..."
     log_step "5D. RVDK Silicon & OS Extreme DeepTune (Role: ${NODE_ROLE} -> --tune ${RESOLVED_TUNE})"
@@ -885,10 +1195,10 @@ printf "  • PG 18 Async I/O    : io_method = %s\n" "$PG_IO_METHOD"
 printf "  • PG Shared Buffers  : %s (HugePages in use: %s / %s)\n" "$PG_SHBUF" "$HP_USED" "$HP_TOTAL"
 printf "  • Mosquitto MQTT     : %s (Port %s)\n" "$MQTT_STATE" "$MQTT_PORT"
 if [[ -n "$TS_SUMMARY" ]]; then
-    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n" "$NFS_STATE" "$LAB_SUBNET"
+    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n" "$NFS_STATE" "${LAB_SUBNET:-auto}"
     printf "  • Tailscale Mesh VPN : %s\n\n" "$TS_SUMMARY"
 else
-    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "$LAB_SUBNET"
+    printf "  • NFSv4 Vault Server : %s (Subnet %s)\n\n" "$NFS_STATE" "${LAB_SUBNET:-auto}"
 fi
 
 # ==============================================================================
@@ -902,8 +1212,6 @@ if [[ -n "$FACTORY_USER" && "$FACTORY_USER" != "$ADMIN_USER" ]]; then
             "$RVDK_BIN" utils/purge-user.sh "$FACTORY_USER" \
                 --to-user "$ADMIN_USER" \
                 --extra-dotdir .brakerrak \
-                --relink-bin /usr/local/bin/brakerrak:.brakerrak/engine/forge.sh \
-                --relink-bin /usr/bin/brakerrak:.brakerrak/engine/forge.sh \
                 --mount-point "$MOUNT_POINT" \
                 --nfs-mount "$NFS_MOUNT_POINT"
             echo ""

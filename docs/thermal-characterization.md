@@ -1,6 +1,6 @@
 # BrakerRak Thermal Characterization Baseline
 
-- **Campaign ID:** `drewvlabs-brakerrak-8fan-nafc1-characterization`
+- **Campaign ID:** `brakerrak-8fan-nafc1-characterization`
 - **Timestamp (UTC):** `2026-11-03T22:15:34Z`
 - **Ambient Baseline:** `21.0°C`
 - **Cooling Fabric:** Noctua `NA-FC1` PWM Controller driving `8x 40mm` fans (`5x` on `U02` 1U vented shelf spacer + `3x` inside `U03` SilverStone `SST-RM100` 1U chassis)

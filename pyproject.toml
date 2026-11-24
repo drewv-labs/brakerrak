@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "brakerrak"
+version = "0.1.0"
+description = "BrakerRak bare-metal RISC-V ORT provenance engine and PostgreSQL 18 io_uring benchmark analytics"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyarrow>=18.0.0",
+]
+
+[project.scripts]
+brakerrak-ort = "brakerrak_ort.cli:main"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11.0",
+    "pytest>=8.3.0",
+    "ruff>=0.6.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["brakerrak_ort"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+namespace_packages = true
+explicit_package_bases = true
+files = ["brakerrak_ort", "benchmarks", "tools", "tests"]
+# Avoid mypy duplicate module basename errors across hyphenated soc-drawer/*/ort-snapshot.py shims
+# during directory traversal; explicit file invocations still type-check every shim.
+exclude = [
+    "^soc-drawer/(starfive-jh7110|generic-riscv64)/ort-snapshot\\.py$",
+]
+
+[[tool.mypy.overrides]]
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

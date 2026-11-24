@@ -1,0 +1,40 @@
+name: BrakerRak CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Hygiene, Assets, ShellCheck, Ruff, Mypy & Pytest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version
+
+      - name: Install uv and Python 3.12
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: Sync dependencies (frozen)
+        run: uv sync --frozen --dev
+
+      - name: Run BrakerRak CI gate
+        run: uv run python tools/brakerrak_ci.py --check

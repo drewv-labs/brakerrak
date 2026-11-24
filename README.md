@@ -31,18 +31,16 @@ Operating as a versatile userspace NFS system, **NFS-Ganesha** is the BrakerRak 
 > Current **Hardware Accelerator Focus Anchors** represent phase 1 development anchors while project matures to ensure performance observations are captured accurately across silicon in a controlled manner with ongoing hardware accelerator support expansion to come.
 
 **[Hailo AI Accelerators](https://hailo.ai/products/ai-accelerators/)**<br>
-The **Hailo-8** (26 TOPS) and **Hailo-8L** (13 TOPS) M.2 NVMe NPU modules provide astounding power per watt making them word class accelerators for int8 or int4 operations. The *Hailo-10H* is rated at 40 TOPS int4 (20 TOPS int8) with 8gb onboard memory. As such, the *Hailo* *8* and *10* series modules are the NPU Accelerator Focus Anchor.   
+The **Hailo-8** (26 TOPS) and **Hailo-8L** (13 TOPS) M.2 NVMe NPU modules provide astounding power per watt making them world-class accelerators for int8 or int4 operations. The *Hailo-10H* is rated at 40 TOPS int4 (20 TOPS int8) with 8gb onboard memory. As such, the *Hailo* *8* and *10* series modules are the NPU Accelerator Focus Anchor.   
 
 **[Tenstorrent Blackhole p150 Accelerators](https://tenstorrent.com/hardware/cards)**<br>
-Powered by 120 Tensix RISC-V compute tiles (600 RV32 baby harts driving 120 AI coprocessors) plus 16 coherent SiFive X280 RV64 harts & 32GB GDDR6 onboard memory, **Tenstorrent's Blackhole p150** card will serve as the PCIe GPU Accelerater Focus Anchor. Note: *p150a* (active cooled) units used in development.
+Powered by 120 Tensix RISC-V compute tiles (600 RV32 baby harts driving 120 AI coprocessors) plus 16 coherent SiFive X280 RV64 harts & 32GB GDDR6 onboard memory, **Tenstorrent's Blackhole p150** card will serve as the PCIe GPU Accelerator Focus Anchor. Note: *p150a* (active cooled) units used in development.
 
 ---
 
 ## Dual-Axis Architecture: Roles x Targets
 
-</div>
-
-### 1. Role Personas (`roles/` & `node.env`)
+### 1. Role Personas (`roles/` & `/etc/brakerrak/node.env`)
 
 Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, Edge NPU inference, isolated microarchitectural benchmarking, or hybrid development via `brakerrak --role <persona> --deeptune`:
 
@@ -92,7 +90,7 @@ Provides the foundational RISC-V idempotent day-0 media flashers, bare-metal boo
 
 Provides a configurable Go-driven **Continuous Telemetric Documentation (CTD)** mesh, distributed systems orchestration plane, **Runner** dispatch, analytics layer, AI powered diagnostics & support, and an MCP service that can be plugged into modern agent harnesses. 
 
-> The lightweight high-throughput **CTD** mesh provides passive hardware-bound wide event observability that captures deep system measurements without interferring with latency sensitive experiments and delivers document blobs to the unified *PSQL-powered* **CTD Ledger** over *MQTT network*. Collects and streams bare-metal metric readings from each node with minimal observer effects creating clean, reliabale systems information that's immediately ready for insight mining or deep systems analysis. 
+> The lightweight high-throughput **CTD** mesh provides passive hardware-bound wide event observability that captures deep system measurements without interfering with latency sensitive experiments and delivers document blobs to the unified *PSQL-powered* **CTD Ledger** over *MQTT network*. Collects and streams bare-metal metric readings from each node with minimal observer effects creating clean, reliable systems information that's immediately ready for insight mining or deep systems analysis. 
 
 > **CarrierPigeons** also provides a distributed systems orchestration platform to reduce friction of managing a R&D cluster so we can spend more time on the science & engineering. 
 
@@ -108,11 +106,11 @@ Provides a configurable Go-driven **Continuous Telemetric Documentation (CTD)** 
 
 ## Ask your doctor if BrakerRak is right for you!
 
-While BrakerRak provides the complete package, devs may only be interested in specific aspects to integrate into their worflows and applications.
+While BrakerRak provides the complete package, devs may only be interested in specific aspects to integrate into their workflows and applications.
 
-* **Use [RVDK](https://github.com/drewv-labs/brakerrak) standalone** if you want unopinionated building blocks—plugging Day-0 OS de-bloating, safe vendor DTB/U-Boot upgrades, `deeptune` kernel tuning, `4Kn` NVMe formatting, or prebuilt `io_uring` PostgreSQL 18.6 directly into your own scripts, Ansible playbooks, or CI pipelines without adopting an external stack.
+* **Use [RVDK](https://github.com/drewv-labs/riscv-data-kit) standalone** if you want unopinionated building blocks—plugging Day-0 OS de-bloating, safe vendor DTB/U-Boot upgrades, `deeptune` kernel tuning, `4Kn` NVMe formatting, or prebuilt `io_uring` PostgreSQL 18.6 directly into your own scripts, Ansible playbooks, or CI pipelines without adopting an external stack.
 
-* **Use [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) standalone** if you want a lightweight-but-mighty Go-powered distributed telemetry, orchestration, execution, and analytics suite with baked in AI Agent + MCP power. Note: **CarrierPigeons** is designed to run on and support heterogenous architectures, **CarrierPigeons is not RISC-V exclusive** like **RVDK** and **BrakerRak** are designed to be.
+* **Use [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons) standalone** if you want a lightweight-but-mighty Go-powered distributed telemetry, orchestration, execution, and analytics suite with baked in AI Agent + MCP power. Note: **CarrierPigeons** is designed to run on and support heterogeneous architectures, **CarrierPigeons is not RISC-V exclusive** like **RVDK** and **BrakerRak** are designed to be.
 
 * **Use [`BrakerRak`](https://github.com/drewv-labs/brakerrak) (`brakerrak`)** if you want the full turnkey bare-metal RISC-V data systems, telemetry, & edge AI R&D engine combining the might of **RVDK** & **CarrierPigeons**. Note: **BrakerRak**, while designed to be a R&D platform, can easily be used to converge production ready machines deterministically & idempotently making it a great tool for provisioning reliable & performant RISC-V data brokers & AI systems into production.
 
@@ -132,7 +130,7 @@ While BrakerRak provides the complete package, devs may only be interested in sp
 
 ### 1. Remote One-Liner Convergence
 
-**BrakerRak's** root `forge.sh` reads `/etc/rvdk/kit.env` (or probes `/proc/device-tree/model`), installs/updates `/usr/local/bin/brakerrak` and `/usr/local/bin/rvdk`, generates `~/.brakerrak/node.env` on Pass 1, and orchestrates the full **RVDK** convergence pipeline (formatting secondary NVMe to `4Kn` with `vg_braker` LVM, converging role-gated PostgreSQL 18.6 / MQTT / NFSv4 services, and applying workload-matched `rvdk deeptune`):
+**BrakerRak's** root `forge.sh` reads `/etc/rvdk/kit.env` (or probes `/proc/device-tree/model`), installs/updates the shared engine at `/usr/local/share/brakerrak/engine`, links `/usr/local/bin/brakerrak` and `/usr/local/bin/rvdk`, generates `/etc/brakerrak/node.env` on Pass 1, and orchestrates the full **RVDK** convergence pipeline (formatting secondary NVMe to `4Kn` with `vg_braker` LVM, converging role-gated PostgreSQL 18.6 / MQTT / NFSv4 services, and applying workload-matched `rvdk deeptune`):
 
 ```bash
 # Install the brakerrak CLI & engine without running the convergence forge
@@ -152,7 +150,7 @@ curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role devbench --de
 Once bootstrapped, use `brakerrak` CLI to flip node personas statelessly (e.g., staging a `DevBench-TitanP150A` / `BabbageBench-TitanP150A` bench and flipping it into `BabbageBox-TitanP150A` production), manage live Dual-LVM storage elasticity, apply role-mapped **RVDK DeepTune** profiles, capture signed ORT/CTD hardware snapshots, verify idempotency, run showdowns, or roll back to factory Day-0 state:
 
 ```bash
-# Re-converge node from ~/.brakerrak/node.env (Pass 2) or flip node persona on the fly
+# Re-converge node from /etc/brakerrak/node.env (Pass 2) or flip node persona on the fly
 brakerrak
 brakerrak --role devbench --deeptune
 brakerrak --role babbagebench --deeptune
@@ -177,9 +175,11 @@ brakerrak ort --stage day1-post-forge
 # Execute the full 5-stage Day-0 -> Day-1 convergence & idempotency verification harness
 brakerrak verify --use-pkg-cache
 
-# Seed the 50M-row torture table & run the cold-cache PG 18.6 sync vs worker vs io_uring showdown
-~/.brakerrak/engine/benchmarks/seed-io-torture.sh
-~/.brakerrak/engine/benchmarks/run-iouring-showdown.sh
+# Seed the 50M-row torture table, run the cold-cache PG 18.6 sync vs worker vs io_uring showdown, & aggregate PyArrow CTD outputs
+# (Wraps /usr/local/share/brakerrak/engine/benchmarks/seed-io-torture.sh, run-iouring-showdown.sh, & analyze_showdown.py)
+brakerrak bench seed
+brakerrak bench showdown
+brakerrak bench analyze ~/.brakerrak/snapshots/benchmarks/<run_id>
 
 # Roll back NVMe to factory 512e (512B) LBA sectors and scrub PG18/service state (preserving .deb cache)
 brakerrak reset --confirm-destroy --keep-pg-cache
@@ -192,19 +192,19 @@ brakerrak update
 
 <div align="center">
 
-## Declarative Node Configuration (`~/.brakerrak/node.env`)
+## Declarative Node Configuration (`/etc/brakerrak/node.env`)
 
 </div>
 
-On **Pass 1**, `forge.sh` converges the core OS, `4Kn` NVMe (`vg_braker/lv_pgdata` + `vg_braker/lv_nfsvault` on single-NVMe NFS builds), and role-selected services using safe single-NVMe defaults (`WITH_RAID="false"`) and writes `~/.brakerrak/node.env`.
+On **Pass 1**, `forge.sh` converges the core OS, `4Kn` NVMe (`vg_braker/lv_pgdata` + `vg_braker/lv_nfsvault` on single-NVMe NFS builds), and role-selected services using safe single-NVMe defaults (`WITH_RAID="false"`) and writes `/etc/brakerrak/node.env` (transparently migrating any legacy `~/.brakerrak/node.env`; override with `BRAKERRAK_NODE_ENV`).
 
-To attach external USB/SATA Btrfs RAID 10 vaults or customize network exports for **Pass 2**, populate `RAID_ARRAYS_JSON` in `~/.brakerrak/node.env` and re-run `sudo brakerrak`:
+To attach external USB/SATA Btrfs RAID 10 vaults or customize network exports for **Pass 2**, populate `RAID_ARRAYS_JSON` in `/etc/brakerrak/node.env` and re-run `sudo brakerrak`:
 
 ```bash
 NODE_ROLE="databroker"
 TARGET_HOSTNAME="brakerbox-p550"
-ADMIN_USER="drew"
-LAB_SUBNET="10.0.10.0/24"
+ADMIN_USER="ubuntu"
+LAB_SUBNET="10.0.0.0/24"
 RVDK_TUNE_PROFILE="data"
 
 NVME_DEV="/dev/nvme0n1"
@@ -225,7 +225,7 @@ RAID_ARRAYS_JSON='[
     "max_bytes": 13000000000000,
     "tablespace": "ts_warm_vault",
     "nfs_fsid": 10,
-    "nfs_dirs": ["models", "sigmf", "fits", "pg_backups", "ctd-vault"]
+    "nfs_dirs": ["models", "datasets", "benchmarks", "pg_backups", "ctd-vault"]
   }
 ]'
 

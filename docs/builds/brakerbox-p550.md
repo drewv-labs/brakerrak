@@ -31,12 +31,12 @@ The BrakerBox-P550 also offers support for `custom RAID storage tiers`, `Mosquit
 | **Boot / Root OS** | 128GB Soldered eMMC (`mmcblk0`) | Ubuntu 24.04 LTS (`multi-user.target` headless strip) |
 | **Tier 0 (Hot NVMe)** | 2TB `WD_BLACK SN850X` (`nvme0n1`) + `be quiet! MC1` Heatsink | PCIe Gen3 x4 (`8.0 GT/s`), formatted to native `4096B` (`4Kn`) LBA |
 | **PCIe Riser Assembly** | StarTech `PEX4M2E1` + Folded Twin-Axial PCIe x4 Ribbon Riser | Anchored to chassis floor via ATX standoff + elastomer isolation bumpers |
-| **Tier 1 (Warm Vault)** | `BigRed-WDR48` (`U08`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (`mdadm` RAID 10, `/mnt/bigred_wdr48`) |
-| **Tier 2 (Cold Archive)** | `LilBlu-WDB24` (`U09`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (`mdadm` RAID 10, `/mnt/lilblu_wdb24`) |
+| **Tier 1 (Warm Vault)** | `WarmVault` (`U08`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/warm_vault`) |
+| **Tier 2 (Cold Archive)** | `ColdVault` (`U09`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/cold_vault`) |
 | **Chassis & Power** | SilverStone `SST-RM100` (1U) + PicoPSU / Internal 12V Brick | 3x 40mm chassis fans controlled via Noctua NA-FC1 |
 
 ### USB Root Hub Topology Note
-All external USB 3.2 Gen 1 ports on the HF106 carrier board sit behind a single **Synopsys DesignWare USB 3.0 Root Hub (`5000M` / ~450 MB/s shared bandwidth)**. High-concurrency transactional workloads (`PGDATA` and WAL) are strictly pinned to the PCIe Gen3 x4 `WD_BLACK SN850X` (`nvme0n1`), while `BigRed-WDR48` and `LilBlu-WDB24` serve warm/cold tablespaces and bulk archives over the rear teal USB 3.2 Gen 1 ports.
+All external USB 3.2 Gen 1 ports on the HF106 carrier board sit behind a single **Synopsys DesignWare USB 3.0 Root Hub (`5000M` / ~450 MB/s shared bandwidth)**. High-concurrency transactional workloads (`PGDATA` and WAL) are strictly pinned to the PCIe Gen3 x4 `WD_BLACK SN850X` (`nvme0n1`), while `WarmVault` and `ColdVault` serve warm/cold tablespaces and bulk archives over the rear teal USB 3.2 Gen 1 ports.
 
 ---
 
@@ -48,7 +48,7 @@ Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sec
 ### B. LVM Snapshot Reserve
 `forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB) of unallocated extents. This allows instant, zero-downtime LVM copy-on-write (CoW) snapshots to reset database state between deterministic benchmark runs.
 
-### C. PostgreSQL 18 Drop-In Configuration (`99-brakerbox-p550.conf`)
+### C. PostgreSQL 18 Drop-In Configuration (`99-rvdk-sifive-p550.conf`)
 * **Async I/O Engine:** `io_method = io_uring` (auto-verified against `liburing` linkage and `kernel.io_uring_disabled = 0`)
 * **Memory Allocation (32GB LPDDR5):** `shared_buffers = 8GB`, `effective_cache_size = 24GB`, `work_mem = 64MB`, `maintenance_work_mem = 2GB`, `huge_pages = try`
 * **RVA20 4-Hart OoO Execution:** `jit = off` (avoids LLVM JIT compilation overhead on scalar RVA20), `max_worker_processes = 4`, `max_parallel_workers = 4`, `max_parallel_workers_per_gather = 2`
@@ -85,13 +85,13 @@ Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-form
 Cheatsheet
 ~~~bash
 # For BrakerBench-P550 Test Bench (NVMe-only)
-curl -fsSL https://brakerrak.dev/forge.sh | sudo bash
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 
 # Full BrakerBox-P550 build (PG18 + Mosquitto MQTT + NFSv4)
 curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker
 ~~~
 
-Then edit `~/.brakerrak/node.env` to setup custom config and rerun to provision and validate the build...  
+Then edit `/etc/brakerrak/node.env` to setup custom config and rerun to provision and validate the build...  
 ~~~bash
 sudo brakerrak verify
 ~~~
@@ -108,55 +108,56 @@ sudo brakerrak verify
 
 ---
 
-## Lab `.brakerrak/node.env` Config for Build Reproducibility
+## Reference `/etc/brakerrak/node.env` Config for Build Reproducibility
 
-~~~md
+~~~bash
 # ==============================================================================
-# DREW-V Labs // BrakerBox-P550 Node Config (~/.brakerrak/node.env)
+# DREW-V Labs // BrakerBox-P550 Node Config (/etc/brakerrak/node.env)
 # ==============================================================================
 NODE_ROLE="databroker"
 TARGET_HOSTNAME="brakerbox-p550"
-ADMIN_USER="drew"
+ADMIN_USER="ubuntu"
 LAB_SUBNET=""
 
 # Hot NVMe Storage
 NVME_DEV="/dev/nvme0n1"
 MOUNT_POINT="/mnt/nvme_pgdata"
+NFS_MOUNT_POINT="/mnt/nfs_vault"
 
-# Optional USB/SATA RAID 10 Arrays (Default: false / empty array)
+# Optional USB/SATA Btrfs RAID 10 Arrays (Default: false / empty array)
 WITH_RAID="true"
 RAID_ARRAYS_JSON='[
   {
-    "name": "BigRed",
-    "id": "bigred",
+    "name": "WarmVault",
+    "id": "warmvault",
     "type": "warm",
-    "label": "BIGRED_VAULT",
-    "mount": "/mnt/bigred_wdr48",
-    "md_dev": "/dev/md/bigred",
+    "label": "WARM_VAULT",
+    "mount": "/mnt/warm_vault",
+    "md_dev": "/dev/md/warmvault",
     "disks": 4,
     "min_bytes": 11000000000000,
     "max_bytes": 13000000000000,
-    "tablespace": "ts_bigred_warm",
+    "tablespace": "ts_warm_vault",
     "nfs_fsid": 10,
-    "nfs_dirs": ["models/hailo8", "models/hailo8l", "sigmf", "fits", "pg_backups", "ctd-vault"]
+    "nfs_dirs": ["models/hailo8", "models/hailo8l", "datasets", "benchmarks", "pg_backups", "ctd-vault"]
   },
   {
-    "name": "LilBlu",
-    "id": "lilblu",
+    "name": "ColdVault",
+    "id": "coldvault",
     "type": "cold",
-    "label": "LILBLU_ARCH",
-    "mount": "/mnt/lilblu_wdb24",
-    "md_dev": "/dev/md/lilblu",
+    "label": "COLD_VAULT",
+    "mount": "/mnt/cold_vault",
+    "md_dev": "/dev/md/coldvault",
     "disks": 4,
     "min_bytes": 5500000000000,
     "max_bytes": 6500000000000,
-    "tablespace": "ts_lilblu_cold",
+    "tablespace": "ts_cold_vault",
     "nfs_fsid": 20,
     "nfs_dirs": ["archives"]
   }
 ]'
 
-# DataBroker Network Services (When ENABLE_NFS_SERVER=true and WITH_RAID=false, exports ${MOUNT_POINT}/nfs_vault)
+# DataBroker Network Services (When ENABLE_NFS_SERVER=true and WITH_RAID=false, Dual-LVM carves lv_nfsvault and exports ${NFS_MOUNT_POINT})
 ENABLE_MQTT_BROKER="true"
 MQTT_PORT="1883"
 ENABLE_NFS_SERVER="true"

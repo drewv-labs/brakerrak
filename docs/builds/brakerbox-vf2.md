@@ -4,7 +4,7 @@
 
 *Optimized StarFive VisionFive 2 (JH7110) Data Bench Build*
 
- <img src="./assets/starfive-visionfive2-jh7110-server-layout.png" alt="BrakerBench-VF2" width="600"> 
+ <img src="../assets/starfive-visionfive2-jh7110-server-layout.png" alt="BrakerBench-VF2" width="600"> 
 
 </div>
 
@@ -12,7 +12,7 @@
 
 ## 1. Architectural Overview
 
-DREW-V Labs presents this `brakerbench-vf2` build as a 1U rack-shelf RISC-V relational benchmark testbed and edge data broker built around the **[StarFive VisionFive 2](https://www.starfivetech.com/en/index.php?s=hardware&c=show&id=14)** (`JH7110`) platform paired with an M.2 NVMe SSD (tested w/ `WD_BLACK SN750` 2TB). Built on the latest PostgreSQL 18.6 `io_uring`, it serves as the canonical **2-Wide In-Order (`InO`)** baseline against the **3-Wide Out-of-Order (`OoO`)** [`BrakerBox-P550`](../eswin-eic7700x/README.md).
+DREW-V Labs presents this `brakerbench-vf2` build as a 1U rack-shelf RISC-V relational benchmark testbed and edge data broker built around the **[StarFive VisionFive 2](https://www.starfivetech.com/en/index.php?s=hardware&c=show&id=14)** (`JH7110`) platform paired with an M.2 NVMe SSD (tested w/ `WD_BLACK SN750` 2TB). Built on the latest PostgreSQL 18.6 `io_uring`, it serves as the canonical **2-Wide In-Order (`InO`)** baseline against the **3-Wide Out-of-Order (`OoO`)** [`BrakerBox-P550`](./brakerbox-p550.md).
 
 By switching to `io_uring`, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead—critical on Dual-Issue In-Order `SiFive U74` harts where syscall traps and `io worker` IPC stalls cannot be hidden behind out-of-order speculative execution.
 
@@ -49,7 +49,7 @@ Factory `WD_BLACK` NVMe drives ship in emulated `512e` (`512`-byte logical secto
 ### B. LVM Snapshot Reserve
 `forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB) of unallocated extents. This allows instant, zero-downtime LVM copy-on-write (CoW) snapshots to reset database state between deterministic benchmark runs.
 
-### C. PostgreSQL 18 Drop-In Configuration (`99-brakerbench-vf2.conf`)
+### C. PostgreSQL 18 Drop-In Configuration (`99-rvdk-starfive-jh7110.conf`)
 * **Async I/O Engine:** `io_method = io_uring` (auto-verified against `liburing` linkage and `kernel.io_uring_disabled = 0`)
 * **Memory Allocation (8GB LPDDR4):** `shared_buffers = 2GB` (pinned in `1,152 × 2MB Sv39` HugePages), `effective_cache_size = 6GB`, `work_mem = 32MB`, `maintenance_work_mem = 512MB`, `huge_pages = try`
 * **RVA20 4-Hart In-Order Execution:** `jit = off` (avoids LLVM JIT compilation overhead on scalar 2-wide In-Order `U74`), `max_worker_processes = 8`, `max_parallel_workers = 4`, `max_parallel_workers_per_gather = 2`
@@ -85,13 +85,13 @@ Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-form
 Cheatsheet
 ~~~bash
 # For BrakerBench-VF2 Test Bench (NVMe-only)
-curl -fsSL https://brakerrak.dev/forge.sh | sudo bash
+curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databench
 
 # Full BrakerBox-VF2 build (PG18 + Mosquitto MQTT + NFSv4)
 curl -fsSL https://brakerrak.dev/forge.sh | sudo bash -s -- --role databroker
 ~~~
 
-Then edit `~/.brakerrak/node.env` to setup custom config and rerun to provision and validate the build...
+Then edit `/etc/brakerrak/node.env` to setup custom config and rerun to provision and validate the build...
 ~~~bash
 sudo brakerrak verify --use-pkg-cache
 ~~~
@@ -100,7 +100,7 @@ sudo brakerrak verify --use-pkg-cache
 
 <div align="center">
 
-**DREW-V LABS** // **Drew Vandagriff** — *Dallas, TX*  
+**[DREW-V Labs](https://github.com/drewv-labs)** // Indie Data Systems R&D  
 `Simplicity in Architecture · Efficiency in Engineering · Purity in Science · Audacity in Art · Life in Logic`
 
 </div>
