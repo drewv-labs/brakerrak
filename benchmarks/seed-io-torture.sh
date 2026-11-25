@@ -311,10 +311,11 @@ CREATE INDEX \"${INDEX_NAME}\" ON \"${TABLE_NAME}\" (scatter_key);
 "
 log_ok "Built '${INDEX_NAME}' in $(( $(date +%s) - INDEX_TS ))s"
 
-# 5. Run VACUUM ANALYZE in its own standalone command (outside transaction block)
-log_step "5. Running VACUUM ANALYZE on '${TABLE_NAME}'"
-run_psql "$DB_NAME" -q -c "VACUUM ANALYZE \"${TABLE_NAME}\";"
-log_ok "VACUUM ANALYZE complete"
+# 5. Run VACUUM (FREEZE, ANALYZE) and CHECKPOINT in standalone commands (outside transaction block)
+log_step "5. Running VACUUM (FREEZE, ANALYZE) and CHECKPOINT on '${TABLE_NAME}'"
+run_psql "$DB_NAME" -q -c "VACUUM (FREEZE, ANALYZE) \"${TABLE_NAME}\";"
+run_psql "$DB_NAME" -q -c "CHECKPOINT;"
+log_ok "VACUUM (FREEZE, ANALYZE) and CHECKPOINT complete"
 
 # 6. Verify final heap and index footprint
 log_step "6. Verifying table footprint"

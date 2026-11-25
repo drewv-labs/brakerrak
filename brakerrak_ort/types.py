@@ -70,6 +70,35 @@ class AcceleratorInfo(TypedDict):
     pcie_link_width: str | None
 
 
+class AcceleratorRuntimeInfo(TypedDict):
+    """Day-1 kernel driver, device node, and CLI runtime probe state."""
+
+    vendor_id: str
+    device_nodes: list[str]
+    kmod_name: str
+    kmod_loaded: bool
+    cli_tool: str
+    cli_ok: bool
+
+
+class MountInfo(TypedDict):
+    """Filesystem mount status and detected fstype for a target mountpoint."""
+
+    mountpoint: str
+    mounted: bool
+    fstype: str | None
+
+
+class BtrfsDeviceStatsInfo(TypedDict):
+    """Parsed read-only `btrfs device stats` health summary."""
+
+    mountpoint: str
+    stats_available: bool
+    total_errors: int
+    nonzero_errors: list[str]
+    error: str | None
+
+
 @dataclass(frozen=True)
 class SnapshotOutputs:
     """Paths, digests, and payloads produced by a single ORT run."""

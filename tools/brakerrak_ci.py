@@ -30,9 +30,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -165,9 +167,50 @@ FORBIDDEN_RULES: tuple[ForbiddenRule, ...] = (
         description="BrakerRak misspelling with 'c' (Bracker/Brakc)",
         pattern=re.compile(r"bracker|brakc", re.IGNORECASE),
     ),
+    ForbiddenRule(
+        description="Retired entity literal (hamstak/hamstack)",
+        pattern=re.compile(r"hamstak|hamstack", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Retired entity literal (darksilicon)",
+        pattern=re.compile(r"darksilicon", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Retired entity literal (poggerbox)",
+        pattern=re.compile(r"poggerbox", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Retired entity literal (codabox)",
+        pattern=re.compile(r"codabox", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Retired entity literal (coffeecan)",
+        pattern=re.compile(r"coffeecan", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Retired entity literal (snitchmesh)",
+        pattern=re.compile(r"snitchmesh", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Downstream astro literal (adastak)",
+        pattern=re.compile(r"adastak", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Downstream astro literal (adascope)",
+        pattern=re.compile(r"adascope", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Downstream astro literal (alone-v)",
+        pattern=re.compile(r"alone-v", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Personal macOS home directory literal (/Users/drew)",
+        pattern=re.compile(r"/Users/drew\b", re.IGNORECASE),
+    ),
 )
 
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+THERMAL_BASELINE_REL = Path("artifacts/ctd-thermal-soak-baseline.json")
 
 
 def collect_repo_files(repo_root: Path) -> list[Path]:
@@ -480,23 +523,23 @@ def compute_canonical_sha256(payload: dict[str, object]) -> str:
 
 def check_thermal_artifact(repo_root: Path) -> list[str]:
     """Verify artifacts/ctd-thermal-soak-baseline.json matches its provenance digest."""
-    artifact_rel = Path("artifacts/ctd-thermal-soak-baseline.json")
-    artifact_path = repo_root / artifact_rel
+    artifact_path = repo_root / THERMAL_BASELINE_REL
     if not artifact_path.is_file():
-        return [f"{artifact_rel}: missing required thermal baseline artifact"]
+        return [f"{THERMAL_BASELINE_REL}: missing required thermal baseline artifact"]
 
     try:
         loaded: object = json.loads(artifact_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
-        return [f"{artifact_rel}: failed to parse JSON ({exc})"]
+        return [f"{THERMAL_BASELINE_REL}: failed to parse JSON ({exc})"]
 
     if not isinstance(loaded, dict):
-        return [f"{artifact_rel}: top-level JSON value must be an object"]
+        return [f"{THERMAL_BASELINE_REL}: top-level JSON value must be an object"]
 
     expected = loaded.get("sha256_provenance_digest")
     if not isinstance(expected, str) or not SHA256_HEX_RE.match(expected):
         return [
-            f"{artifact_rel}: missing or invalid 64-hex sha256_provenance_digest ({expected!r})"
+            f"{THERMAL_BASELINE_REL}: missing or invalid 64-hex "
+            f"sha256_provenance_digest ({expected!r})"
         ]
 
     unsigned_payload: dict[str, object] = {
@@ -505,10 +548,58 @@ def check_thermal_artifact(repo_root: Path) -> list[str]:
     actual = compute_canonical_sha256(unsigned_payload)
     if actual != expected:
         return [
-            f"{artifact_rel}: canonical SHA-256 mismatch (expected {expected}, computed {actual})"
+            f"{THERMAL_BASELINE_REL}: canonical SHA-256 mismatch "
+            f"(expected {expected}, computed {actual})"
         ]
 
     return []
+
+
+def update_thermal_baseline_sha(repo_root: Path) -> tuple[list[str], str]:
+    """Recompute sha256_provenance_digest and atomically update the thermal baseline JSON."""
+    artifact_path = repo_root / THERMAL_BASELINE_REL
+    if not artifact_path.is_file():
+        return [f"{THERMAL_BASELINE_REL}: missing required thermal baseline artifact"], ""
+
+    try:
+        loaded: object = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"{THERMAL_BASELINE_REL}: failed to parse JSON ({exc})"], ""
+
+    if not isinstance(loaded, dict):
+        return [f"{THERMAL_BASELINE_REL}: top-level JSON value must be an object"], ""
+
+    unsigned_payload: dict[str, object] = {
+        str(k): v for k, v in loaded.items() if k != "sha256_provenance_digest"
+    }
+    digest = compute_canonical_sha256(unsigned_payload)
+    updated_payload: dict[str, object] = dict(unsigned_payload)
+    updated_payload["sha256_provenance_digest"] = digest
+    serialized = json.dumps(updated_payload, indent=2) + "\n"
+
+    orig_mode = stat.S_IMODE(artifact_path.stat().st_mode)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=artifact_path.parent,
+            prefix=f".{artifact_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+            tmp_file.write(serialized)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.chmod(tmp_path, orig_mode)
+        os.replace(tmp_path, artifact_path)
+    except OSError as exc:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        return [f"{THERMAL_BASELINE_REL}: failed atomic write ({exc})"], ""
+
+    return [], digest
 
 
 def collect_shell_targets(repo_root: Path) -> tuple[list[Path], list[str]]:
@@ -657,6 +748,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Run all repository integrity, hygiene, shell, and Python checks.",
     )
     parser.add_argument(
+        "--update-baseline-sha",
+        action="store_true",
+        help=(
+            "Recompute canonical SHA-256 and atomically update "
+            "artifacts/ctd-thermal-soak-baseline.json."
+        ),
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=None,
+        help="Optional repository root override (defaults to brakerrak repo root).",
+    )
+    parser.add_argument(
         "--skip-shellcheck",
         action="store_true",
         help="Skip shellcheck (still runs bash -n).",
@@ -671,11 +776,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.check:
+    if not args.check and not args.update_baseline_sha:
         parse_args(["--help"])
         return 1
 
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = (
+        args.repo_root.resolve()
+        if args.repo_root is not None
+        else Path(__file__).resolve().parent.parent
+    )
+
+    if args.update_baseline_sha:
+        errors, digest = update_thermal_baseline_sha(repo_root)
+        if errors:
+            print("[BRAKERRAK:CI] FAILED to update thermal baseline SHA-256:", file=sys.stderr)
+            for err in errors:
+                print(f"  - {err}", file=sys.stderr)
+            return 1
+        print(f"[BRAKERRAK:CI] Updated {THERMAL_BASELINE_REL} sha256_provenance_digest={digest}")
+        if not args.check:
+            return 0
+
     return run_checks(
         repo_root,
         skip_shellcheck=args.skip_shellcheck,

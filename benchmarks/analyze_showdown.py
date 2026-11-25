@@ -49,11 +49,14 @@ METHOD_SORT_ORDER: Mapping[str, int] = {
     "io_uring": 2,
 }
 
+ITER_DIR_RE = re.compile(r"^iter[_-]?(?P<iter>\d+)$")
+
 PASS_DIR_RE = re.compile(
     r"^(?P<cache_mode>cold|warm)__"
     r"(?P<io_method>sync|worker|io_uring)__"
     r"eic(?P<eic>\d+)__"
-    r"(?P<workload>[a-zA-Z0-9_-]+)$"
+    r"(?P<workload>[a-zA-Z0-9_-]+?)"
+    r"(?:_+iter[_-]?(?P<iter>\d+))?$"
 )
 
 SHOWDOWN_SCHEMA: pa.Schema = pa.schema(
@@ -127,6 +130,14 @@ SHOWDOWN_SCHEMA: pa.Schema = pa.schema(
         # Vectorized pyarrow.compute derived columns
         pa.field("nvme_read_mib_s", pa.float64(), nullable=True),
         pa.field("speedup_vs_sync", pa.float64(), nullable=True),
+        # Rigor, iteration, direct-I/O, plan-shape, and PMU multiplexing extensions
+        pa.field("iteration", pa.int32(), nullable=False),
+        pa.field("io_direct", pa.string(), nullable=False),
+        pa.field("wall_duration_ms", pa.float64(), nullable=True),
+        pa.field("pg_io_read_mib_s", pa.float64(), nullable=True),
+        pa.field("plan_shape_valid", pa.bool_(), nullable=False),
+        pa.field("perf_pmu_multiplexed", pa.bool_(), nullable=False),
+        pa.field("perf_min_pcnt_running", pa.float64(), nullable=True),
     ]
 )
 
@@ -147,6 +158,7 @@ class ExplainMetrics:
     wal_fpi: int
     wal_bytes: int
     top_node_type: str
+    plan_node_types: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +187,8 @@ class PerfMetrics:
     l1_dcache_load_misses: int | None
     llc_load_misses: int | None
     dtlb_load_misses: int | None
+    pmu_multiplexed: bool = False
+    min_pcnt_running: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,7 +296,7 @@ class ArtifactSink(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class ShowdownPassRow:
-    """Single aggregated (cache_mode, io_method, concurrency, workload) benchmark pass."""
+    """Single aggregated (cache_mode, io_method, concurrency, workload, iteration) pass."""
 
     schema_version: str
     run_id: str
@@ -309,6 +323,10 @@ class ShowdownPassRow:
     pg_stat_io: PgStatIOMetrics
     perf: PerfMetrics
     diskstats: DiskStatsDelta
+    iteration: int = 1
+    io_direct: str = "off"
+    wall_duration_ms: float | None = None
+    plan_shape_valid: bool = True
 
     @property
     def execution_time_ms(self) -> float:
@@ -317,16 +335,25 @@ class ShowdownPassRow:
 
 @dataclass(frozen=True, slots=True)
 class MethodLatencySummary:
-    """Aggregated pyarrow.compute latency summary for a method within a workload."""
+    """Aggregated pyarrow.compute latency summary for a method/EIC/direct-IO group."""
 
     cache_mode: str
     workload: str
     io_method: str
-    pass_count: int
+    effective_io_concurrency: int
+    io_direct: str
+    n: int
     min_ms: float
     p50_ms: float
+    p95_ms: float
+    p99_ms: float
     mean_ms: float
+    stddev_ms: float
     max_ms: float
+
+    @property
+    def pass_count(self) -> int:
+        return self.n
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,6 +434,33 @@ def _extract_plan_numeric(
     return 0.0
 
 
+def _collect_plan_node_types(plan_node: Mapping[str, Any]) -> tuple[str, ...]:
+    """Recursively collect all PostgreSQL plan Node Type names in a plan tree."""
+    node_types: list[str] = []
+    raw_type = plan_node.get("Node Type")
+    if isinstance(raw_type, str) and raw_type.strip():
+        node_types.append(raw_type.strip())
+    children = plan_node.get("Plans")
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, Mapping):
+                node_types.extend(_collect_plan_node_types(child))
+    return tuple(node_types)
+
+
+def validate_plan_shape(workload: str, explain: ExplainMetrics) -> bool:
+    """Assert that EXPLAIN plan nodes match the expected scan shape for a workload."""
+    nodes = set(explain.plan_node_types)
+    if explain.top_node_type:
+        nodes.add(explain.top_node_type)
+    wl_norm = workload.strip().lower()
+    if wl_norm == "seq_scan" or wl_norm.startswith("seq_scan"):
+        return "Parallel Seq Scan" in nodes or "Seq Scan" in nodes
+    if wl_norm == "bitmap_heap_scan" or wl_norm.startswith("bitmap_heap_scan"):
+        return "Bitmap Heap Scan" in nodes
+    return explain.top_node_type != "Unknown"
+
+
 def parse_explain_json(path: Path) -> ExplainMetrics:
     """Parse PostgreSQL EXPLAIN (ANALYZE, BUFFERS, TIMING, WAL, FORMAT JSON) output."""
     raw = path.read_text(encoding="utf-8").strip()
@@ -459,6 +513,7 @@ def parse_explain_json(path: Path) -> ExplainMetrics:
     wal_fpi = int(round(_extract_plan_numeric(plan, ("WAL FPI",))))
     wal_bytes = int(round(_extract_plan_numeric(plan, ("WAL Bytes",))))
     top_node_type = str(plan.get("Node Type", "Unknown"))
+    plan_node_types = _collect_plan_node_types(plan)
 
     return ExplainMetrics(
         execution_time_ms=execution_time_ms,
@@ -473,6 +528,7 @@ def parse_explain_json(path: Path) -> ExplainMetrics:
         wal_fpi=wal_fpi,
         wal_bytes=wal_bytes,
         top_node_type=top_node_type,
+        plan_node_types=plan_node_types,
     )
 
 
@@ -602,21 +658,33 @@ def parse_perf_stat_json(path: Path) -> PerfMetrics:
 
     counters: dict[str, int] = {}
     reported_ipc: float | None = None
+    pcnt_running_values: list[float] = []
 
     for rec in records:
-        event_raw = rec.get("event")
-        if not isinstance(event_raw, str) or not event_raw.strip():
-            continue
-        event_name = _canonical_perf_event(event_raw)
-        val = _parse_perf_counter(rec.get("counter-value"))
-        if val is not None:
-            counters[event_name] = counters.get(event_name, 0) + val
-
         metric_unit = str(rec.get("metric-unit", "")).strip().lower()
         if "insn per cycle" in metric_unit and rec.get("metric-value") is not None:
             parsed_ipc = _as_float(rec.get("metric-value"), -1.0)
             if parsed_ipc >= 0.0:
                 reported_ipc = round(parsed_ipc, 6)
+
+        event_raw = rec.get("event")
+        if not isinstance(event_raw, str) or not event_raw.strip():
+            continue
+        event_name = _canonical_perf_event(event_raw)
+        raw_counter = rec.get("counter-value")
+        val = _parse_perf_counter(raw_counter)
+        if val is not None:
+            counters[event_name] = counters.get(event_name, 0) + val
+
+        is_not_supported = (
+            isinstance(raw_counter, str)
+            and raw_counter.strip().lower().startswith("<not supported")
+        )
+        raw_pcnt = rec.get("pcnt-running")
+        if not is_not_supported and raw_pcnt is not None and not isinstance(raw_pcnt, bool):
+            pcnt_val = _as_float(raw_pcnt, -1.0)
+            if 0.0 <= pcnt_val <= 100.0:
+                pcnt_running_values.append(pcnt_val)
 
     cycles = counters.get("cycles")
     instructions = counters.get("instructions")
@@ -625,6 +693,11 @@ def parse_perf_stat_json(path: Path) -> PerfMetrics:
         ipc_val = round(instructions / cycles, 6)
     else:
         ipc_val = reported_ipc
+
+    min_pcnt_running: float | None = (
+        round(min(pcnt_running_values), 2) if pcnt_running_values else None
+    )
+    pmu_multiplexed = min_pcnt_running is not None and min_pcnt_running < 100.0
 
     return PerfMetrics(
         cycles=cycles,
@@ -635,6 +708,8 @@ def parse_perf_stat_json(path: Path) -> PerfMetrics:
         l1_dcache_load_misses=counters.get("l1-dcache-load-misses"),
         llc_load_misses=counters.get("llc-load-misses"),
         dtlb_load_misses=counters.get("dtlb-load-misses"),
+        pmu_multiplexed=pmu_multiplexed,
+        min_pcnt_running=min_pcnt_running,
     )
 
 
@@ -853,16 +928,26 @@ def load_showdown_passes(
     if not passes_root.is_dir():
         passes_root = run_dir
 
-    pass_dirs = sorted(
-        p for p in passes_root.iterdir() if p.is_dir() and (p / "explain.json").is_file()
-    )
-    if not pass_dirs:
+    discovered: list[tuple[int | None, Path]] = []
+    for entry in sorted(passes_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        if (entry / "explain.json").is_file():
+            discovered.append((None, entry))
+            continue
+        iter_match = ITER_DIR_RE.match(entry.name)
+        parent_iter = int(iter_match.group("iter")) if iter_match else None
+        for sub_entry in sorted(entry.iterdir()):
+            if sub_entry.is_dir() and (sub_entry / "explain.json").is_file():
+                discovered.append((parent_iter, sub_entry))
+
+    if not discovered:
         raise FileNotFoundError(
             f"No benchmark pass directories with explain.json found under: {passes_root}"
         )
 
     rows: list[ShowdownPassRow] = []
-    for pdir in pass_dirs:
+    for parent_iter, pdir in discovered:
         pmeta_path = pdir / "pass_meta.json"
         pmeta: Mapping[str, Any] = {}
         if pmeta_path.is_file():
@@ -884,6 +969,31 @@ def load_showdown_passes(
         workload = str(
             pmeta.get("workload") or (dir_match.group("workload") if dir_match else pdir.name)
         )
+        dir_iter = (
+            int(dir_match.group("iter")) if (dir_match and dir_match.group("iter")) else None
+        )
+        default_iter = (
+            parent_iter if parent_iter is not None else (dir_iter if dir_iter is not None else 1)
+        )
+        iteration = _as_int(pmeta.get("iteration"), default_iter)
+        if iteration < 1:
+            iteration = 1
+
+        raw_io_direct = str(pmeta.get("io_direct", "")).strip()
+        if raw_io_direct:
+            io_direct = raw_io_direct
+        elif bool(pmeta.get("with_direct_io")):
+            io_direct = "data"
+        else:
+            io_direct = "off"
+
+        raw_wall = pmeta.get("wall_duration_ms")
+        wall_duration_ms: float | None = None
+        if raw_wall is not None and not isinstance(raw_wall, bool):
+            parsed_wall = _as_float(raw_wall, -1.0)
+            if parsed_wall > 0.0:
+                wall_duration_ms = parsed_wall
+
         io_workers = _as_int(pmeta.get("io_workers"), 0)
         gather_workers = _as_int(pmeta.get("gather_workers"), 0)
         nvme_short = str(pmeta.get("nvme_short") or meta.nvme_short)
@@ -893,6 +1003,7 @@ def load_showdown_passes(
         )
 
         explain_metrics = ex_p.parse(pdir / "explain.json")
+        plan_shape_valid = validate_plan_shape(workload, explain_metrics)
         pg_stat_io_metrics = io_p.parse(pdir / "pg_stat_io.json")
 
         perf_path = pdir / "perf_stat.json"
@@ -933,6 +1044,10 @@ def load_showdown_passes(
                 pg_stat_io=pg_stat_io_metrics,
                 perf=perf_metrics,
                 diskstats=disk_delta,
+                iteration=iteration,
+                io_direct=io_direct,
+                wall_duration_ms=wall_duration_ms,
+                plan_shape_valid=plan_shape_valid,
             )
         )
 
@@ -971,12 +1086,19 @@ def _arrow_scalar_float(scalar: Any) -> float | None:
 
 
 def _compute_speedup_column(table: pa.Table) -> pa.Array:
-    """Compute speedup vs sync baseline per (cache_mode, workload) via pyarrow.compute."""
+    """Compute speedup vs sync baseline per (cache_mode, workload, io_direct)."""
     cache_modes: list[str] = [str(v) for v in table["cache_mode"].to_pylist()]
     workloads: list[str] = [str(v) for v in table["workload"].to_pylist()]
     eics: list[int] = [int(v) for v in table["effective_io_concurrency"].to_pylist()]
+    if "io_direct" in table.column_names:
+        io_directs: list[str] = [str(v) for v in table["io_direct"].to_pylist()]
+    else:
+        io_directs = ["off"] * table.num_rows
 
-    # Precompute sync baseline per (cache_mode, workload, eic) and per (cache_mode, workload)
+    # Precompute sync baseline per (cache_mode, workload, io_direct, eic) and fallbacks
+    exact_direct_baselines: dict[tuple[str, str, str, int], float] = {}
+    zero_direct_baselines: dict[tuple[str, str, str], float] = {}
+    group_direct_baselines: dict[tuple[str, str, str], float] = {}
     exact_baselines: dict[tuple[str, str, int], float] = {}
     zero_baselines: dict[tuple[str, str], float] = {}
     group_baselines: dict[tuple[str, str], float] = {}
@@ -1012,10 +1134,33 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
                 if sync_eic == 0:
                     zero_baselines[(cm, wl)] = eic_mean
 
+        if "io_direct" in sync_group.column_names:
+            direct_vals = sorted({str(v) for v in sync_group["io_direct"].to_pylist()})
+            for d_val in direct_vals:
+                d_sub = sync_group.filter(pc.equal(sync_group["io_direct"], d_val))
+                d_mean = _arrow_scalar_float(pc.mean(d_sub["execution_time_ms"]))
+                if d_mean is not None and d_mean > 0.0:
+                    group_direct_baselines[(cm, wl, d_val)] = d_mean
+                for sync_eic in sync_eics:
+                    eic_scalar = pa.scalar(sync_eic, type=pa.int32())
+                    de_sub = d_sub.filter(
+                        pc.equal(d_sub["effective_io_concurrency"], eic_scalar)
+                    )
+                    if de_sub.num_rows == 0:
+                        continue
+                    de_mean = _arrow_scalar_float(pc.mean(de_sub["execution_time_ms"]))
+                    if de_mean is not None and de_mean > 0.0:
+                        exact_direct_baselines[(cm, wl, d_val, sync_eic)] = de_mean
+                        if sync_eic == 0:
+                            zero_direct_baselines[(cm, wl, d_val)] = de_mean
+
     baseline_per_row: list[float | None] = []
-    for cm, wl, eic in zip(cache_modes, workloads, eics, strict=True):
+    for cm, wl, d_val, eic in zip(cache_modes, workloads, io_directs, eics, strict=True):
         baseline = (
-            exact_baselines.get((cm, wl, eic))
+            exact_direct_baselines.get((cm, wl, d_val, eic))
+            or zero_direct_baselines.get((cm, wl, d_val))
+            or group_direct_baselines.get((cm, wl, d_val))
+            or exact_baselines.get((cm, wl, eic))
             or zero_baselines.get((cm, wl))
             or group_baselines.get((cm, wl))
         )
@@ -1023,7 +1168,7 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
 
     baseline_arr = pa.array(baseline_per_row, type=pa.float64())
     exec_arr = table["execution_time_ms"]
-    valid_denom = pc.and_(
+    valid_denom = pc.and_kleene(
         pc.is_valid(baseline_arr),
         pc.greater(exec_arr, pa.scalar(0.0, type=pa.float64())),
     )
@@ -1045,6 +1190,8 @@ def build_showdown_table(
             r.effective_io_concurrency,
             METHOD_SORT_ORDER.get(r.io_method, 99),
             r.io_method,
+            r.io_direct,
+            r.iteration,
         ),
     )
 
@@ -1110,24 +1257,54 @@ def build_showdown_table(
         "disk_weighted_io_time_ms": [r.diskstats.weighted_io_time_ms for r in sorted_rows],
         "nvme_read_mib_s": [None for _ in sorted_rows],
         "speedup_vs_sync": [None for _ in sorted_rows],
+        "iteration": [r.iteration for r in sorted_rows],
+        "io_direct": [r.io_direct for r in sorted_rows],
+        "wall_duration_ms": [r.wall_duration_ms for r in sorted_rows],
+        "pg_io_read_mib_s": [None for _ in sorted_rows],
+        "plan_shape_valid": [r.plan_shape_valid for r in sorted_rows],
+        "perf_pmu_multiplexed": [r.perf.pmu_multiplexed for r in sorted_rows],
+        "perf_min_pcnt_running": [r.perf.min_pcnt_running for r in sorted_rows],
     }
 
     table = pa.Table.from_pydict(columns, schema=SHOWDOWN_SCHEMA)
 
-    # Vectorized NVMe throughput calculation via pyarrow.compute
-    exec_sec = pc.divide(table["execution_time_ms"], pa.scalar(1000.0, type=pa.float64()))
+    # Vectorized NVMe throughput calculation over wall_duration_ms (falling back to
+    # execution_time_ms only for legacy fixtures lacking wall_duration_ms) via pyarrow.compute
+    has_wall = pc.and_kleene(
+        pc.is_valid(table["wall_duration_ms"]),
+        pc.greater(table["wall_duration_ms"], pa.scalar(0.0, type=pa.float64())),
+    )
+    effective_dur_ms = pc.if_else(has_wall, table["wall_duration_ms"], table["execution_time_ms"])
+    dur_sec = pc.divide(effective_dur_ms, pa.scalar(1000.0, type=pa.float64()))
     read_mib = pc.divide(
         pc.cast(table["disk_read_bytes"], pa.float64()),
         pa.scalar(1048576.0, type=pa.float64()),
     )
-    valid_tput = pc.and_(
+    valid_tput = pc.and_kleene(
         pc.is_valid(read_mib),
-        pc.greater(exec_sec, pa.scalar(0.0, type=pa.float64())),
+        pc.greater(dur_sec, pa.scalar(0.0, type=pa.float64())),
     )
-    safe_exec_sec = pc.if_else(valid_tput, exec_sec, pa.scalar(1.0, type=pa.float64()))
+    safe_dur_sec = pc.if_else(valid_tput, dur_sec, pa.scalar(1.0, type=pa.float64()))
     nvme_mib_s = pc.if_else(
         valid_tput,
-        pc.round(pc.divide(read_mib, safe_exec_sec), 3),
+        pc.round(pc.divide(read_mib, safe_dur_sec), 3),
+        pa.scalar(None, type=pa.float64()),
+    )
+
+    # Vectorized PG EXPLAIN I/O read throughput: Shared Read Blocks (8 KiB) / I/O Read Time
+    pg_read_mib = pc.divide(
+        pc.multiply(
+            pc.cast(table["shared_read_blocks"], pa.float64()),
+            pa.scalar(float(DEFAULT_PG_BLOCK_BYTES), type=pa.float64()),
+        ),
+        pa.scalar(1048576.0, type=pa.float64()),
+    )
+    pg_io_sec = pc.divide(table["io_read_time_ms"], pa.scalar(1000.0, type=pa.float64()))
+    valid_pg_io = pc.greater(pg_io_sec, pa.scalar(0.0, type=pa.float64()))
+    safe_pg_io_sec = pc.if_else(valid_pg_io, pg_io_sec, pa.scalar(1.0, type=pa.float64()))
+    pg_io_mib_s = pc.if_else(
+        valid_pg_io,
+        pc.round(pc.divide(pg_read_mib, safe_pg_io_sec), 3),
         pa.scalar(None, type=pa.float64()),
     )
 
@@ -1137,6 +1314,11 @@ def build_showdown_table(
         table.schema.get_field_index("nvme_read_mib_s"),
         "nvme_read_mib_s",
         nvme_mib_s,
+    )
+    table = table.set_column(
+        table.schema.get_field_index("pg_io_read_mib_s"),
+        "pg_io_read_mib_s",
+        pg_io_mib_s,
     )
     table = table.set_column(
         table.schema.get_field_index("speedup_vs_sync"),
@@ -1158,25 +1340,46 @@ def build_showdown_table(
 
 
 def compute_method_summaries(table: pa.Table) -> list[MethodLatencySummary]:
-    """Compute per-(cache_mode, workload, io_method) latency quantiles using pyarrow.compute."""
+    """Compute per-(cache_mode, workload, io_method, eic, io_direct) quantiles."""
     cache_modes = [str(v) for v in table["cache_mode"].to_pylist()]
     workloads = [str(v) for v in table["workload"].to_pylist()]
     methods = [str(v) for v in table["io_method"].to_pylist()]
+    eics = [int(v) for v in table["effective_io_concurrency"].to_pylist()]
+    has_io_direct = "io_direct" in table.column_names
+    io_directs = (
+        [str(v) if v is not None else "off" for v in table["io_direct"].to_pylist()]
+        if has_io_direct
+        else ["off"] * table.num_rows
+    )
 
     unique_keys = sorted(
-        set(zip(cache_modes, workloads, methods, strict=True)),
-        key=lambda k: (0 if k[0] == "cold" else 1, k[1], METHOD_SORT_ORDER.get(k[2], 99), k[2]),
+        set(zip(cache_modes, workloads, methods, eics, io_directs, strict=True)),
+        key=lambda k: (
+            0 if k[0] == "cold" else 1,
+            k[1],
+            k[3],
+            METHOD_SORT_ORDER.get(k[2], 99),
+            k[2],
+            k[4],
+        ),
     )
 
     summaries: list[MethodLatencySummary] = []
-    for cm, wl, method in unique_keys:
+    for cm, wl, method, eic, io_direct in unique_keys:
+        eic_scalar = pa.scalar(eic, type=pa.int32())
         mask = pc.and_(
             pc.and_(
-                pc.equal(table["cache_mode"], cm),
-                pc.equal(table["workload"], wl),
+                pc.and_(
+                    pc.equal(table["cache_mode"], cm),
+                    pc.equal(table["workload"], wl),
+                ),
+                pc.equal(table["io_method"], method),
             ),
-            pc.equal(table["io_method"], method),
+            pc.equal(table["effective_io_concurrency"], eic_scalar),
         )
+        if has_io_direct:
+            mask = pc.and_(mask, pc.equal(table["io_direct"], io_direct))
+
         sub = table.filter(mask)
         if sub.num_rows == 0:
             continue
@@ -1184,17 +1387,28 @@ def compute_method_summaries(table: pa.Table) -> list[MethodLatencySummary]:
         min_ms = _arrow_scalar_float(pc.min(exec_col)) or 0.0
         max_ms = _arrow_scalar_float(pc.max(exec_col)) or 0.0
         mean_ms = _arrow_scalar_float(pc.mean(exec_col)) or 0.0
-        q50_arr = pc.quantile(exec_col, q=0.5)
-        p50_ms = _arrow_scalar_float(q50_arr[0]) if len(q50_arr) > 0 else mean_ms
+        q_arr = pc.quantile(exec_col, q=[0.5, 0.95, 0.99])
+        p50_ms = _arrow_scalar_float(q_arr[0]) if len(q_arr) > 0 else mean_ms
+        p95_ms = _arrow_scalar_float(q_arr[1]) if len(q_arr) > 1 else max_ms
+        p99_ms = _arrow_scalar_float(q_arr[2]) if len(q_arr) > 2 else max_ms
+        ddof = 1 if sub.num_rows > 1 else 0
+        stddev_ms = _arrow_scalar_float(pc.stddev(exec_col, ddof=ddof))
+        if stddev_ms is None:
+            stddev_ms = 0.0
         summaries.append(
             MethodLatencySummary(
                 cache_mode=cm,
                 workload=wl,
                 io_method=method,
-                pass_count=int(sub.num_rows),
+                effective_io_concurrency=eic,
+                io_direct=io_direct,
+                n=int(sub.num_rows),
                 min_ms=round(min_ms, 3),
                 p50_ms=round(p50_ms if p50_ms is not None else mean_ms, 3),
+                p95_ms=round(p95_ms if p95_ms is not None else max_ms, 3),
+                p99_ms=round(p99_ms if p99_ms is not None else max_ms, 3),
                 mean_ms=round(mean_ms, 3),
+                stddev_ms=round(stddev_ms, 3),
                 max_ms=round(max_ms, 3),
             )
         )
@@ -1231,44 +1445,90 @@ def render_markdown_summary(
         "",
         "### Per-Pass Ablation Matrix",
         "",
-        "| Cache | Workload | io_method | EIC | Exec (ms) | Plan (ms) | I/O Read (ms) "
-        "| Shared Read Blks | NVMe Read (MiB/s) | IPC | Ctx Sw | vs sync |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Cache | Workload | io_method | EIC | Exec (ms) | Iter | Plan (ms) | I/O Read (ms) "
+        "| Shared Read Blks | NVMe Read (MiB/s) | PG I/O (MiB/s) | IPC | Ctx Sw | Plan OK "
+        "| vs sync |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+        "| --- | ---: |",
     ]
 
+    mux_warnings: list[str] = []
+    plan_warnings: list[str] = []
+
     for row in table.to_pylist():
+        plan_ok = bool(row.get("plan_shape_valid", True))
+        if not plan_ok:
+            plan_warnings.append(
+                f"{row['cache_mode']}/{row['workload']}/{row['io_method']}"
+                f"/eic{row['effective_io_concurrency']}/iter{row['iteration']} "
+                f"(top={row['top_node_type']})"
+            )
+        if bool(row.get("perf_pmu_multiplexed", False)):
+            mux_warnings.append(
+                f"{row['cache_mode']}/{row['workload']}/{row['io_method']}"
+                f"/eic{row['effective_io_concurrency']}/iter{row['iteration']} "
+                f"(min pcnt-running={_fmt_opt_float(row.get('perf_min_pcnt_running'), 1, '%')})"
+            )
         lines.append(
             f"| {row['cache_mode']} "
             f"| {row['workload']} "
             f"| `{row['io_method']}` "
             f"| {int(row['effective_io_concurrency'])} "
             f"| {float(row['execution_time_ms']):.2f} "
+            f"| {int(row.get('iteration', 1))} "
             f"| {float(row['planning_time_ms']):.2f} "
             f"| {float(row['io_read_time_ms']):.2f} "
             f"| {int(row['shared_read_blocks']):,} "
             f"| {_fmt_opt_float(row['nvme_read_mib_s'], 1)} "
+            f"| {_fmt_opt_float(row.get('pg_io_read_mib_s'), 1)} "
             f"| {_fmt_opt_float(row['perf_ipc'], 2)} "
             f"| {_fmt_opt_int(row['perf_context_switches'])} "
+            f"| {'yes' if plan_ok else 'NO'} "
             f"| {_fmt_opt_float(row['speedup_vs_sync'], 2, 'x')} |"
         )
 
     summaries = compute_method_summaries(table)
     if summaries:
+        show_direct = len({s.io_direct for s in summaries}) > 1 or any(
+            s.io_direct != "off" for s in summaries
+        )
+        direct_hdr = " Direct I/O |" if show_direct else ""
+        direct_sep = " --- |" if show_direct else ""
         lines.extend(
             [
                 "",
                 "### Latency Summary by `io_method`",
                 "",
-                "| Cache | Workload | io_method | Passes | Min (ms) | P50 (ms) "
-                "| Mean (ms) | Max (ms) |",
-                "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |",
+                f"| Cache | Workload | io_method | EIC |{direct_hdr} N | Min (ms) | P50 (ms) "
+                "| P95 (ms) | P99 (ms) | Mean (ms) | Stddev (ms) | Max (ms) |",
+                f"| --- | --- | --- | ---: |{direct_sep} ---: | ---: | ---: | ---: | ---: "
+                "| ---: | ---: | ---: |",
             ]
         )
         for s in summaries:
+            direct_cell = f" `{s.io_direct}` |" if show_direct else ""
             lines.append(
-                f"| {s.cache_mode} | {s.workload} | `{s.io_method}` | {s.pass_count} "
-                f"| {s.min_ms:.2f} | {s.p50_ms:.2f} | {s.mean_ms:.2f} | {s.max_ms:.2f} |"
+                f"| {s.cache_mode} | {s.workload} | `{s.io_method}` | {s.effective_io_concurrency} "
+                f"|{direct_cell} {s.n} | {s.min_ms:.2f} | {s.p50_ms:.2f} | {s.p95_ms:.2f} "
+                f"| {s.p99_ms:.2f} | {s.mean_ms:.2f} | {s.stddev_ms:.2f} | {s.max_ms:.2f} |"
             )
+
+    if mux_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **PMU Multiplexing Warning:** `pcnt-running < 100%` detected on "
+                f"{len(mux_warnings)} pass(es): {', '.join(mux_warnings[:5])}",
+            ]
+        )
+    if plan_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **Plan Shape Warning:** Unexpected EXPLAIN node shape on "
+                f"{len(plan_warnings)} pass(es): {', '.join(plan_warnings[:5])}",
+            ]
+        )
 
     return "\n".join(lines)
 

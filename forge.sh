@@ -74,8 +74,7 @@ Forge Options (all value flags also accept --flag=value):
   --deeptune | --tune <data|ai>       Run RVDK DeepTune at end of forge (persists tune profile on --tune)
   --with-tailscale                    Install & configure Tailscale mesh VPN
   --tailscale-up | --tailscale-ssh    Run `tailscale up` / enable Tailscale SSH
-  --tailscale-authkey-file <path>     Read Tailscale auth key from a 0600 file (recommended)
-  --tailscale-authkey <key>           Pass Tailscale auth key via argv (deprecated; exposes secret in /proc)
+  --tailscale-authkey-file <path>     Read Tailscale auth key from a 0600 file (or set TS_AUTHKEY env)
   --tailscale-routes <CIDRs>          Advertise subnet routes via Tailscale
   --tailscale-userspace               Force userspace networking for Tailscale
   --no-apt-update                     Skip redundant apt-get update calls
@@ -115,6 +114,41 @@ print_version() {
     printf "brakerrak (%s) [%s]\n" "$commit_sha" "$engine_root"
 }
 
+_brak_run_bench_analyze() {
+    local bench_root="$1"
+    shift
+    local analyzer="${bench_root}/benchmarks/analyze_showdown.py"
+    if [[ ! -f "$analyzer" ]]; then
+        printf '[BRAKERRAK:FATAL] Showdown analyzer script not found: %s\n' "$analyzer" >&2
+        exit 1
+    fi
+
+    if [[ -x "${bench_root}/.venv/bin/python" ]]; then
+        if "${bench_root}/.venv/bin/python" -c 'import pyarrow' >/dev/null 2>&1; then
+            exec "${bench_root}/.venv/bin/python" "$analyzer" "$@"
+        fi
+    fi
+
+    if command -v uv >/dev/null 2>&1 && [[ -f "${bench_root}/pyproject.toml" ]] && [[ -d "${bench_root}/.venv" || -n "${UV_PROJECT_ENVIRONMENT:-}" ]]; then
+        if uv run --project "$bench_root" --no-sync python -c 'import pyarrow' >/dev/null 2>&1; then
+            exec uv run --project "$bench_root" --no-sync python "$analyzer" "$@"
+        fi
+    fi
+
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import pyarrow' >/dev/null 2>&1; then
+        exec python3 "$analyzer" "$@"
+    fi
+
+    cat >&2 <<EOF
+[BRAKERRAK:FATAL] Python 'pyarrow' is unavailable for 'brakerrak bench analyze' (engine: ${bench_root}).
+Remediate by syncing the engine virtualenv as root with world-readable permissions:
+  sudo uv sync --project "${bench_root}" --frozen --no-dev && sudo chmod -R a+rX "${bench_root}/.venv"
+Or reinstall the BrakerRak CLI:
+  curl -fsSL https://brakerrak.dev/install-cli.sh | sudo bash
+EOF
+    exit 1
+}
+
 # Handle unprivileged --help / --version and read-only `bench analyze` before sudo escalation
 if [[ $# -gt 0 ]]; then
     case "$1" in
@@ -141,15 +175,9 @@ if [[ $# -gt 0 ]]; then
                     exit 0
                     ;;
                 analyze|report)
-                    _BENCH_ROOT="${CANDIDATE_ROOT:-/usr/local/share/brakerrak/engine}"
+                    _BENCH_ROOT="${BRAKERRAK_ENGINE_DIR:-${CANDIDATE_ROOT:-/usr/local/share/brakerrak/engine}}"
                     shift 2
-                    if command -v uv >/dev/null 2>&1 && [[ -f "${_BENCH_ROOT}/pyproject.toml" && -x "${_BENCH_ROOT}/.venv/bin/python" ]]; then
-                        exec uv run --project "$_BENCH_ROOT" --no-sync python "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                    elif command -v uv >/dev/null 2>&1 && [[ -f "${_BENCH_ROOT}/pyproject.toml" ]]; then
-                        exec uv run --project "$_BENCH_ROOT" python "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                    else
-                        exec python3 "${_BENCH_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                    fi
+                    _brak_run_bench_analyze "$_BENCH_ROOT" "$@"
                     ;;
             esac
             ;;
@@ -158,7 +186,8 @@ fi
 
 if [[ $EUID -ne 0 ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "$SCRIPT_SELF" "$@"
+        _BRAK_SUDO_KEEP_ENV="BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,BRAKERRAK_NODE_ENV,BRAKERRAK_TARGET,BRAKERRAK_NO_PROGBAR,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_INSTALL_SHA256,BRAKERRAK_SYSTEM_ENGINE_DIR,BRAKERRAK_SYSTEM_ETC_DIR,BRAKERRAK_SYSTEM_NODE_ENV,NO_PROGBAR,RVDK_BASE_URL,RVDK_INSTALL_SHA256,RVDK_NO_PROGBAR,RVDK_ENV_FILE,APT_UPDATED,TS_AUTHKEY,TERM,COLORTERM,NO_COLOR"
+        exec sudo --preserve-env="$_BRAK_SUDO_KEEP_ENV" bash "$SCRIPT_SELF" "$@"
     else
         echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://brakerrak.dev/forge.sh | sudo bash" >&2
         exit 1
@@ -243,6 +272,106 @@ esac
 RVDK_BIN="/usr/local/bin/rvdk"
 [[ ! -x "$RVDK_BIN" && -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk"
 
+_brak_resolve_rvdk_cmd() {
+    if command -v rvdk >/dev/null 2>&1; then
+        command -v rvdk
+    elif [[ -x "${RVDK_BIN:-}" ]]; then
+        printf '%s\n' "$RVDK_BIN"
+    else
+        return 1
+    fi
+}
+
+# Download a remote shell script to a 0700 temp file, validate non-empty + valid
+# shell shebang (+ optional SHA-256 verification), execute it, and clean up.
+# Usage: _brak_fetch_and_exec_script <url> [expected_sha256] [script_args...]
+_brak_fetch_and_exec_script() {
+    local url="$1"
+    local expected_sha256="${2:-}"
+    shift 2
+
+    if ! command -v curl >/dev/null 2>&1; then
+        log_fatal "Missing curl; cannot fetch ${url}."
+    fi
+
+    local tmp_dir="${BRAKERRAK_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    local tmp_script=""
+    if declare -F brak_mktemp >/dev/null 2>&1; then
+        brak_mktemp -v tmp_script "${tmp_dir%/}/brakerrak-fetch.XXXXXX" || log_fatal "Failed to create temporary file for ${url}."
+    else
+        tmp_script="$(
+            umask 077
+            mktemp "${tmp_dir%/}/brakerrak-fetch.XXXXXX"
+        )" || log_fatal "Failed to create temporary file for ${url}."
+        if declare -p _BRAK_TMPFILES >/dev/null 2>&1; then
+            _BRAK_TMPFILES+=("$tmp_script")
+        fi
+        if declare -F brak_register_exit_hook >/dev/null 2>&1; then
+            brak_register_exit_hook _brak_cleanup_tmpfiles
+        elif [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
+            _BRAK_FETCH_TMPFILE="$tmp_script"
+            trap 'rm -f "${_BRAK_FETCH_TMPFILE:-}" 2>/dev/null || true' EXIT
+            trap 'rm -f "${_BRAK_FETCH_TMPFILE:-}" 2>/dev/null || true; trap - INT; kill -INT $$' INT
+            trap 'rm -f "${_BRAK_FETCH_TMPFILE:-}" 2>/dev/null || true; trap - TERM; kill -TERM $$' TERM
+        fi
+    fi
+    if ! chmod 0700 "$tmp_script"; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        _BRAK_FETCH_TMPFILE=""
+        log_fatal "Failed to chmod 0700 temporary script ${tmp_script}."
+    fi
+
+    local curl_args=(-fsSL)
+    if [[ "$url" == https://* ]]; then
+        curl_args+=(--proto '=https' --tlsv1.2)
+    fi
+    if ! curl "${curl_args[@]}" -o "$tmp_script" "$url"; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        log_fatal "Failed to download script: ${url}"
+    fi
+
+    if [[ ! -s "$tmp_script" ]]; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        log_fatal "Downloaded script is empty: ${url}"
+    fi
+
+    local first_line=""
+    IFS= read -r first_line < "$tmp_script" || true
+    first_line="${first_line%$'\r'}"
+    if [[ ! "$first_line" =~ ^#! ]] || [[ ! "$first_line" =~ (sh|bash|zsh) ]]; then
+        rm -f "$tmp_script" 2>/dev/null || true
+        log_fatal "Downloaded file from ${url} lacks a valid shell shebang (got: '${first_line:0:64}')."
+    fi
+
+    if [[ -n "$expected_sha256" ]]; then
+        local norm_expected actual_sha=""
+        norm_expected="$(tr '[:upper:]' '[:lower:]' <<< "$expected_sha256")"
+        if [[ ! "$norm_expected" =~ ^[0-9a-f]{64}$ ]]; then
+            rm -f "$tmp_script" 2>/dev/null || true
+            log_fatal "Invalid expected SHA-256 digest for ${url}: '${expected_sha256}'"
+        fi
+        if command -v sha256sum >/dev/null 2>&1; then
+            actual_sha="$(sha256sum "$tmp_script" | awk '{print $1}')"
+        elif command -v shasum >/dev/null 2>&1; then
+            actual_sha="$(shasum -a 256 "$tmp_script" | awk '{print $1}')"
+        else
+            rm -f "$tmp_script" 2>/dev/null || true
+            log_fatal "Cannot verify SHA-256 for ${url}: neither sha256sum nor shasum is installed."
+        fi
+        actual_sha="$(tr '[:upper:]' '[:lower:]' <<< "$actual_sha")"
+        if [[ "$actual_sha" != "$norm_expected" ]]; then
+            rm -f "$tmp_script" 2>/dev/null || true
+            log_fatal "SHA-256 mismatch for ${url}: expected ${norm_expected}, got ${actual_sha}"
+        fi
+    fi
+
+    local rc=0
+    bash "$tmp_script" "$@" || rc=$?
+    rm -f "$tmp_script" 2>/dev/null || true
+    _BRAK_FETCH_TMPFILE=""
+    return "$rc"
+}
+
 # ==============================================================================
 # 1. Parse Subcommand (forge | deeptune | storage | ort | bench | verify | reset | update)
 # ==============================================================================
@@ -293,7 +422,7 @@ EOF
         elif [[ -f "/usr/local/share/rvdk/engine/install-cli.sh" ]]; then
             bash "/usr/local/share/rvdk/engine/install-cli.sh" ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
         else
-            curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
+            _brak_fetch_and_exec_script "${RVDK_BASE_URL}/install-cli.sh" "${RVDK_INSTALL_SHA256:-}" ${RVDK_QUIET_ARGS[@]+"${RVDK_QUIET_ARGS[@]}"}
         fi
     fi
 
@@ -302,7 +431,7 @@ EOF
     elif [[ -f "${ENGINE_DIR}/install-cli.sh" ]]; then
         exec bash "${ENGINE_DIR}/install-cli.sh" ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
     else
-        curl -fsSL "${BRAKERRAK_BASE_URL}/install-cli.sh" | bash -s -- ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
+        _brak_fetch_and_exec_script "${BRAKERRAK_BASE_URL}/install-cli.sh" "${BRAKERRAK_INSTALL_SHA256:-}" ${BRAK_UPDATE_ARGS[@]+"${BRAK_UPDATE_ARGS[@]}"}
         exit 0
     fi
 fi
@@ -375,53 +504,75 @@ fi
 # Resolve /etc/brakerrak/node.env (transparently migrating legacy ~/.brakerrak/node.env)
 brak_resolve_node_env --migrate
 
-# Migrate pre-FHS `/opt/drewv-pgdg-riscv64` local APT repo -> `/var/lib/rvdk/pgdg-riscv64`
-# Strictly gated behind `ACTION == "forge"` so read-only/utility commands never mutate APT state.
-if [[ "$ACTION" == "forge" ]] && [[ -d /opt/drewv-pgdg-riscv64 || -f /etc/apt/sources.list.d/drewv-local-pgdg.list ]]; then
-    _RVDK_PG_ROOT="/var/lib/rvdk/pgdg-riscv64"
-    _RVDK_PG_DEBS="${_RVDK_PG_ROOT}/debs"
-    if compgen -G "/opt/drewv-pgdg-riscv64/debs/*.deb" >/dev/null 2>&1; then
-        mkdir -p /var/lib/rvdk "$_RVDK_PG_ROOT" "$_RVDK_PG_DEBS"
-        chmod 0755 /var/lib/rvdk "$_RVDK_PG_ROOT" "$_RVDK_PG_DEBS"
-        cp -a /opt/drewv-pgdg-riscv64/debs/*.deb "$_RVDK_PG_DEBS/" 2>/dev/null || true
-        rm -f "${_RVDK_PG_DEBS}"/*-dbgsym_*.deb
-        if command -v dpkg-scanpackages >/dev/null 2>&1; then
-            (
-                cd "$_RVDK_PG_DEBS"
-                rm -f InRelease Release Release.gpg Packages Packages.gz Packages.xz Packages.bz2 Packages.lzma Packages.zst
-                dpkg-scanpackages . /dev/null > Packages 2>/dev/null
-                gzip -9cn Packages > Packages.gz
-                chmod 0644 Packages Packages.gz ./*.deb 2>/dev/null || true
-                if command -v apt-ftparchive >/dev/null 2>&1; then
-                    apt-ftparchive release . > Release 2>/dev/null
-                else
-                    {
-                        printf 'Origin: RVDK\nLabel: RVDK-PGDG\nSuite: local\nCodename: local\nDate: %s\nSHA256:\n' \
-                            "$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S UTC')"
-                        for _idx in Packages Packages.gz; do
-                            printf ' %s %16d %s\n' \
-                                "$(sha256sum "$_idx" | awk '{print $1}')" \
-                                "$(wc -c < "$_idx" | tr -d '[:space:]')" \
-                                "$_idx"
-                        done
-                    } > Release
-                fi
-                chmod 0644 Release
-            )
-            printf 'deb [trusted=yes check-date=no lang=none] file://%s ./\n' "$_RVDK_PG_DEBS" > /etc/apt/sources.list.d/rvdk-local-pgdg.list
-            chmod 0644 /etc/apt/sources.list.d/rvdk-local-pgdg.list
+# Delegate pre-FHS `/opt/drewv-pgdg-riscv64` APT repo migration to RVDK when present;
+# strictly gated behind `ACTION == "forge"` so read-only/utility commands never mutate APT state.
+_brak_delegate_legacy_pgdg_migration() {
+    [[ "$ACTION" == "forge" ]] || return 0
+    [[ -d /opt/drewv-pgdg-riscv64 || -f /etc/apt/sources.list.d/drewv-local-pgdg.list ]] || return 0
+
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if [[ -f /usr/local/share/rvdk/engine/utils/migrate-pgdg.sh ]]; then
+            "$rvdk_cmd" utils/migrate-pgdg.sh
+            log_ok "Delegated legacy /opt/drewv-pgdg-riscv64 APT migration to RVDK"
+            return 0
+        elif "$rvdk_cmd" --help 2>/dev/null | grep -qE '(^|[[:space:]])migrate-pgdg([[:space:]]|$)'; then
+            "$rvdk_cmd" migrate-pgdg
+            log_ok "Delegated legacy /opt/drewv-pgdg-riscv64 APT migration to RVDK"
+            return 0
+        elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--migrate-legacy'; then
+            "$rvdk_cmd" postgresql --migrate-legacy
+            log_ok "Delegated legacy /opt/drewv-pgdg-riscv64 APT migration to RVDK"
+            return 0
         fi
+        log_warn "Legacy /opt/drewv-pgdg-riscv64 detected; delegating PGDG APT repo setup to RVDK (removing stale drewv-local-pgdg.list)."
+    else
+        log_warn "Legacy /opt/drewv-pgdg-riscv64 detected before RVDK CLI install; removing stale drewv-local-pgdg.list."
     fi
     rm -f /etc/apt/sources.list.d/drewv-local-pgdg.list /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* 2>/dev/null || true
-    rm -rf /opt/drewv-pgdg-riscv64
-    if [[ -f /etc/apt/sources.list.d/rvdk-local-pgdg.list ]] && command -v apt-get >/dev/null 2>&1; then
-        apt-get update \
-            -o Dir::Etc::sourcelist="/etc/apt/sources.list.d/rvdk-local-pgdg.list" \
-            -o Dir::Etc::sourceparts="-" \
-            -o APT::Get::List-Cleanup="0" -q 2>/dev/null || true
+}
+
+# Quarantined fallback for reclaiming PG18 Sv39 HugePages when RVDK is absent or lacks a hook.
+_brak_reclaim_hugepages_compat() {
+    local _hp_reclaimed="false"
+    if [[ -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf ]]; then
+        rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
+        _hp_reclaimed="true"
     fi
-    log_ok "Migrated legacy /opt/drewv-pgdg-riscv64 APT repo -> ${_RVDK_PG_DEBS}"
-fi
+    local _cur_hp
+    _cur_hp="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    if [[ "$_hp_reclaimed" == "true" ]] || { [[ "$_cur_hp" =~ ^[0-9]+$ ]] && (( _cur_hp > 0 )); }; then
+        sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
+        log_ok "Reclaimed static 2MB Sv39 HugePages (removed 90-rvdk-pg18-hugepages.conf & set vm.nr_hugepages=0)"
+    fi
+}
+
+# Delegate HugePages disablement to RVDK CLI/hooks when available.
+_brak_disable_hugepages() {
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if [[ -f /usr/local/share/rvdk/engine/utils/reclaim-hugepages.sh ]]; then
+            "$rvdk_cmd" utils/reclaim-hugepages.sh
+            log_ok "Delegated HugePages disablement to RVDK"
+            return 0
+        elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--disable'; then
+            run_rvdk postgresql --disable
+            log_ok "Delegated PostgreSQL/HugePages disablement to RVDK"
+            return 0
+        elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--reclaim-hugepages'; then
+            run_rvdk postgresql --reclaim-hugepages
+            log_ok "Delegated HugePages disablement to RVDK"
+            return 0
+        elif "$rvdk_cmd" deeptune --help 2>/dev/null | grep -qE -- '--reclaim-hugepages'; then
+            run_rvdk deeptune --reclaim-hugepages
+            log_ok "Delegated HugePages disablement to RVDK"
+            return 0
+        fi
+    fi
+    _brak_reclaim_hugepages_compat
+}
 
 # ==============================================================================
 # 3. Route Shared Lifecycle Subcommands Immediately (deeptune | storage | ort | bench | verify | reset)
@@ -514,13 +665,7 @@ case "$ACTION" in
                 ;;
             analyze|report)
                 shift
-                if command -v uv >/dev/null 2>&1 && [[ -f "${LOCAL_ROOT}/pyproject.toml" && -x "${LOCAL_ROOT}/.venv/bin/python" ]]; then
-                    exec uv run --project "$LOCAL_ROOT" --no-sync python "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                elif command -v uv >/dev/null 2>&1 && [[ -f "${LOCAL_ROOT}/pyproject.toml" ]]; then
-                    exec uv run --project "$LOCAL_ROOT" python "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                else
-                    exec python3 "${LOCAL_ROOT}/benchmarks/analyze_showdown.py" "$@"
-                fi
+                _brak_run_bench_analyze "$LOCAL_ROOT" "$@"
                 ;;
             -*)
                 exec bash "${LOCAL_ROOT}/benchmarks/run-iouring-showdown.sh" "$@"
@@ -723,18 +868,8 @@ while [[ $# -gt 0 ]]; do
             CLI_WITH_TAILSCALE="true"
             CLI_TS_FLAGS+=("--ssh")
             shift ;;
-        --tailscale-authkey|--ts-authkey)
-            brak_require_arg "$1" "${2:-}"
-            log_warn "Passing $1 on CLI argv exposes secrets in /proc/<pid>/cmdline. Prefer --tailscale-authkey-file <path> (0600) or TS_AUTHKEY env."
-            CLI_WITH_TAILSCALE="true"
-            CLI_TS_AUTHKEY="$2"
-            shift 2 ;;
-        --tailscale-authkey=*|--ts-authkey=*)
-            CLI_TS_AUTHKEY="${1#*=}"
-            brak_require_arg "${1%%=*}" "$CLI_TS_AUTHKEY"
-            log_warn "Passing ${1%%=*} on CLI argv exposes secrets in /proc/<pid>/cmdline. Prefer --tailscale-authkey-file <path> (0600) or TS_AUTHKEY env."
-            CLI_WITH_TAILSCALE="true"
-            shift ;;
+        --tailscale-authkey|--ts-authkey|--tailscale-authkey=*|--ts-authkey=*)
+            log_fatal "Option '${1%%=*}' is no longer supported because CLI argv exposes secrets in /proc/<pid>/cmdline. Use --tailscale-authkey-file <path> (0600) or the TS_AUTHKEY environment variable." ;;
         --tailscale-authkey-file|--ts-authkey-file)
             brak_require_arg "$1" "${2:-}"
             CLI_WITH_TAILSCALE="true"
@@ -792,9 +927,6 @@ done
 
 # Validate and read --tailscale-authkey-file (enforcing 0600 permissions)
 if [[ -n "$CLI_TS_AUTHKEY_FILE" ]]; then
-    if [[ -n "$CLI_TS_AUTHKEY" ]]; then
-        log_fatal "Cannot specify both --tailscale-authkey and --tailscale-authkey-file."
-    fi
     if [[ ! -f "$CLI_TS_AUTHKEY_FILE" || ! -r "$CLI_TS_AUTHKEY_FILE" ]]; then
         log_fatal "Tailscale authkey file not found or unreadable: ${CLI_TS_AUTHKEY_FILE}"
     fi
@@ -974,9 +1106,11 @@ export NODE_ROLE TARGET_HOSTNAME ADMIN_USER LAB_SUBNET NVME_DEV MOUNT_POINT NFS_
 if [[ ! -x "$RVDK_BIN" ]]; then
     brak_prog 5 "Stage 0A: Installing RVDK CLI..." 0 "Cloning RVDK engine..."
     log_step "0A. Installing RVDK Package Manager CLI (${RVDK_BASE_URL}/install-cli.sh)"
-    curl -fsSL "${RVDK_BASE_URL}/install-cli.sh" | bash -s -- --quiet
+    _brak_fetch_and_exec_script "${RVDK_BASE_URL}/install-cli.sh" "${RVDK_INSTALL_SHA256:-}" --quiet
     [[ -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk" || RVDK_BIN="/usr/local/bin/rvdk"
 fi
+
+_brak_delegate_legacy_pgdg_migration
 
 brak_prog 8 "Stage 1/7: Day-0 OS & Silicon BSP (${TARGET_HOSTNAME})" 0 "Launching rvdk day0..."
 log_step "1. RVDK Day-0 OS & Silicon BSP Convergence (Hostname: ${TARGET_HOSTNAME})"
@@ -1021,16 +1155,7 @@ else
         systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
         log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE} workloads"
     fi
-    _hp_reclaimed="false"
-    if [[ -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf ]]; then
-        rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
-        _hp_reclaimed="true"
-    fi
-    _cur_hp="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-    if [[ "$_hp_reclaimed" == "true" ]] || { [[ "$_cur_hp" =~ ^[0-9]+$ ]] && (( _cur_hp > 0 )); }; then
-        sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
-        log_ok "Reclaimed static 2MB Sv39 HugePages (removed 90-rvdk-pg18-hugepages.conf & set vm.nr_hugepages=0)"
-    fi
+    _brak_disable_hugepages
 fi
 
 if [[ "$WITH_RAID" == "true" ]]; then
@@ -1183,7 +1308,7 @@ fi
 
 log_step "6. Post-Flight Verification Summary (Pass ${FORGE_PASS})"
 printf "  • Hostname           : %s (Role: %s | Tune: %s | Pass: %s)\n" "$(hostname)" "$NODE_ROLE" "$RVDK_TUNE_PROFILE" "$FORGE_PASS"
-printf "  • HamStak Mesh Role  : %s\n" "$PIGEON_ROLE"
+printf "  • CarrierPigeons Role: %s\n" "$PIGEON_ROLE"
 printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
 printf "  • CPU Governor/Clock : %s\n" "$CPU_CLOCK_INFO"
 printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"

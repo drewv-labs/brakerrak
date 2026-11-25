@@ -53,7 +53,8 @@ done
 
 if [[ $EUID -ne 0 ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "$SCRIPT_SELF" "$@"
+        _BRAK_SUDO_KEEP_ENV="BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_NODE_ENV,BRAKERRAK_SYSTEM_ENGINE_DIR,BRAKERRAK_SYSTEM_ETC_DIR,BRAKERRAK_SYSTEM_NODE_ENV,TERM,COLORTERM,NO_COLOR"
+        exec sudo --preserve-env="$_BRAK_SUDO_KEEP_ENV" bash "$SCRIPT_SELF" "$@"
     else
         echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://brakerrak.dev/install-cli.sh | sudo bash" >&2
         exit 1
@@ -187,6 +188,31 @@ chmod +x \
     "${ENGINE_DIR}/install-cli.sh" \
     "${ENGINE_DIR}"/scripts/*.sh \
     "${ENGINE_DIR}"/benchmarks/*.sh 2>/dev/null || true
+
+# Sync clean-room Python runtime (.venv) when uv + pyproject.toml + uv.lock are present
+UV_BIN=""
+if command -v uv >/dev/null 2>&1; then
+    UV_BIN="$(command -v uv)"
+elif [[ -x /root/.local/bin/uv ]]; then
+    UV_BIN="/root/.local/bin/uv"
+elif [[ -x /root/.cargo/bin/uv ]]; then
+    UV_BIN="/root/.cargo/bin/uv"
+fi
+
+if [[ -n "$UV_BIN" && -f "${ENGINE_DIR}/pyproject.toml" ]]; then
+    if [[ -f "${ENGINE_DIR}/uv.lock" ]]; then
+        log_info "Syncing clean-room Python runtime in ${ENGINE_DIR}/.venv..."
+        if "$UV_BIN" sync --project "$ENGINE_DIR" --frozen --no-dev; then
+            chown -R 0:0 "${ENGINE_DIR}/.venv" 2>/dev/null || true
+            chmod -R a+rX "${ENGINE_DIR}/.venv" 2>/dev/null || true
+            log_ok "Synced ${ENGINE_DIR}/.venv (world-readable a+rX)"
+        else
+            log_warn "uv sync --project '${ENGINE_DIR}' --frozen --no-dev failed; 'brakerrak bench analyze' may require manual sync."
+        fi
+    else
+        log_warn "uv.lock missing in ${ENGINE_DIR}; skipping frozen .venv sync."
+    fi
+fi
 
 # Source the freshly staged lib-common.sh when bootstrapped via `curl | sudo bash`
 if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" != "1" && -f "${ENGINE_DIR}/scripts/lib-common.sh" ]]; then

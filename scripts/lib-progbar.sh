@@ -204,6 +204,11 @@ brak_prog_init() {
     local init_msg="${1:-Initializing BrakerRak forge...}"
     local esc="$_BRAK_ESC"
 
+    if declare -F brak_register_exit_hook >/dev/null 2>&1 && declare -F _brak_cleanup_tmpfiles >/dev/null 2>&1; then
+        _BRAK_LEGACY_TMPFILES_PID="${BASHPID:-$$}"
+        brak_register_exit_hook _brak_cleanup_tmpfiles
+    fi
+
     if [[ "${BRAKERRAK_NO_PROGBAR:-0}" == "1" || "${NO_PROGBAR:-0}" == "1" ]]; then
         export RVDK_NO_PROGBAR="1"
         return 0
@@ -253,9 +258,13 @@ brak_prog_init() {
     local scroll_end=$(( _BRAK_PROG_ROWS - 2 ))
     _brak_prog_out $'\n\n'"${esc}[2A${esc}7${esc}[1;${scroll_end}r${esc}8"
 
-    trap 'brak_prog_cleanup' EXIT
-    trap 'brak_prog_cleanup; trap - INT; kill -INT $$' INT
-    trap 'brak_prog_cleanup; trap - TERM; kill -TERM $$' TERM
+    if declare -F brak_register_exit_hook >/dev/null 2>&1; then
+        brak_register_exit_hook brak_prog_cleanup
+    else
+        trap 'brak_prog_cleanup' EXIT
+        trap 'brak_prog_cleanup; trap - INT; kill -INT $$' INT
+        trap 'brak_prog_cleanup; trap - TERM; kill -TERM $$' TERM
+    fi
     trap '_brak_prog_render' WINCH
 
     _brak_prog_render
@@ -297,7 +306,7 @@ brak_prog() {
 }
 
 brak_prog_cleanup() {
-    local rc=$?
+    local rc="${1:-$?}"
     local esc="$_BRAK_ESC"
     if [[ "$_BRAK_PROG_ACTIVE" == "1" ]]; then
         _brak_prog_query_geom

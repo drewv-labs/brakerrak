@@ -26,7 +26,10 @@ from brakerrak_ort.probes import (
     LocalSystemProbe,
     detect_pcie_accelerators,
     detect_primary_nic,
+    inspect_accelerator_runtime,
+    inspect_btrfs_device_stats,
     inspect_databroker_services,
+    inspect_mount_fstype,
     inspect_postgres_state,
     parse_cpuinfo_harts,
     parse_gt_per_sec,
@@ -38,15 +41,16 @@ from brakerrak_ort.probes import (
 from brakerrak_ort.profiles import (
     ROLE_STEM_MAP,
     SocProfile,
-    detect_soc_from_dt_model,
-    get_soc_profile,
-    normalize_soc_slug,
+    resolve_profile,
 )
 from brakerrak_ort.redact import build_public_snapshot, sign_snapshot
 from brakerrak_ort.types import (
     AcceleratorInfo,
+    AcceleratorRuntimeInfo,
     AssertionResult,
     AssertionStatus,
+    BtrfsDeviceStatsInfo,
+    MountInfo,
     PrimaryNicStatus,
     SnapshotOutputs,
     SystemProbe,
@@ -81,6 +85,90 @@ def compute_overall_status(assertions: Sequence[AssertionResult]) -> AssertionSt
     return "PASS"
 
 
+_PROTECTED_OS_MOUNTS: frozenset[str] = frozenset(
+    {"/", "/boot", "/boot/efi", "/boot/firmware", "[SWAP]"}
+)
+
+
+def _is_rotational_disk(bd: Mapping[str, Any]) -> bool:
+    """Return True when lsblk reports a rotational (ROTA == 1 / true) disk."""
+    rota = bd.get("rota")
+    if isinstance(rota, bool):
+        return rota
+    if isinstance(rota, int):
+        return rota == 1
+    if isinstance(rota, str):
+        return rota.strip().lower() in ("1", "true")
+    return False
+
+
+def _is_protected_os_disk(bd: Mapping[str, Any]) -> bool:
+    """Return True if a disk or any of its children hosts root, boot, or active swap."""
+    mp = str(bd.get("mountpoint") or "").strip()
+    if mp in _PROTECTED_OS_MOUNTS:
+        return True
+    raw_mps = bd.get("mountpoints")
+    if isinstance(raw_mps, list):
+        for entry in raw_mps:
+            if entry is not None and str(entry).strip() in _PROTECTED_OS_MOUNTS:
+                return True
+    fstype = str(bd.get("fstype") or "").strip().lower()
+    if fstype == "swap":
+        return True
+    children = bd.get("children")
+    if isinstance(children, list):
+        for child in children:
+            if isinstance(child, Mapping) and _is_protected_os_disk(child):
+                return True
+    return False
+
+
+def _build_accelerator_link_assertion(
+    assertion_id: str,
+    pcie_accelerators: Sequence[AcceleratorInfo],
+    profile: SocProfile,
+) -> AssertionResult:
+    """Build an independent PCIe accelerator link assertion for ORT-03 or ORT-03B."""
+    if not pcie_accelerators:
+        return {
+            "id": assertion_id,
+            "description": (
+                "PCIe Accelerator Seated (NPU/GPU occupying M.2/PCIe slot; NVMe optional)"
+            ),
+            "expected": "PCIe accelerator present (e.g., 1e60:* / 1e52:*)",
+            "actual": "missing (no PCIe accelerator detected)",
+            "status": "FAIL",
+        }
+
+    parts: list[str] = []
+    overall: AssertionStatus = "PASS"
+    for acc in pcie_accelerators:
+        acc_speed = acc["pcie_link_speed"]
+        acc_width = acc["pcie_link_width"]
+        if acc_speed:
+            acc_gt_s = parse_gt_per_sec(acc_speed)
+            if acc_gt_s != 0.0 and acc_gt_s < profile.min_gt_s:
+                overall = "WARN"
+            parts.append(
+                f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] "
+                f"({acc_speed} | x{acc_width or '?'})"
+            )
+        else:
+            parts.append(
+                f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] (detected)"
+            )
+
+    return {
+        "id": assertion_id,
+        "description": (
+            "PCIe Accelerator Seated (NPU/GPU occupying M.2/PCIe slot; NVMe optional)"
+        ),
+        "expected": "PCIe accelerator present (e.g., 1e60:* / 1e52:*)",
+        "actual": "; ".join(parts),
+        "status": overall,
+    }
+
+
 def evaluate_assertions(
     *,
     profile: SocProfile,
@@ -100,13 +188,19 @@ def evaluate_assertions(
     broker_services_state: Mapping[str, Any],
     sysctl_baseline: Mapping[str, str],
     env: Mapping[str, str] | None = None,
+    accelerator_runtime: Mapping[str, AcceleratorRuntimeInfo] | None = None,
+    nvme_mount_info: MountInfo | None = None,
+    raid_mount_checks: Sequence[tuple[str, str, MountInfo, BtrfsDeviceStatsInfo]] = (),
+    with_raid: bool = False,
+    mount_point: str = "/mnt/nvme_pgdata",
 ) -> list[AssertionResult]:
     """Evaluate hardware, bus, network, thermal, and stage-aware Day-1 ORT assertions."""
+    active_env = os.environ if env is None else env
     role_lower = node_role.strip().lower()
     is_accel_persona = role_lower.startswith(("vision", "babbage"))
-    enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, role_lower, env)
-    enable_mqtt = resolve_feature_flag("ENABLE_MQTT_BROKER", node_env, role_lower, env)
-    enable_nfs = resolve_feature_flag("ENABLE_NFS_SERVER", node_env, role_lower, env)
+    enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, role_lower, active_env)
+    enable_mqtt = resolve_feature_flag("ENABLE_MQTT_BROKER", node_env, role_lower, active_env)
+    enable_nfs = resolve_feature_flag("ENABLE_NFS_SERVER", node_env, role_lower, active_env)
 
     # ORT-01: CPU Harts
     hart_count = len(harts)
@@ -120,7 +214,8 @@ def evaluate_assertions(
     # ORT-02: System Memory
     ram_status: AssertionStatus = "PASS" if total_ram_kb >= profile.ram_floor_kb else "FAIL"
 
-    # ORT-03: Primary PCIe NVMe or Accelerator Slot
+    # ORT-03 & ORT-03B: Decoupled Primary PCIe NVMe and Accelerator Slots
+    ort_03_checks: list[AssertionResult] = []
     if nvme_present:
         actual_gt_s = parse_gt_per_sec(
             str(nvme_info["pcie_link_speed"])
@@ -144,59 +239,49 @@ def evaluate_assertions(
             pcie_status = "PASS"
         else:
             pcie_status = "WARN"
-        ort_03: AssertionResult = {
-            "id": "ORT-03_PCIE_NVME_LINK",
-            "description": profile.pcie_desc,
-            "expected": f">= {profile.min_gt_s:.1f} GT/s PCIe | >= x{profile.min_width}",
-            "actual": f"{link_speed_raw} | x{link_width_raw}",
-            "status": pcie_status,
-        }
-    elif is_accel_persona and not enable_pg:
-        if pcie_accelerators:
-            acc = pcie_accelerators[0]
-            acc_speed = acc["pcie_link_speed"]
-            acc_width = acc["pcie_link_width"]
-            if acc_speed:
-                acc_gt_s = parse_gt_per_sec(acc_speed)
-                acc_status: AssertionStatus = (
-                    "PASS" if (acc_gt_s == 0.0 or acc_gt_s >= profile.min_gt_s) else "WARN"
-                )
-                acc_actual = (
-                    f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] "
-                    f"({acc_speed} | x{acc_width or '?'})"
-                )
-            else:
-                acc_status = "PASS"
-                acc_actual = (
-                    f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] (detected)"
-                )
-            ort_03 = {
-                "id": "ORT-03_PCIE_ACCELERATOR_LINK",
-                "description": (
-                    "PCIe Accelerator Seated (NPU/GPU occupying M.2/PCIe slot; NVMe optional)"
-                ),
-                "expected": "PCIe accelerator present (e.g., 1e60:* / 1e52:*)",
-                "actual": acc_actual,
-                "status": acc_status,
+        ort_03_checks.append(
+            {
+                "id": "ORT-03_PCIE_NVME_LINK",
+                "description": profile.pcie_desc,
+                "expected": f">= {profile.min_gt_s:.1f} GT/s PCIe | >= x{profile.min_width}",
+                "actual": f"{link_speed_raw} | x{link_width_raw}",
+                "status": pcie_status,
             }
-        else:
-            ort_03 = {
-                "id": "ORT-03_PCIE_ACCELERATOR_LINK",
-                "description": (
-                    "PCIe Accelerator Seated (NPU/GPU occupying M.2/PCIe slot; NVMe optional)"
-                ),
-                "expected": "PCIe accelerator present (e.g., 1e60:* / 1e52:*)",
-                "actual": "missing (no NVMe or PCIe accelerator detected)",
+        )
+        if pcie_accelerators or is_accel_persona:
+            ort_03_checks.append(
+                _build_accelerator_link_assertion(
+                    "ORT-03B_PCIE_ACCELERATOR_LINK",
+                    pcie_accelerators,
+                    profile,
+                )
+            )
+    elif is_accel_persona and not enable_pg:
+        ort_03_checks.append(
+            _build_accelerator_link_assertion(
+                "ORT-03_PCIE_ACCELERATOR_LINK",
+                pcie_accelerators,
+                profile,
+            )
+        )
+    else:
+        ort_03_checks.append(
+            {
+                "id": "ORT-03_PCIE_NVME_LINK",
+                "description": profile.pcie_desc,
+                "expected": f">= {profile.min_gt_s:.1f} GT/s PCIe | >= x{profile.min_width}",
+                "actual": "missing",
                 "status": "FAIL",
             }
-    else:
-        ort_03 = {
-            "id": "ORT-03_PCIE_NVME_LINK",
-            "description": profile.pcie_desc,
-            "expected": f">= {profile.min_gt_s:.1f} GT/s PCIe | >= x{profile.min_width}",
-            "actual": "missing",
-            "status": "FAIL",
-        }
+        )
+        if pcie_accelerators:
+            ort_03_checks.append(
+                _build_accelerator_link_assertion(
+                    "ORT-03B_PCIE_ACCELERATOR_LINK",
+                    pcie_accelerators,
+                    profile,
+                )
+            )
 
     next_idx = 4 + len(raid_ort_checks)
     nic_tag = re.sub(r"[^A-Z0-9]", "_", primary_nic.name.upper())
@@ -222,7 +307,7 @@ def evaluate_assertions(
             "actual": f"{total_ram_kb} kB",
             "status": ram_status,
         },
-        ort_03,
+        *ort_03_checks,
         *raid_ort_checks,
         {
             "id": f"ORT-{next_idx:02d}_PRIMARY_NIC_{nic_tag}",
@@ -267,6 +352,22 @@ def evaluate_assertions(
                 }
             )
 
+        if (nvme_present or enable_pg) and nvme_mount_info is not None:
+            xfs_mounted = bool(nvme_mount_info.get("mounted"))
+            xfs_fstype = nvme_mount_info.get("fstype")
+            xfs_ok = xfs_mounted and xfs_fstype == "xfs"
+            checks.append(
+                {
+                    "id": "ORT-D1_NVME_XFS_MOUNT",
+                    "description": f"Primary NVMe Data Volume ({mount_point}) Mounted as XFS",
+                    "expected": "mounted (xfs)",
+                    "actual": (
+                        f"mounted ({xfs_fstype or 'unknown'})" if xfs_mounted else "unmounted"
+                    ),
+                    "status": "PASS" if xfs_ok else "FAIL",
+                }
+            )
+
         if enable_pg:
             pg_active = bool(postgres_state.get("systemd_service_active"))
             checks.append(
@@ -294,27 +395,97 @@ def evaluate_assertions(
 
             hp_raw = str(sysctl_baseline.get("vm.nr_hugepages") or "").strip()
             hp_val = int(hp_raw) if hp_raw.isdigit() else 0
+            hp_pg_status = str(pg_params.get("huge_pages_status") or "unavailable").strip().lower()
+            hp_ok = hp_val > 0 and hp_pg_status == "on"
             checks.append(
                 {
                     "id": "ORT-D1_VM_HUGEPAGES",
-                    "description": "Static Linux Kernel HugePages Allocated for PostgreSQL",
-                    "expected": "> 0",
-                    "actual": hp_val,
-                    "status": "PASS" if hp_val > 0 else "FAIL",
+                    "description": (
+                        "Static Linux Kernel HugePages Allocated and Active in PostgreSQL"
+                    ),
+                    "expected": "vm.nr_hugepages > 0 and huge_pages_status = on",
+                    "actual": f"vm.nr_hugepages={hp_val}, huge_pages_status={hp_pg_status}",
+                    "status": "PASS" if hp_ok else "FAIL",
                 }
             )
 
+        if with_raid:
+            if raid_mount_checks:
+                for arr_name, arr_mount, m_info, btrfs_stats in raid_mount_checks:
+                    arr_tag = re.sub(r"[^A-Z0-9]", "_", arr_name.upper())
+                    b_mounted = bool(m_info.get("mounted"))
+                    b_fstype = m_info.get("fstype")
+                    b_mount_ok = b_mounted and b_fstype == "btrfs"
+                    checks.append(
+                        {
+                            "id": f"ORT-D1_{arr_tag}_BTRFS_MOUNT",
+                            "description": (
+                                f"{arr_name} Btrfs RAID Volume ({arr_mount}) Mounted as btrfs"
+                            ),
+                            "expected": "mounted (btrfs)",
+                            "actual": (
+                                f"mounted ({b_fstype or 'unknown'})" if b_mounted else "unmounted"
+                            ),
+                            "status": "PASS" if b_mount_ok else "FAIL",
+                        }
+                    )
+
+                    stats_ok = bool(btrfs_stats.get("stats_available"))
+                    total_errs = int(btrfs_stats.get("total_errors") or 0)
+                    nonzero = btrfs_stats.get("nonzero_errors") or []
+                    if stats_ok and total_errs == 0:
+                        stats_actual = "0 errors"
+                        stats_status: AssertionStatus = "PASS"
+                    elif stats_ok:
+                        stats_actual = f"{total_errs} errors ({', '.join(nonzero)})"
+                        stats_status = "FAIL"
+                    else:
+                        stats_actual = str(btrfs_stats.get("error") or "unavailable")
+                        stats_status = "FAIL"
+                    checks.append(
+                        {
+                            "id": f"ORT-D1_{arr_tag}_BTRFS_STATS",
+                            "description": (
+                                f"{arr_name} Btrfs Device Error Counters Zero ({arr_mount})"
+                            ),
+                            "expected": "0 errors",
+                            "actual": stats_actual,
+                            "status": stats_status,
+                        }
+                    )
+            else:
+                checks.append(
+                    {
+                        "id": "ORT-D1_RAID_BTRFS_MOUNT",
+                        "description": "Configured Btrfs RAID Vault Mounted",
+                        "expected": "mounted (btrfs)",
+                        "actual": "WITH_RAID=true but RAID_ARRAYS_JSON is empty",
+                        "status": "FAIL",
+                    }
+                )
+
         if enable_mqtt:
+            raw_req_mqtt = (
+                active_env.get("REQUIRE_MQTT_BROKER")
+                if active_env.get("REQUIRE_MQTT_BROKER") is not None
+                else node_env.get("REQUIRE_MQTT_BROKER")
+            )
+            if raw_req_mqtt is not None and raw_req_mqtt.strip() != "":
+                mqtt_required = raw_req_mqtt.strip().lower() in ("1", "true", "yes", "on")
+            else:
+                mqtt_required = role_lower == "databroker"
+
             raw_mqtt = broker_services_state.get("mosquitto_mqtt")
             mqtt_map = raw_mqtt if isinstance(raw_mqtt, Mapping) else {}
             mqtt_active = bool(mqtt_map.get("systemd_service_active"))
+            mqtt_fail_status: AssertionStatus = "FAIL" if mqtt_required else "WARN"
             checks.append(
                 {
                     "id": "ORT-D1_MQTT_ACTIVE",
                     "description": "Mosquitto MQTT Broker Systemd Service Active",
-                    "expected": "active",
+                    "expected": "active" if mqtt_required else "active (optional/supplemental)",
                     "actual": "active" if mqtt_active else "inactive",
-                    "status": "PASS" if mqtt_active else "FAIL",
+                    "status": "PASS" if mqtt_active else mqtt_fail_status,
                 }
             )
 
@@ -329,6 +500,52 @@ def evaluate_assertions(
                     "expected": "active",
                     "actual": "active" if nfs_active else "inactive",
                     "status": "PASS" if nfs_active else "FAIL",
+                }
+            )
+
+        detected_vendors = {acc["vendor_id"].lower() for acc in pcie_accelerators}
+        rt_map = accelerator_runtime or {}
+        if "1e60" in detected_vendors:
+            hailo_rt = rt_map.get("hailo")
+            devs = list(hailo_rt.get("device_nodes", [])) if hailo_rt else []
+            kmod = bool(hailo_rt.get("kmod_loaded")) if hailo_rt else False
+            cli_ok = bool(hailo_rt.get("cli_ok")) if hailo_rt else False
+            hailo_ok = bool(devs) and kmod and cli_ok
+            checks.append(
+                {
+                    "id": "ORT-D1_HAILO_RUNTIME",
+                    "description": (
+                        "Hailo NPU Runtime (/dev/hailo*, hailo_pci kmod, hailortcli) Operational"
+                    ),
+                    "expected": "/dev/hailo* + hailo_pci + hailortcli ok",
+                    "actual": (
+                        f"devs={','.join(devs) if devs else 'none'} | "
+                        f"kmod={'loaded' if kmod else 'missing'} | "
+                        f"hailortcli={'ok' if cli_ok else 'failed'}"
+                    ),
+                    "status": "PASS" if hailo_ok else "FAIL",
+                }
+            )
+        if "1e52" in detected_vendors:
+            tt_rt = rt_map.get("tenstorrent")
+            devs = list(tt_rt.get("device_nodes", [])) if tt_rt else []
+            kmod = bool(tt_rt.get("kmod_loaded")) if tt_rt else False
+            cli_ok = bool(tt_rt.get("cli_ok")) if tt_rt else False
+            tt_ok = bool(devs) and kmod and cli_ok
+            checks.append(
+                {
+                    "id": "ORT-D1_TENSTORRENT_RUNTIME",
+                    "description": (
+                        "Tenstorrent AI Runtime (/dev/tenstorrent*, tenstorrent kmod, tt-smi) "
+                        "Operational"
+                    ),
+                    "expected": "/dev/tenstorrent* + tenstorrent + tt-smi ok",
+                    "actual": (
+                        f"devs={','.join(devs) if devs else 'none'} | "
+                        f"kmod={'loaded' if kmod else 'missing'} | "
+                        f"tt-smi={'ok' if cli_ok else 'failed'}"
+                    ),
+                    "status": "PASS" if tt_ok else "FAIL",
                 }
             )
 
@@ -380,19 +597,28 @@ def collect_snapshot(
     resolved_node_env = dict(node_env) if node_env is not None else {}
 
     dt_model = (probe.read_text("/proc/device-tree/model") or "").rstrip("\x00")
-    raw_soc = (
+    requested_soc = (
         soc
         or active_env.get("BRAKERRAK_TARGET")
         or resolved_kit.get("RVDK_SOC_SLUG")
-        or detect_soc_from_dt_model(dt_model)
-        or "generic-riscv64"
     )
-    soc_slug = normalize_soc_slug(raw_soc)
-    profile = get_soc_profile(soc_slug)
+    profile = resolve_profile(requested_soc, dt_model=dt_model)
+    soc_slug = profile.slug
 
     node_role = (
         active_env.get("NODE_ROLE") or resolved_node_env.get("NODE_ROLE") or "devbench"
     ).strip().lower()
+    with_raid = (
+        (active_env.get("WITH_RAID") or resolved_node_env.get("WITH_RAID") or "false")
+        .strip()
+        .lower()
+        == "true"
+    )
+    mount_point = (
+        active_env.get("MOUNT_POINT")
+        or resolved_node_env.get("MOUNT_POINT")
+        or "/mnt/nvme_pgdata"
+    ).strip() or "/mnt/nvme_pgdata"
     raid_arrays_cfg = get_raid_arrays_config(resolved_node_env, active_env)
 
     ts = now_utc or datetime.datetime.now(datetime.UTC)
@@ -455,7 +681,7 @@ def collect_snapshot(
             "-b",
             "-o",
             (
-                "NAME,PATH,SIZE,TYPE,TRAN,VENDOR,MODEL,SERIAL,REV,"
+                "NAME,PATH,SIZE,TYPE,TRAN,ROTA,VENDOR,MODEL,SERIAL,REV,"
                 "LOG-SEC,PHY-SEC,FSTYPE,LABEL,PARTLABEL,UUID,PARTUUID,MOUNTPOINT"
             ),
         ]
@@ -475,41 +701,86 @@ def collect_snapshot(
 
     usb_raid_arrays: dict[str, dict[str, Any]] = {}
     raid_ort_checks: list[AssertionResult] = []
+    raid_mount_checks: list[tuple[str, str, MountInfo, BtrfsDeviceStatsInfo]] = []
+    day1_mode = is_day1_stage(stage)
+
     for idx, arr_cfg in enumerate(raid_arrays_cfg, start=4):
         arr_name = str(arr_cfg.get("name", f"Array{idx}"))
         arr_id = str(arr_cfg.get("id") or arr_name.lower())
         arr_type = str(arr_cfg.get("type", "vault"))
         arr_label = str(arr_cfg.get("label", ""))
-        arr_mount = str(arr_cfg.get("mount", ""))
+        arr_mount = str(arr_cfg.get("mount", "")).strip()
         expected_disks = int(arr_cfg.get("disks", 4))
         min_b = int(arr_cfg.get("min_bytes", 0))
         max_b = int(arr_cfg.get("max_bytes", 0))
 
+        explicit_raw = arr_cfg.get("devices")
+        explicit_devices: set[str] = set()
+        if isinstance(explicit_raw, list):
+            explicit_devices = {str(dev).strip() for dev in explicit_raw if str(dev).strip()}
+        has_explicit_devices = bool(explicit_devices)
+
         matched_disks: list[dict[str, Any]] = []
         for bd in block_devices:
-            if bd.get("type") == "disk":
-                sz = int(bd.get("size") or 0)
-                if min_b <= sz <= max_b:
-                    matched_disks.append(
-                        {
-                            "path": bd.get("path"),
-                            "size_bytes": sz,
-                            "model": bd.get("model"),
-                            "serial": bd.get("serial"),
-                            "tran": bd.get("tran"),
-                        }
-                    )
+            if bd.get("type") != "disk":
+                continue
+            if _is_protected_os_disk(bd):
+                continue
+            sz = int(bd.get("size") or 0)
+            if has_explicit_devices:
+                bd_path = str(bd.get("path") or "").strip()
+                bd_name = str(bd.get("name") or "").strip()
+                if bd_path not in explicit_devices and bd_name not in explicit_devices:
+                    continue
+            else:
+                if not _is_rotational_disk(bd):
+                    continue
+                if not (min_b <= sz <= max_b):
+                    continue
+            matched_disks.append(
+                {
+                    "path": bd.get("path"),
+                    "size_bytes": sz,
+                    "model": bd.get("model"),
+                    "serial": bd.get("serial"),
+                    "tran": bd.get("tran"),
+                    "rota": bd.get("rota"),
+                }
+            )
 
-        usb_raid_arrays[arr_id] = {
+        arr_mount_info = (
+            inspect_mount_fstype(arr_mount, probe)
+            if arr_mount
+            else MountInfo(mountpoint="", mounted=False, fstype=None)
+        )
+        if day1_mode and arr_mount_info["mounted"] and arr_mount_info["fstype"] == "btrfs":
+            btrfs_stats = inspect_btrfs_device_stats(arr_mount, probe)
+        else:
+            btrfs_stats = BtrfsDeviceStatsInfo(
+                mountpoint=arr_mount,
+                stats_available=False,
+                total_errors=0,
+                nonzero_errors=[],
+                error="not mounted as btrfs" if arr_mount else "missing mount path",
+            )
+
+        arr_entry: dict[str, Any] = {
             "name": arr_name,
             "type": arr_type,
             "label": arr_label,
             "mount": arr_mount,
             "expected_disks": expected_disks,
             "detected_disks_count": len(matched_disks),
-            "mounted": probe.is_mount(arr_mount) if arr_mount else False,
+            "mounted": arr_mount_info["mounted"],
+            "fstype": arr_mount_info["fstype"],
             "detected_disks": matched_disks,
         }
+        if day1_mode:
+            arr_entry["btrfs_device_stats"] = btrfs_stats
+        usb_raid_arrays[arr_id] = arr_entry
+
+        if with_raid:
+            raid_mount_checks.append((arr_name, arr_mount, arr_mount_info, btrfs_stats))
 
         chk_id = f"ORT-{idx:02d}_{re.sub(r'[^A-Z0-9]', '_', arr_name.upper())}_ARRAY_JBOD"
         raid_ort_checks.append(
@@ -634,6 +905,11 @@ def collect_snapshot(
         "mdadm": _first_line(["mdadm", "--version"]),
     }
 
+    accelerator_runtime = (
+        inspect_accelerator_runtime(pcie_accelerators, probe) if day1_mode else {}
+    )
+    nvme_mount_info = inspect_mount_fstype(mount_point, probe) if day1_mode else None
+
     total_ram_kb = probe.get_total_ram_kb()
     soc_peak_c = resolve_soc_peak_temp(quiescent["thermal_zones_celsius"])
     ort_checks = evaluate_assertions(
@@ -654,6 +930,11 @@ def collect_snapshot(
         broker_services_state=broker_services_state,
         sysctl_baseline=sysctl_baseline,
         env=active_env,
+        accelerator_runtime=accelerator_runtime,
+        nvme_mount_info=nvme_mount_info,
+        raid_mount_checks=raid_mount_checks,
+        with_raid=with_raid,
+        mount_point=mount_point,
     )
     overall_status = compute_overall_status(ort_checks)
 
@@ -663,6 +944,10 @@ def collect_snapshot(
         uptime_seconds = float(uptime_token)
     except ValueError:
         uptime_seconds = 0.0
+
+    storage_mounts: dict[str, Any] = {}
+    if nvme_mount_info is not None:
+        storage_mounts[mount_point] = nvme_mount_info
 
     hostname = probe.get_hostname()
     snapshot_payload: dict[str, Any] = {
@@ -691,7 +976,9 @@ def collect_snapshot(
             "cache_hierarchy": caches,
             "nvme_primary": nvme_info,
             "pcie_accelerators": pcie_accelerators,
+            "accelerator_runtime": accelerator_runtime,
             "usb_raid_arrays": usb_raid_arrays,
+            "storage_mounts": storage_mounts,
             "usb_topology_tree": lsusb_tree.splitlines(),
             "pci_devices": pci_lines,
             "block_devices": block_devices,

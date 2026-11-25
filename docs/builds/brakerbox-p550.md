@@ -31,8 +31,8 @@ The BrakerBox-P550 also offers support for `custom RAID storage tiers`, `Mosquit
 | **Boot / Root OS** | 128GB Soldered eMMC (`mmcblk0`) | Ubuntu 24.04 LTS (`multi-user.target` headless strip) |
 | **Tier 0 (Hot NVMe)** | 2TB `WD_BLACK SN850X` (`nvme0n1`) + `be quiet! MC1` Heatsink | PCIe Gen3 x4 (`8.0 GT/s`), formatted to native `4096B` (`4Kn`) LBA |
 | **PCIe Riser Assembly** | StarTech `PEX4M2E1` + Folded Twin-Axial PCIe x4 Ribbon Riser | Anchored to chassis floor via ATX standoff + elastomer isolation bumpers |
-| **Tier 1 (Warm Vault)** | `WarmVault` (`U08`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/warm_vault`) |
-| **Tier 2 (Cold Archive)** | `ColdVault` (`U09`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/cold_vault`) |
+| **Tier 1 (Warm Vault)** | `WarmVault` (`Slot-C`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/warm_vault`) |
+| **Tier 2 (Cold Archive)** | `ColdVault` (`Slot-D`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/cold_vault`) |
 | **Chassis & Power** | SilverStone `SST-RM100` (1U) + PicoPSU / Internal 12V Brick | 3x 40mm chassis fans controlled via Noctua NA-FC1 |
 
 ### USB Root Hub Topology Note
@@ -45,8 +45,9 @@ All external USB 3.2 Gen 1 ports on the HF106 carrier board sit behind a single 
 ### A. Native `4Kn` (`4096`-Byte) NVMe Alignment
 Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sector) mode. During Stage 1/2 of `forge.sh`, `nvme-cli` inspects the namespace capabilities (`lbads:12` -> `4096B`) and executes a low-level `nvme format` to native **`4Kn` (`4096`-byte)** sectors prior to LVM physical volume alignment (`--dataalignment 4m`) and XFS creation (`-s size=4096 -b size=4096`). This eliminates internal SSD controller Read-Modify-Write (RMW) translation penalties on PostgreSQL 8KB page flushes.
 
-### B. LVM Snapshot Reserve
-`forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB) of unallocated extents. This allows instant, zero-downtime LVM copy-on-write (CoW) snapshots to reset database state between deterministic benchmark runs.
+### B. Dual-LVM Elastic Pool & Snapshot Reserve
+* **Single-LV / RAID-Backed Builds (`databench` or `WITH_RAID="true"`):** `forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB) of unallocated extents for instant, zero-downtime LVM copy-on-write (CoW) snapshots between deterministic benchmark runs.
+* **Single-NVMe NFS Builds (`ENABLE_NFS_SERVER="true"` & `WITH_RAID="false"`):** `forge.sh` provisions a **Dual-LVM** layout inside `vg_braker` (`rvdk mods/nvme-4kn --with-nfs-lv`), carving `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`, XFS) alongside `/dev/vg_braker/lv_nfsvault` (`/mnt/nfs_vault`, Btrfs) while retaining unallocated VG reserve extents for CoW snapshots and online elastic rebalancing (`brakerrak storage [status|grow-psql|grow-nfs|shrink-nfs|autotune]`).
 
 ### C. PostgreSQL 18 Drop-In Configuration (`99-rvdk-sifive-p550.conf`)
 * **Async I/O Engine:** `io_method = io_uring` (auto-verified against `liburing` linkage and `kernel.io_uring_disabled = 0`)
@@ -74,6 +75,12 @@ Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-form
 | **Bitmap Scan Wall Time** | 54698 ms | 28530 ms | 35011 ms | 62482 ms |
 | **Bitmap Scan Context Switches** | 24854 | 611038 | 508370 | 32189 |
 | **Bitmap Scan L1d Cache Misses** | 4.75 B | 4.97 B | 4.93 B | 3.03 B |
+
+To reproduce the `io_uring` + `O_DIRECT` column during a showdown run, pass `--with-direct-io`:
+~~~bash
+sudo brakerrak bench showdown --with-direct-io
+~~~
+`--with-direct-io` sets `debug_io_direct = 'data'` via `ALTER SYSTEM`, restarts PostgreSQL (verifying `pending_restart = 'f'`), and cleanly restores the baseline GUC on teardown.
 
 
 ---
@@ -133,13 +140,12 @@ RAID_ARRAYS_JSON='[
     "type": "warm",
     "label": "WARM_VAULT",
     "mount": "/mnt/warm_vault",
-    "md_dev": "/dev/md/warmvault",
     "disks": 4,
     "min_bytes": 11000000000000,
     "max_bytes": 13000000000000,
     "tablespace": "ts_warm_vault",
     "nfs_fsid": 10,
-    "nfs_dirs": ["models/hailo8", "models/hailo8l", "datasets", "benchmarks", "pg_backups", "ctd-vault"]
+    "nfs_dirs": ["models/hailo8", "models/hailo8l", "models/hailo10h", "datasets", "benchmarks", "pg_backups", "ctd-vault"]
   },
   {
     "name": "ColdVault",
@@ -147,7 +153,6 @@ RAID_ARRAYS_JSON='[
     "type": "cold",
     "label": "COLD_VAULT",
     "mount": "/mnt/cold_vault",
-    "md_dev": "/dev/md/coldvault",
     "disks": 4,
     "min_bytes": 5500000000000,
     "max_bytes": 6500000000000,

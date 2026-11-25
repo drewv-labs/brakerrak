@@ -27,12 +27,12 @@ When provisioned with `--role databroker` (`BrakerBox-VF2`), this target also of
 | **Board / SoC** | StarFive VisionFive 2 (`StarFive JH7110`) | Compact SBC (`100mm × 72mm`), Dual RGMII GbE (`eth0` / `eth1`) |
 | **CPU Complex** | 4x SiFive U74 Cores @ 1.5GHz (+ 1x S7 Monitor Core) | 8-stage, 2-Wide Dual-Issue In-Order (`InO`), `rv64imafdc_zicsr_zifencei_zba_zbb` |
 | **Cache Hierarchy** | 32KB L1I + 32KB L1D / 2MB Shared L2 (`CCACHE`) | Coherent L2 cache controller w/ hardware PMU event counters |
-| **System Memory** | 8GB LPDDR4-2800 | 32-bit bus, soldered on PCB |
+| **System Memory** | 8GB LPDDR4-2800 (4GB variant supported) | 32-bit bus, soldered on PCB (see §3.C memory profiles) |
 | **Boot / Root OS** | 16MB QSPI NOR (`SPL` + `U-Boot`) + microSD / eMMC | Debian Headless (`riscv64`, `multi-user.target` headless strip) |
 | **Tier 0 (Hot NVMe)** | 2TB `WD_BLACK SN750` (`nvme0n1`) | Underside M.2 M-Key (`2280`), PCIe Gen2 x1 (`5.0 GT/s`), native `4096B` (`4Kn`) LBA |
 | **Optional RAID Tiers** | Configurable via `RAID_ARRAYS_JSON` (`--with-raid`) | External USB 3.0 4-Bay JBOD (`mdadm` RAID 10 + XFS or native `Btrfs RAID 10`) |
 | **Thermal Armor** | `youyeetoo` Passive Finned Aluminum Enclosure | Under-PCB shelf cutouts for direct airflow across underside M.2 NVMe |
-| **Chassis & Cooling** | 1U Vented Honeycomb Shelf (`U02`) + USB-C PD | 5x 40mm front-intake PWM fans controlled via Noctua `NA-FC1` |
+| **Chassis & Cooling** | 1U Vented Honeycomb Shelf (`Slot-A`) + USB-C PD | 5x 40mm front-intake PWM fans controlled via Noctua `NA-FC1` |
 
 ### PCIe 2.0 & VL805 USB 3.0 Bus Topology Note
 The StarFive `JH7110` SoC exposes two independent single-lane **PCIe Gen2 x1 (`5.0 GT/s` / ~450 MB/s)** controllers:
@@ -46,12 +46,14 @@ The StarFive `JH7110` SoC exposes two independent single-lane **PCIe Gen2 x1 (`5
 ### A. Native `4Kn` (`4096`-Byte) NVMe Alignment & Filesystem Adaptation
 Factory `WD_BLACK` NVMe drives ship in emulated `512e` (`512`-byte logical sector) mode. During Stage 1/2 of `forge.sh`, `nvme-cli` inspects the namespace capabilities (`lbads:12` -> `4096B`) and executes a low-level `nvme format` to native **`4Kn` (`4096`-byte)** sectors prior to LVM physical volume alignment (`--dataalignment 4m`). `forge.sh` formats the logical volume as `XFS` (`-s size=4096 -b size=4096`) when `xfs.ko` is present, or seamlessly falls back to `4K`-aligned `ext4` (`-b 4096`) on stripped custom JH7110 kernels compiled without `CONFIG_XFS_FS`. This eliminates internal SSD controller Read-Modify-Write (RMW) translation penalties on PostgreSQL 8KB page flushes.
 
-### B. LVM Snapshot Reserve
-`forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB) of unallocated extents. This allows instant, zero-downtime LVM copy-on-write (CoW) snapshots to reset database state between deterministic benchmark runs.
+### B. Dual-LVM Elastic Pool & Snapshot Reserve
+* **Single-LV / RAID-Backed Builds (`databench` or `WITH_RAID="true"`):** `forge.sh` allocates `85%VG` to `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`), reserving `15%VG` (~270GB on 2TB NVMe) of unallocated extents for instant, zero-downtime LVM copy-on-write (CoW) snapshots between deterministic benchmark runs.
+* **Single-NVMe NFS Builds (`ENABLE_NFS_SERVER="true"` & `WITH_RAID="false"`):** `forge.sh` provisions a **Dual-LVM** layout inside `vg_braker` (`rvdk mods/nvme-4kn --with-nfs-lv`), carving `/dev/vg_braker/lv_pgdata` (`/mnt/nvme_pgdata`, XFS/ext4) alongside `/dev/vg_braker/lv_nfsvault` (`/mnt/nfs_vault`, Btrfs) while retaining unallocated VG reserve extents for CoW snapshots and online elastic rebalancing (`brakerrak storage [status|grow-psql|grow-nfs|shrink-nfs|autotune]`).
 
 ### C. PostgreSQL 18 Drop-In Configuration (`99-rvdk-starfive-jh7110.conf`)
 * **Async I/O Engine:** `io_method = io_uring` (auto-verified against `liburing` linkage and `kernel.io_uring_disabled = 0`)
-* **Memory Allocation (8GB LPDDR4):** `shared_buffers = 2GB` (pinned in `1,152 × 2MB Sv39` HugePages), `effective_cache_size = 6GB`, `work_mem = 32MB`, `maintenance_work_mem = 512MB`, `huge_pages = try`
+* **Memory Allocation — 8 GB VF2 Profile (`8GB LPDDR4`):** `shared_buffers = 2GB` (pinned in `1,152 × 2MB Sv39` HugePages), `effective_cache_size = 6GB`, `work_mem = 32MB`, `maintenance_work_mem = 512MB`, `huge_pages = try`
+* **Memory Allocation — 4 GB VF2 Safe Ceiling (`4GB LPDDR4`):** `shared_buffers = 512MB`–`1GB` (capped at `288–576 × 2MB Sv39` HugePages), `effective_cache_size = 2GB`–`3GB`, `work_mem = 16MB`, `maintenance_work_mem = 256MB`, `huge_pages = try` (preserves OS/page-cache headroom and prevents OOM on 4 GB boards under parallel workers and `io_uring` ring allocation)
 * **RVA20 4-Hart In-Order Execution:** `jit = off` (avoids LLVM JIT compilation overhead on scalar 2-wide In-Order `U74`), `max_worker_processes = 8`, `max_parallel_workers = 4`, `max_parallel_workers_per_gather = 2`
 * **WAL & Checkpoints:** `wal_compression = zstd`, `wal_buffers = 64MB`, `min_wal_size = 2GB`, `max_wal_size = 16GB`, `checkpoint_completion_target = 0.9`
 
@@ -66,7 +68,7 @@ Factory `WD_BLACK` NVMe drives ship in emulated `512e` (`512`-byte logical secto
 * **Branch Predictor Accuracy (`TBD`):** `TBD` branches executed with `TBD` mispredictions (`TBD` miss rate).
 
 ### B. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Preliminary Baseline)
-Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN750` (`PCIe Gen2 x1`, `shared_buffers = 2GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
+Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN750` (`PCIe Gen2 x1`, 8 GB VF2 profile: `shared_buffers = 2GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
 
 | Workload & Metric | `sync` | `worker` | `io_uring` | `io_uring` + `O_DIRECT` |
 | :--- | :--- | :--- | :--- | :--- |
@@ -75,6 +77,12 @@ Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-form
 | **Bitmap Scan Wall Time** | — | — | — | — |
 | **Bitmap Scan Context Switches** | — | — | — | — |
 | **Bitmap Scan L1d Cache Misses** | — | — | — | — |
+
+To evaluate the `io_uring` + `O_DIRECT` column during a showdown run, pass `--with-direct-io`:
+~~~bash
+sudo brakerrak bench showdown --with-direct-io
+~~~
+`--with-direct-io` sets `debug_io_direct = 'data'` via `ALTER SYSTEM`, restarts PostgreSQL (verifying `pending_restart = 'f'`), and cleanly restores the baseline GUC on teardown.
 
 ---
 

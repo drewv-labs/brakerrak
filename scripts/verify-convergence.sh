@@ -21,9 +21,10 @@ usage() {
 Usage: sudo brakerrak verify [options] [forge-options...]
 
 Options:
-  --target <slug>    Override silicon target for ORT snapshots and forge passes
-  --out-dir <dir>    Directory for Day-0 & Day-1 ORT snapshots (default: ~/.brakerrak/snapshots)
-  -h, --help         Show this help message and exit
+  --target <slug>        Override silicon target for ORT snapshots and forge passes
+  --mount-point <path>   Override NVMe mountpoint (forwarded to forge passes)
+  --out-dir <dir>        Directory for Day-0 & Day-1 ORT snapshots (default: ~/.brakerrak/snapshots)
+  -h, --help             Show this help message and exit
 
 All other flags are forwarded to forge.sh. Destructive/rebuild flags
 (--force-wipe-nvme, --force-wipe-raid, --force-rebuild-pg, --force-build,
@@ -41,7 +42,8 @@ done
 
 if [[ $EUID -ne 0 ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-        exec sudo -E bash "${BASH_SOURCE[0]}" "$@"
+        _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TS_AUTHKEY,RVDK_INSTALL_SHA256,BRAKERRAK_INSTALL_SHA256,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
+        exec sudo --preserve-env="$_sudo_preserve_env" bash "${BASH_SOURCE[0]}" "$@"
     else
         log_fatal "Run as root or via 'sudo brakerrak verify'."
     fi
@@ -51,6 +53,8 @@ brak_resolve_user
 brak_resolve_node_env --migrate
 
 SNAP_DIR="${REAL_HOME}/.brakerrak/snapshots"
+CLI_MOUNT_POINT=""
+CLI_ENABLE_PG=""
 PASS1_ARGS=()
 PASS2_ARGS=()
 ORT_ARGS=()
@@ -70,6 +74,32 @@ while [[ $# -gt 0 ]]; do
             PASS1_ARGS+=("--target" "$_tval")
             PASS2_ARGS+=("--target" "$_tval")
             ORT_ARGS+=("--target" "$_tval")
+            shift
+            ;;
+        --mount-point)
+            brak_require_arg "$1" "${2:-}"
+            CLI_MOUNT_POINT="$2"
+            PASS1_ARGS+=("--mount-point" "$2")
+            PASS2_ARGS+=("--mount-point" "$2")
+            shift 2
+            ;;
+        --mount-point=*)
+            CLI_MOUNT_POINT="${1#*=}"
+            brak_require_arg "--mount-point" "$CLI_MOUNT_POINT"
+            PASS1_ARGS+=("--mount-point" "$CLI_MOUNT_POINT")
+            PASS2_ARGS+=("--mount-point" "$CLI_MOUNT_POINT")
+            shift
+            ;;
+        --with-pg)
+            CLI_ENABLE_PG="true"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --no-pg)
+            CLI_ENABLE_PG="false"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
             shift
             ;;
         --out-dir)
@@ -95,10 +125,21 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-MOUNT_POINT="/mnt/nvme_pgdata"
-if [[ -r "$NODE_ENV" ]]; then
-    brak_load_kv_env "$NODE_ENV" MOUNT_POINT || log_fatal "Failed to parse node config: ${NODE_ENV}"
-fi
+_verify_refresh_node_vars() {
+    MOUNT_POINT="/mnt/nvme_pgdata"
+    ENABLE_POSTGRES="true"
+    if [[ -r "$NODE_ENV" ]]; then
+        brak_load_kv_env "$NODE_ENV" MOUNT_POINT ENABLE_POSTGRES || log_fatal "Failed to parse node config: ${NODE_ENV}"
+    fi
+    if [[ -n "$CLI_MOUNT_POINT" ]]; then
+        MOUNT_POINT="$CLI_MOUNT_POINT"
+    fi
+    if [[ -n "$CLI_ENABLE_PG" ]]; then
+        ENABLE_POSTGRES="$CLI_ENABLE_PG"
+    fi
+}
+
+_verify_refresh_node_vars
 
 install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$SNAP_DIR"
 
@@ -109,9 +150,69 @@ PASS2_LOG="${RUNTIME_DIR}/verify-pass2.$$.log"
 _verify_cleanup() {
     rm -f "${PASS2_LOG:-}" 2>/dev/null || true
 }
-trap '_verify_cleanup' EXIT
-trap '_verify_cleanup; trap - INT; kill -INT $$' INT
-trap '_verify_cleanup; trap - TERM; kill -TERM $$' TERM
+brak_register_exit_hook _verify_cleanup
+
+_verify_get_xfs_uuid() {
+    local mp="$1"
+    local fstype="" src="" uuid=""
+    if command -v findmnt >/dev/null 2>&1; then
+        fstype="$(findmnt -n -o FSTYPE "$mp" 2>/dev/null | head -n1 || true)"
+        src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -n1 || true)"
+        uuid="$(findmnt -n -o UUID "$mp" 2>/dev/null | head -n1 || true)"
+    fi
+    if [[ -n "$fstype" && "$fstype" != "xfs" ]]; then
+        log_fatal "Convergence assertion FAILED: expected XFS on ${mp}, found '${fstype}'."
+    fi
+    if [[ -z "$uuid" && -n "$src" ]] && command -v blkid >/dev/null 2>&1; then
+        uuid="$(blkid -s UUID -o value "$src" 2>/dev/null | head -n1 || true)"
+    fi
+    if [[ -z "$uuid" && -n "$src" ]] && command -v lsblk >/dev/null 2>&1; then
+        uuid="$(lsblk -ndo UUID "$src" 2>/dev/null | head -n1 || true)"
+    fi
+    printf '%s\n' "$uuid"
+}
+
+_verify_get_pg_sysid() {
+    local sysid=""
+    if command -v psql >/dev/null 2>&1; then
+        if command -v sudo >/dev/null 2>&1; then
+            sysid="$(sudo -u postgres psql -tAc "SELECT system_identifier FROM pg_control_system();" 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+        if [[ -z "$sysid" ]]; then
+            sysid="$(psql -U postgres -tAc "SELECT system_identifier FROM pg_control_system();" 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+    fi
+    local pg_controldata_bin=""
+    if command -v pg_controldata >/dev/null 2>&1; then
+        pg_controldata_bin="$(command -v pg_controldata)"
+    else
+        local cand_bin
+        for cand_bin in /usr/lib/postgresql/*/bin/pg_controldata; do
+            if [[ -x "$cand_bin" ]]; then
+                pg_controldata_bin="$cand_bin"
+                break
+            fi
+        done
+    fi
+    if [[ -z "$sysid" && -n "$pg_controldata_bin" ]]; then
+        local pgdata="" cand
+        if command -v psql >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
+            pgdata="$(sudo -u postgres psql -tAc "SHOW data_directory;" 2>/dev/null | tr -d '[:space:]' || true)"
+        fi
+        if [[ -z "$pgdata" ]]; then
+            for cand in "${MOUNT_POINT}/pgdata" /var/lib/postgresql/18/main /var/lib/postgresql/*/main; do
+                if [[ -f "${cand}/global/pg_control" ]]; then
+                    pgdata="$cand"
+                    break
+                fi
+            done
+        fi
+        if [[ -n "$pgdata" && -d "$pgdata" ]]; then
+            sysid="$("$pg_controldata_bin" "$pgdata" 2>/dev/null | awk -F: '/Database system identifier/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' || true)"
+        fi
+    fi
+    printf '%s\n' "$sysid"
+}
 
 # Locate newest ORT snapshot JSON for <stage> in <snap_dir> and assert overall_status != "FAIL".
 _verify_assert_ort_status() {
@@ -176,6 +277,24 @@ echo ""
 echo ">>> [STAGE 1] Executing Convergence Pass 1 (RVDK OS/BSP + 4Kn NVMe + PG 18.6 + Services)..."
 bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"}
 
+_verify_refresh_node_vars
+
+PASS1_XFS_UUID=""
+if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    PASS1_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+fi
+if [[ -z "$PASS1_XFS_UUID" ]]; then
+    log_fatal "Stage 1 assertion FAILED: unable to resolve XFS filesystem UUID on ${MOUNT_POINT}."
+fi
+
+PASS1_PG_SYSID=""
+if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+    PASS1_PG_SYSID="$(_verify_get_pg_sysid)"
+    if [[ -z "$PASS1_PG_SYSID" ]]; then
+        log_fatal "Stage 1 assertion FAILED: unable to resolve PostgreSQL system_identifier."
+    fi
+fi
+
 echo ""
 echo ">>> [STAGE 2] Executing Idempotency Validation Pass 2 (Expecting Converged [SKIP] States)..."
 (
@@ -196,7 +315,30 @@ if grep -E -i -n "$DESTRUCTIVE_RE" "$PASS2_LOG" >/dev/null 2>&1; then
     grep -E -i -n "$DESTRUCTIVE_RE" "$PASS2_LOG" >&2 || true
     log_fatal "Stage 2 idempotency assertion FAILED: Pass 2 must not execute nvme format, mkfs.*, pg_createcluster, or initdb."
 fi
-log_ok "Stage 2 idempotency assertion passed: zero destructive storage or cluster init commands ran during Pass 2."
+
+SKIP_MARKER_COUNT="$(sed -E $'s/\x1b\\[[0-9;]*[[:alpha:]]//g' "$PASS2_LOG" | grep -cE '(^|[[:space:]])\[SKIP\]([[:space:]]|$)' || true)"
+if [[ ! "$SKIP_MARKER_COUNT" =~ ^[0-9]+$ ]] || (( SKIP_MARKER_COUNT == 0 )); then
+    log_fatal "Stage 2 idempotency assertion FAILED: expected structured [SKIP] convergence markers in Pass 2 output, found 0."
+fi
+
+PASS2_XFS_UUID=""
+if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    PASS2_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+fi
+if [[ -z "$PASS2_XFS_UUID" || "$PASS2_XFS_UUID" != "$PASS1_XFS_UUID" ]]; then
+    log_fatal "Stage 2 idempotency assertion FAILED: XFS UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_XFS_UUID}', Pass 2='${PASS2_XFS_UUID:-missing}')."
+fi
+
+if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+    PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
+    if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
+        log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+    fi
+    log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+else
+    log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
+    log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID})."
+fi
 
 echo ""
 echo ">>> [STAGE 3] Capturing Day-1 Post-Forge CTD Provenance Snapshot..."

@@ -60,7 +60,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 | SoC / Board | Core Complex & Pipeline | ISA Profile & Compiler Flags | Status |
 | :--- | :--- | :--- | :--- |
 | ESWIN EIC7700X (HiFive Premier P550 / Milk-V Megrez) | 4x SiFive P550 (3-Wide OoO @ 1.4–1.8GHz) | RVA20 (-O3 -march=rv64gc_zba_zbb -mcpu=sifive-p550) | **Active / Verified** |
-| StarFive JH7110 / JH7110S (VF2 / VF2 Lite / Mars / OPi RV) | 4x SiFive U74 (2-Wide InO @ 1.25–1.5GHz) | RVA20 (-O3 -march=rv64gc -mcpu=sifive-u74) | **Active / Verified** |
+| StarFive JH7110 / JH7110S (VF2 / VF2 Lite / Mars / OPi RV) | 4x SiFive U74 (2-Wide InO @ 1.25–1.5GHz) | RVA20 (-O3 -march=rv64gc_zba_zbb -mcpu=sifive-u74) | **Active / Verified** |
 | SpacemiT K1/M1 (OPi RV2 / OPi R2S / Jupiter / BPI-F3 / CM6) | 8x SpacemiT X60 (2-Wide InO @ 1.6–1.8GHz) | RVA22 + 256-bit RVV 1.0 | **Active / Bring-Up** |
 | UltraRISC UR-DP1000 (Milk-V Titan) | 8x UR-CP100 (4-Wide OoO @ 2.0GHz + PCIe Gen4 x16) | RVA22 + H-Ext 1.0 | **Active / Bring-Up** |
 | SpacemiT K3 (Milk-V Jupiter 2 / Firefly AIBOX-K3) | 8x SpacemiT X100 (4-Wide OoO @ 2.4GHz + 60 TOPS) | RVA23 + 1024-bit RVV 1.0 | Planned |
@@ -219,7 +219,6 @@ RAID_ARRAYS_JSON='[
     "type": "warm",
     "label": "WARM_VAULT",
     "mount": "/mnt/warm_vault",
-    "md_dev": "/dev/md/warmvault",
     "disks": 4,
     "min_bytes": 11000000000000,
     "max_bytes": 13000000000000,

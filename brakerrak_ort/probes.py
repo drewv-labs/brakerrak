@@ -19,7 +19,15 @@ from brakerrak_ort.profiles import (
     DEDICATED_ACCELERATOR_VENDORS,
     GPU_ACCELERATOR_VENDORS,
 )
-from brakerrak_ort.types import AcceleratorInfo, CommandResult, PrimaryNicStatus, SystemProbe
+from brakerrak_ort.types import (
+    AcceleratorInfo,
+    AcceleratorRuntimeInfo,
+    BtrfsDeviceStatsInfo,
+    CommandResult,
+    MountInfo,
+    PrimaryNicStatus,
+    SystemProbe,
+)
 
 SYSCTL_KEYS: tuple[str, ...] = (
     "kernel.perf_event_paranoid",
@@ -72,6 +80,9 @@ _PCI_LINE_RE = re.compile(
     r"(?P<rest>.*?)\[(?P<vendor>[0-9a-fA-F]{4}):(?P<device>[0-9a-fA-F]{4})\]"
 )
 _PCI_CLASS_RE = re.compile(r"\[(?P<cls>[0-9a-fA-F]{4})\]:")
+_BTRFS_STAT_RE = re.compile(
+    r"^\[(?P<dev>[^\]]+)\]\.(?P<stat>[A-Za-z0-9_]+)\s+(?P<count>\d+)\s*$"
+)
 _GANESHA_EXPORT_HDR_RE = re.compile(r"\bEXPORT\s*\{", re.IGNORECASE)
 _GANESHA_CLIENT_HDR_RE = re.compile(r"\bCLIENT\s*\{", re.IGNORECASE)
 _GANESHA_KV_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*;?\s*$")
@@ -696,3 +707,152 @@ def inspect_databroker_services(
             "configured_exports": active_exports,
         },
     }
+
+
+def _is_kmod_loaded(probe: SystemProbe, module_name: str) -> bool:
+    """Return True if a kernel module is loaded via /sys/module or /proc/modules."""
+    if probe.path_exists(f"/sys/module/{module_name}"):
+        return True
+    normalized = module_name.replace("-", "_")
+    proc_modules = probe.read_text("/proc/modules") or ""
+    for line in proc_modules.splitlines():
+        parts = line.split()
+        if parts and parts[0].replace("-", "_") == normalized:
+            return True
+    return False
+
+
+def inspect_accelerator_runtime(
+    pcie_accelerators: Sequence[AcceleratorInfo],
+    probe: SystemProbe,
+) -> dict[str, AcceleratorRuntimeInfo]:
+    """Inspect Hailo (1e60) and Tenstorrent (1e52) device nodes, kmods, and userspace CLIs."""
+    vendors = {acc["vendor_id"].lower() for acc in pcie_accelerators}
+    runtime: dict[str, AcceleratorRuntimeInfo] = {}
+
+    if "1e60" in vendors:
+        hailo_devs = probe.glob_paths("/dev/hailo*")
+        hailo_kmod = _is_kmod_loaded(probe, "hailo_pci")
+        hailo_cli = probe.run_cmd(["hailortcli", "fw-control", "identify"])
+        runtime["hailo"] = AcceleratorRuntimeInfo(
+            vendor_id="1e60",
+            device_nodes=hailo_devs,
+            kmod_name="hailo_pci",
+            kmod_loaded=hailo_kmod,
+            cli_tool="hailortcli",
+            cli_ok=hailo_cli.ok,
+        )
+
+    if "1e52" in vendors:
+        tt_devs = sorted(
+            {p for p in probe.glob_paths("/dev/tenstorrent*") if p != "/dev/tenstorrent"}
+            | set(probe.glob_paths("/dev/tenstorrent/*"))
+        )
+        tt_kmod = _is_kmod_loaded(probe, "tenstorrent")
+        tt_cli = probe.run_cmd(["tt-smi", "-s"])
+        runtime["tenstorrent"] = AcceleratorRuntimeInfo(
+            vendor_id="1e52",
+            device_nodes=tt_devs,
+            kmod_name="tenstorrent",
+            kmod_loaded=tt_kmod,
+            cli_tool="tt-smi",
+            cli_ok=tt_cli.ok,
+        )
+
+    return runtime
+
+
+def _decode_proc_mount_path(raw: str) -> str:
+    decoded = (
+        raw.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+    )
+    return decoded.rstrip("/") or "/"
+
+
+def inspect_mount_fstype(mount_path: str, probe: SystemProbe) -> MountInfo:
+    """Inspect mount status and filesystem type for a target mountpoint."""
+    cleaned = mount_path.strip()
+    if not cleaned:
+        return MountInfo(mountpoint=mount_path, mounted=False, fstype=None)
+
+    target = cleaned.rstrip("/") or "/"
+    mounts_raw = probe.read_text("/proc/mounts") or ""
+    matched_fstype: str | None = None
+    matched_in_proc = False
+
+    for line in mounts_raw.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        if _decode_proc_mount_path(parts[1]) == target:
+            matched_in_proc = True
+            matched_fstype = parts[2]
+
+    if matched_in_proc:
+        return MountInfo(mountpoint=cleaned, mounted=True, fstype=matched_fstype)
+
+    is_mounted = probe.is_mount(cleaned)
+    if is_mounted or not mounts_raw:
+        findmnt_res = probe.run_cmd(["findmnt", "-n", "-o", "FSTYPE", cleaned])
+        if findmnt_res.ok and findmnt_res.stdout.strip():
+            fstype = findmnt_res.stdout.strip().splitlines()[-1].strip()
+            return MountInfo(mountpoint=cleaned, mounted=True, fstype=fstype)
+
+    return MountInfo(mountpoint=cleaned, mounted=is_mounted, fstype=None)
+
+
+def inspect_btrfs_device_stats(mount_path: str, probe: SystemProbe) -> BtrfsDeviceStatsInfo:
+    """Run read-only `btrfs device stats` on a Btrfs mountpoint and tally device errors."""
+    cleaned = mount_path.strip()
+    if not cleaned:
+        return BtrfsDeviceStatsInfo(
+            mountpoint=mount_path,
+            stats_available=False,
+            total_errors=0,
+            nonzero_errors=[],
+            error="empty mountpoint",
+        )
+
+    res = probe.run_cmd(["btrfs", "device", "stats", cleaned], use_sudo=True)
+    if not res.ok or not res.stdout:
+        err_msg = res.stderr or res.error or f"rc={res.returncode}"
+        return BtrfsDeviceStatsInfo(
+            mountpoint=cleaned,
+            stats_available=False,
+            total_errors=0,
+            nonzero_errors=[],
+            error=err_msg,
+        )
+
+    parsed_count = 0
+    total_errors = 0
+    nonzero_errors: list[str] = []
+    for line in res.stdout.splitlines():
+        match = _BTRFS_STAT_RE.match(line.strip())
+        if not match:
+            continue
+        parsed_count += 1
+        cnt = int(match.group("count"))
+        total_errors += cnt
+        if cnt > 0:
+            nonzero_errors.append(f"{match.group('dev')}.{match.group('stat')}={cnt}")
+
+    if parsed_count == 0:
+        return BtrfsDeviceStatsInfo(
+            mountpoint=cleaned,
+            stats_available=False,
+            total_errors=0,
+            nonzero_errors=[],
+            error="unrecognized btrfs device stats output",
+        )
+
+    return BtrfsDeviceStatsInfo(
+        mountpoint=cleaned,
+        stats_available=True,
+        total_errors=total_errors,
+        nonzero_errors=nonzero_errors,
+        error=None,
+    )

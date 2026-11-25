@@ -82,9 +82,9 @@ SOC_PROFILES: dict[str, SocProfile] = {
         ram_floor_kb=14_000_000,
         ram_variants_gb=(16, 32),
         ram_desc="LPDDR5 System Memory Detected (>= 14 GiB usable)",
-        pcie_desc="Primary NVMe Seated at PCIe Gen3+ (>= 8.0 GT/s)",
+        pcie_desc="Primary NVMe Seated at PCIe Gen3+ (>= 8.0 GT/s, Width x2)",
         min_gt_s=8.0,
-        min_width=1,
+        min_width=2,
         thermal_ceiling_c=60.0,
     ),
     "ultrarisc-dp1000": SocProfile(
@@ -95,9 +95,9 @@ SOC_PROFILES: dict[str, SocProfile] = {
         ram_floor_kb=14_000_000,
         ram_variants_gb=(16, 32, 64),
         ram_desc="DDR4 System Memory Detected (>= 14 GiB usable)",
-        pcie_desc="Primary NVMe Seated at PCIe Gen3/Gen4 (>= 8.0 GT/s)",
+        pcie_desc="Primary NVMe Seated at PCIe Gen3/Gen4 (>= 8.0 GT/s, Width x4)",
         min_gt_s=8.0,
-        min_width=1,
+        min_width=4,
         thermal_ceiling_c=60.0,
     ),
     "sifive-fu740": SocProfile(
@@ -108,9 +108,9 @@ SOC_PROFILES: dict[str, SocProfile] = {
         ram_floor_kb=14_000_000,
         ram_variants_gb=(16,),
         ram_desc="16GB DDR4 System Memory Detected (>= 14 GiB usable)",
-        pcie_desc="Primary NVMe Seated at PCIe Gen3 (>= 8.0 GT/s)",
+        pcie_desc="Primary NVMe Seated at PCIe Gen3 (>= 8.0 GT/s, Width x4)",
         min_gt_s=8.0,
-        min_width=1,
+        min_width=4,
         thermal_ceiling_c=60.0,
     ),
     "tenstorrent-atlantis": SocProfile(
@@ -121,9 +121,9 @@ SOC_PROFILES: dict[str, SocProfile] = {
         ram_floor_kb=30_000_000,
         ram_variants_gb=(32, 64, 128),
         ram_desc="High-Bandwidth System Memory Detected (>= 30 GiB usable)",
-        pcie_desc="Primary NVMe Seated at PCIe Gen4/Gen5 (>= 8.0 GT/s)",
+        pcie_desc="Primary NVMe Seated at PCIe Gen4/Gen5 (>= 8.0 GT/s, Width x4)",
         min_gt_s=8.0,
-        min_width=1,
+        min_width=4,
         thermal_ceiling_c=60.0,
     ),
     "generic-riscv64": SocProfile(
@@ -142,31 +142,96 @@ SOC_PROFILES: dict[str, SocProfile] = {
 }
 
 SOC_ALIASES: dict[str, str] = {
+    # eswin-eic7700x
     "eswin-eic7700x": "eswin-eic7700x",
+    "eswin/eic7700x": "eswin-eic7700x",
     "sifive-p550": "eswin-eic7700x",
+    "sifive/p550": "eswin-eic7700x",
+    "p550": "eswin-eic7700x",
+    "premier-p550": "eswin-eic7700x",
     "milkv-megrez": "eswin-eic7700x",
+    "milkv/megrez": "eswin-eic7700x",
+    "megrez": "eswin-eic7700x",
+    "pine64-starpro64": "eswin-eic7700x",
+    "pine64/starpro64": "eswin-eic7700x",
     "starpro64": "eswin-eic7700x",
+    # sifive-fu740
     "sifive-fu740": "sifive-fu740",
+    "sifive/fu740": "sifive-fu740",
     "sifive-unmatched": "sifive-fu740",
-    "starfive-jh7110": "starfive-jh7110",
-    "starfive-vf2": "starfive-jh7110",
+    "sifive/unmatched": "sifive-fu740",
+    "unmatched": "sifive-fu740",
+    "fu740": "sifive-fu740",
+    # starfive-jh7110
     "starfive-vf2-lite": "starfive-jh7110",
+    "starfive/vf2-lite": "starfive-jh7110",
+    "vf2-lite": "starfive-jh7110",
+    "vf2lite": "starfive-jh7110",
     "milkv-mars": "starfive-jh7110",
-    "orangepi-rv": "starfive-jh7110",
+    "milkv/mars": "starfive-jh7110",
+    "mars": "starfive-jh7110",
+    "pine64-star64": "starfive-jh7110",
+    "pine64/star64": "starfive-jh7110",
     "star64": "starfive-jh7110",
-    "spacemit-k1": "spacemit-k1",
-    "milkv-jupiter": "spacemit-k1",
+    "orangepi-rv": "starfive-jh7110",
+    "orangepi/rv": "starfive-jh7110",
+    "opirv": "starfive-jh7110",
+    "starfive-jh7110": "starfive-jh7110",
+    "starfive/jh7110": "starfive-jh7110",
+    "starfive-vf2": "starfive-jh7110",
+    "starfive/vf2": "starfive-jh7110",
+    "vf2": "starfive-jh7110",
+    "visionfive2": "starfive-jh7110",
+    # spacemit-k1
     "orangepi-rv2": "spacemit-k1",
+    "orangepi/rv2": "spacemit-k1",
+    "rv2": "spacemit-k1",
     "orangepi-r2s": "spacemit-k1",
+    "orangepi/r2s": "spacemit-k1",
+    "r2s": "spacemit-k1",
     "bananapi-f3": "spacemit-k1",
+    "bananapi/f3": "spacemit-k1",
+    "bpi-f3": "spacemit-k1",
+    "bpif3": "spacemit-k1",
     "bananapi-cm6": "spacemit-k1",
-    "spacemit-k3": "spacemit-k3",
-    "milkv-jupiter2": "spacemit-k3",
+    "bananapi/cm6": "spacemit-k1",
+    "bpi-cm6": "spacemit-k1",
+    "bpicm6": "spacemit-k1",
+    "spacemit-k1": "spacemit-k1",
+    "spacemit/k1": "spacemit-k1",
+    "milkv-jupiter": "spacemit-k1",
+    "milkv/jupiter": "spacemit-k1",
+    "jupiter": "spacemit-k1",
+    "jptr1": "spacemit-k1",
+    "muse-pi": "spacemit-k1",
+    "musepi": "spacemit-k1",
+    # spacemit-k3
     "firefly-aibox-k3": "spacemit-k3",
+    "firefly/aibox-k3": "spacemit-k3",
+    "aibox-k3": "spacemit-k3",
+    "aiboxk3": "spacemit-k3",
+    "spacemit-k3": "spacemit-k3",
+    "spacemit/k3": "spacemit-k3",
+    "milkv-jupiter2": "spacemit-k3",
+    "milkv/jupiter2": "spacemit-k3",
+    "jupiter2": "spacemit-k3",
+    "jptr2": "spacemit-k3",
+    # ultrarisc-dp1000
     "ultrarisc-dp1000": "ultrarisc-dp1000",
+    "ultrarisc/dp1000": "ultrarisc-dp1000",
     "milkv-titan": "ultrarisc-dp1000",
+    "milkv/titan": "ultrarisc-dp1000",
+    "titan": "ultrarisc-dp1000",
+    "dp1000": "ultrarisc-dp1000",
+    # tenstorrent-atlantis
     "tenstorrent-atlantis": "tenstorrent-atlantis",
+    "tenstorrent/atlantis": "tenstorrent-atlantis",
+    "atlantis": "tenstorrent-atlantis",
+    "ascalon": "tenstorrent-atlantis",
+    # generic-riscv64
     "generic-riscv64": "generic-riscv64",
+    "generic": "generic-riscv64",
+    "riscv64": "generic-riscv64",
 }
 
 ROLE_DEFAULTS: dict[str, RoleDefaults] = {
@@ -258,12 +323,18 @@ def detect_soc_from_dt_model(dt_model: str | None) -> str | None:
     if any(
         tok in lower
         for tok in (
+            "orangepi-rv2",
             "orangepi rv2",
             "orange pi rv2",
+            "orangepi-r2s",
             "orangepi r2s",
             "orange pi r2s",
             "bpi-f3",
+            "banana pi f3",
+            "bananapi-f3",
             "bpi-cm6",
+            "banana pi cm6",
+            "bananapi-cm6",
         )
     ):
         return "spacemit-k1"
@@ -275,8 +346,10 @@ def detect_soc_from_dt_model(dt_model: str | None) -> str | None:
             "jh7110",
             "jh-7110",
             "milk-v mars",
+            "milkv-mars",
             "milkv mars",
             "star64",
+            "orangepi-rv",
             "orangepi rv",
             "orange pi rv",
         )
@@ -299,6 +372,7 @@ def detect_soc_from_dt_model(dt_model: str | None) -> str | None:
         tok in lower
         for tok in (
             "milk-v jupiter",
+            "milkv-jupiter",
             "milkv jupiter",
             "spacemit k1",
             "spacemit-k1",
@@ -307,14 +381,34 @@ def detect_soc_from_dt_model(dt_model: str | None) -> str | None:
             "spacemit x60",
             "ky x1",
             "ky-x1",
+            "muse pi",
+            "muse book",
         )
     ):
         return "spacemit-k1"
-    if any(tok in lower for tok in ("milk-v titan", "milkv titan", "ultrarisc", "dp1000")):
+    if any(
+        tok in lower
+        for tok in ("milk-v titan", "milkv-titan", "milkv titan", "ultrarisc", "dp1000")
+    ):
         return "ultrarisc-dp1000"
     if any(tok in lower for tok in ("atlantis", "ascalon")):
         return "tenstorrent-atlantis"
     return None
+
+
+def resolve_profile(identifier: str | None = None, *, dt_model: str | None = None) -> SocProfile:
+    """Resolve CLI alias/slug first, then fall back to DT model detection, then generic-riscv64."""
+    if identifier:
+        cleaned = identifier.strip().lower()
+        if cleaned in SOC_ALIASES:
+            return SOC_PROFILES[SOC_ALIASES[cleaned]]
+        if cleaned in SOC_PROFILES:
+            return SOC_PROFILES[cleaned]
+
+    detected = detect_soc_from_dt_model(dt_model or identifier)
+    if detected and detected in SOC_PROFILES:
+        return SOC_PROFILES[detected]
+    return SOC_PROFILES["generic-riscv64"]
 
 
 def get_soc_profile(soc_slug: str) -> SocProfile:

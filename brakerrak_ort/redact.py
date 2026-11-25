@@ -25,8 +25,36 @@ _SERIAL_KV_RE = re.compile(
 )
 _USER_KV_RE = re.compile(r"\b(sudo_user|username|user|owner)=([^\s,;\"']+)", re.IGNORECASE)
 _HOME_PATH_RE = re.compile(r"(/(?:home|Users))/([A-Za-z0-9._-]+)")
-_IPV4_CIDR_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?\b")
-_IPV6_CIDR_RE = re.compile(r"\b[0-9a-fA-F:]*:[0-9a-fA-F:]+/\d{1,3}\b")
+_IPV4_CIDR_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+    r"(?:/(?:3[0-2]|[12]?\d))?"
+    r"(?![0-9.]|-[A-Za-z])"
+)
+_IPV4_VERSION_CONTEXT_RE = re.compile(
+    r"\b(?:linux|kernel|version|ver|gcc|glibc|systemd|u-boot|opensbi)\s*(?:[:=]\s*|\s+)$",
+    re.IGNORECASE,
+)
+_IPV6_CIDR_RE = re.compile(
+    r"(?<![0-9a-fA-F:.])"
+    r"(?:"
+    r"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
+    r"|(?:[0-9a-fA-F]{1,4}:){6}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+    r"(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+    r"|(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,5}"
+    r"|(?:[0-9a-fA-F]{1,4}:){1,5}:(?:[0-9a-fA-F]{1,4}:){0,4}"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+    r"|(?:[0-9a-fA-F]{1,4}:){1,7}:"
+    r"|::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4}"
+    r"|::(?:[0-9a-fA-F]{1,4}:){0,5}"
+    r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+    r"|::(?=/(?:12[0-8]|1[01]\d|[1-9]?\d))"
+    r")"
+    r"(?:%[A-Za-z0-9._-]+)?"
+    r"(?:/(?:12[0-8]|1[01]\d|[1-9]?\d))?"
+    r"(?![0-9a-fA-F.]|:[0-9a-fA-F:])"
+)
 _KERNEL_EXPORT_CLIENT_RE = re.compile(r"^([^\s(]+)(\([^)]*\))?$")
 
 # Common system/OS tokens that must not be globally replaced if a human account shares the name.
@@ -187,6 +215,18 @@ def redact_nfs_export(
     return _scrub_usernames_in_text(redacted, usernames, home_paths)
 
 
+def _scrub_ips(text: str, replacement: str = "REDACTED_IP") -> str:
+    result = _IPV6_CIDR_RE.sub(replacement, text)
+
+    def _replace_ipv4(match: re.Match[str]) -> str:
+        prefix = result[: match.start()]
+        if _IPV4_VERSION_CONTEXT_RE.search(prefix):
+            return match.group(0)
+        return replacement
+
+    return _IPV4_CIDR_RE.sub(_replace_ipv4, result)
+
+
 def redact_proc_cmdline(
     cmdline: str,
     *,
@@ -194,12 +234,13 @@ def redact_proc_cmdline(
     usernames: Iterable[str] = (),
     home_paths: Iterable[str] = (),
 ) -> str:
-    """Redact UUIDs, PARTUUIDs, MAC addresses, Tailscale authkeys, serials, and usernames."""
+    """Redact UUIDs, PARTUUIDs, MACs, IPs, Tailscale authkeys, serials, and usernames."""
     result = _UUID_TOKEN_RE.sub(r"\1=REDACTED", cmdline)
     result = _BARE_UUID_RE.sub("REDACTED_UUID", result)
     result = _MAC_RE.sub("REDACTED_MAC", result)
     result = _TSKEY_RE.sub("REDACTED_TSKEY", result)
     result = _SERIAL_KV_RE.sub(r"\1\2REDACTED", result)
+    result = _scrub_ips(result)
     result = _scrub_known_literals(result, known_serials, "REDACTED")
     return _scrub_usernames_in_text(result, usernames, home_paths)
 
@@ -212,12 +253,13 @@ def redact_dmesg_line(
     usernames: Iterable[str] = (),
     home_paths: Iterable[str] = (),
 ) -> str:
-    """Scrub hardware serials, MAC addresses, UUIDs, Tailscale keys, and usernames from dmesg."""
+    """Scrub hardware serials, MACs, IPs, UUIDs, Tailscale keys, and usernames from dmesg."""
     result = _MAC_RE.sub("REDACTED_MAC", line)
     result = _TSKEY_RE.sub("REDACTED_TSKEY", result)
     result = _SERIAL_KV_RE.sub(r"\1\2REDACTED", result)
     result = _UUID_TOKEN_RE.sub(r"\1=REDACTED", result)
     result = _BARE_UUID_RE.sub("REDACTED_UUID", result)
+    result = _scrub_ips(result)
     result = _scrub_known_literals(result, known_serials, "REDACTED")
     result = _scrub_known_literals(result, known_uuids, "REDACTED_UUID")
     return _scrub_usernames_in_text(result, usernames, home_paths)

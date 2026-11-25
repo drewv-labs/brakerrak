@@ -23,6 +23,7 @@ from benchmarks.analyze_showdown import (
     parse_explain_json,
     parse_perf_stat_json,
     parse_pg_stat_io_json,
+    validate_plan_shape,
 )
 
 
@@ -474,3 +475,366 @@ def test_showdown_pyarrow_ingestion_markdown_and_roundtrip(
     assert "### Per-Pass Ablation Matrix" in captured.out
     assert (cli_out / "custom-stem.parquet").is_file()
     assert (cli_out / "custom-stem.arrow").is_file()
+
+
+def test_multi_iteration_quantiles_eic_and_direct_io_grouping(tmp_path: Path) -> None:
+    run_dir = tmp_path / "showdown-multi-iter"
+    passes_root = run_dir / "passes"
+    passes_root.mkdir(parents=True)
+    (run_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": "showdown-multi-iter",
+                "node_id": "brakerbench-multi-test",
+                "pillar": CTD_PILLAR,
+                "component": CTD_COMPONENT,
+                "captured_at_utc": "2026-11-24T01:00:00Z",
+                "architecture": "riscv64",
+                "kernel_release": "6.12.0-riscv64",
+                "device_tree_model": "SiFive HiFive Premier P550",
+                "cpu_harts_count": 4,
+                "pg_server_version": "18.6",
+                "db_name": "brakerrak",
+                "table_name": "brakerrak_io_torture",
+                "nvme_device": "/dev/nvme0n1",
+                "nvme_short": "nvme0n1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Create 3 iterations using iter_01/<pass_dir> layout for io_uring eic=16 and eic=32,
+    # plus io_direct="data" on eic=32, and sync baseline across 3 iterations.
+    sync_execs = [300.0, 310.0, 320.0]
+    uring_16_execs = [100.0, 200.0, 300.0]
+    uring_32_execs = [80.0, 90.0, 100.0]
+
+    for idx, (s_ms, u16_ms, u32_ms) in enumerate(
+        zip(sync_execs, uring_16_execs, uring_32_execs, strict=True), start=1
+    ):
+        iter_dir = passes_root / f"iter_{idx:02d}"
+        _write_pass_fixture(
+            iter_dir,
+            cache_mode="cold",
+            io_method="sync",
+            eic=16,
+            workload="bitmap_heap_scan",
+            exec_ms=s_ms,
+            plan_ms=0.5,
+            shared_read_blocks=16384,
+            io_read_ms=200.0,
+            cycles=1_000_000,
+            instructions=1_000_000,
+            ctx_switches=100,
+            sectors_read_delta=262_144,
+        )
+        _write_pass_fixture(
+            iter_dir,
+            cache_mode="cold",
+            io_method="io_uring",
+            eic=16,
+            workload="bitmap_heap_scan",
+            exec_ms=u16_ms,
+            plan_ms=0.5,
+            shared_read_blocks=16384,
+            io_read_ms=100.0,
+            cycles=1_000_000,
+            instructions=1_000_000,
+            ctx_switches=50,
+            sectors_read_delta=262_144,
+        )
+        _write_pass_fixture(
+            iter_dir,
+            cache_mode="cold",
+            io_method="io_uring",
+            eic=32,
+            workload="bitmap_heap_scan",
+            exec_ms=u32_ms,
+            plan_ms=0.5,
+            shared_read_blocks=16384,
+            io_read_ms=80.0,
+            cycles=1_000_000,
+            instructions=1_000_000,
+            ctx_switches=40,
+            sectors_read_delta=262_144,
+        )
+
+    # Also verify <pass_dir>_iter01 flat suffixed layout + distinct io_direct grouping
+    direct_pdir = _write_pass_fixture(
+        passes_root,
+        cache_mode="cold",
+        io_method="io_uring",
+        eic=32,
+        workload="bitmap_heap_scan",
+        exec_ms=75.0,
+        plan_ms=0.5,
+        shared_read_blocks=16384,
+        io_read_ms=60.0,
+        cycles=1_000_000,
+        instructions=1_000_000,
+        ctx_switches=30,
+        sectors_read_delta=262_144,
+    )
+    suffixed_dir = passes_root / f"{direct_pdir.name}_iter04"
+    direct_pdir.rename(suffixed_dir)
+    pmeta = json.loads((suffixed_dir / "pass_meta.json").read_text(encoding="utf-8"))
+    # Verify fallback to "data" when io_direct is omitted/empty while with_direct_io=True
+    pmeta["with_direct_io"] = True
+    pmeta["iteration"] = 4
+    (suffixed_dir / "pass_meta.json").write_text(json.dumps(pmeta), encoding="utf-8")
+
+    artifacts = analyze_showdown_run(run_dir, out_dir=tmp_path / "out")
+    assert artifacts.table.num_rows == 10
+
+    summaries = compute_method_summaries(artifacts.table)
+    summary_by_key = {
+        (s.cache_mode, s.workload, s.io_method, s.effective_io_concurrency, s.io_direct): s
+        for s in summaries
+    }
+    assert len(summary_by_key) == 4
+
+    u16 = summary_by_key[("cold", "bitmap_heap_scan", "io_uring", 16, "off")]
+    assert u16.n == 3
+    assert u16.min_ms == pytest.approx(100.0)
+    assert u16.p50_ms == pytest.approx(200.0)
+    assert u16.p95_ms == pytest.approx(290.0)
+    assert u16.p99_ms == pytest.approx(298.0)
+    assert u16.mean_ms == pytest.approx(200.0)
+    assert u16.stddev_ms == pytest.approx(100.0)
+    assert u16.max_ms == pytest.approx(300.0)
+
+    u32_off = summary_by_key[("cold", "bitmap_heap_scan", "io_uring", 32, "off")]
+    assert u32_off.n == 3
+    assert u32_off.p50_ms == pytest.approx(90.0)
+    assert u32_off.stddev_ms == pytest.approx(10.0)
+
+    u32_direct = summary_by_key[("cold", "bitmap_heap_scan", "io_uring", 32, "data")]
+    assert u32_direct.n == 1
+    assert u32_direct.stddev_ms == pytest.approx(0.0)
+    assert u32_direct.mean_ms == pytest.approx(75.0)
+    assert "Direct I/O" in artifacts.markdown
+
+
+def test_wall_throughput_pg_io_throughput_and_warm_hits(tmp_path: Path) -> None:
+    run_dir = tmp_path / "showdown-tput"
+    iter_dir = run_dir / "passes" / "iter_01"
+    iter_dir.mkdir(parents=True)
+    (run_dir / "metadata.json").write_text(
+        json.dumps({"run_id": "showdown-tput", "node_id": "test-node"}),
+        encoding="utf-8",
+    )
+
+    pdir = _write_pass_fixture(
+        iter_dir,
+        cache_mode="cold",
+        io_method="io_uring",
+        eic=32,
+        workload="seq_scan",
+        exec_ms=4000.0,
+        plan_ms=1.0,
+        shared_read_blocks=131072,  # 1024 MiB (131072 * 8192 bytes)
+        io_read_ms=2000.0,  # 2.0s -> pg_io_read_mib_s = 512.0 MiB/s
+        cycles=1_000_000,
+        instructions=1_200_000,
+        ctx_switches=100,
+        sectors_read_delta=2_097_152,  # 1024 MiB
+    )
+    # Set wall_duration_ms = 5000.0 (different from execution_time_ms = 4000.0)
+    pmeta = json.loads((pdir / "pass_meta.json").read_text(encoding="utf-8"))
+    pmeta["wall_duration_ms"] = 5000.0
+    (pdir / "pass_meta.json").write_text(json.dumps(pmeta), encoding="utf-8")
+
+    # Warm-cache pass with reads=0 and hits=50000 in pg_stat_io.json
+    warm_pdir = _write_pass_fixture(
+        iter_dir,
+        cache_mode="warm",
+        io_method="io_uring",
+        eic=32,
+        workload="seq_scan",
+        exec_ms=250.0,
+        plan_ms=0.5,
+        shared_read_blocks=0,
+        io_read_ms=0.0,
+        cycles=500_000,
+        instructions=750_000,
+        ctx_switches=20,
+        sectors_read_delta=0,
+    )
+    (warm_pdir / "pg_stat_io.json").write_text(
+        json.dumps(
+            [
+                {
+                    "backend_type": "client backend",
+                    "object": "relation",
+                    "context": "normal",
+                    "reads": 0,
+                    "hits": 50000,
+                    "writes": 0,
+                    "op_bytes": 8192,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    artifacts = analyze_showdown_run(run_dir, out_dir=tmp_path / "out")
+    by_cm = {r["cache_mode"]: r for r in artifacts.table.to_pylist()}
+
+    cold_row = by_cm["cold"]
+    # 1024 MiB / 5.0 s (wall_duration_ms) = 204.8 MiB/s (NOT 1024 / 4.0 = 256.0)
+    assert cold_row["wall_duration_ms"] == pytest.approx(5000.0)
+    assert cold_row["nvme_read_mib_s"] == pytest.approx(204.8)
+    # 131072 * 8192 B / 1048576 / 2.0 s = 512.0 MiB/s
+    assert cold_row["pg_io_read_mib_s"] == pytest.approx(512.0)
+
+    warm_row = by_cm["warm"]
+    assert warm_row["pg_stat_io_reads"] == 0
+    assert warm_row["pg_stat_io_hits"] == 50000
+    assert warm_row["pg_io_read_mib_s"] is None
+
+
+def test_perf_pmu_multiplexing_and_plan_shape_validation(tmp_path: Path) -> None:
+    # 1. PMU multiplexing detection via pcnt-running < 100.0
+    perf_clean = tmp_path / "perf_clean.json"
+    perf_clean.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "cycles", "counter-value": "1000000", "pcnt-running": 100.0}),
+                json.dumps(
+                    {
+                        "event": "LLC-load-misses",
+                        "counter-value": "<not supported>",
+                        "pcnt-running": 0.0,
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    m_clean = parse_perf_stat_json(perf_clean)
+    assert m_clean.pmu_multiplexed is False
+    assert m_clean.min_pcnt_running == pytest.approx(100.0)
+
+    perf_mux = tmp_path / "perf_mux.json"
+    perf_mux.write_text(
+        "\n".join(
+            [
+                json.dumps({"event": "cycles", "counter-value": "1000000", "pcnt-running": 100.0}),
+                json.dumps({"metric-value": "1.37", "metric-unit": "insn per cycle"}),
+                json.dumps(
+                    {
+                        "event": "dTLB-load-misses",
+                        "counter-value": "45000",
+                        "pcnt-running": 62.5,
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    m_mux = parse_perf_stat_json(perf_mux)
+    assert m_mux.pmu_multiplexed is True
+    assert m_mux.min_pcnt_running == pytest.approx(62.5)
+    assert m_mux.ipc == pytest.approx(1.37)
+
+    # 2. Plan-shape validation across Parallel Seq Scan, Seq Scan, Bitmap Heap Scan, and mismatch
+    run_dir = tmp_path / "showdown-plan-mux"
+    iter_dir = run_dir / "passes" / "iter_01"
+    iter_dir.mkdir(parents=True)
+    (run_dir / "metadata.json").write_text(
+        json.dumps({"run_id": "showdown-plan-mux", "node_id": "test-node"}),
+        encoding="utf-8",
+    )
+
+    p_parallel_seq = _write_pass_fixture(
+        iter_dir,
+        cache_mode="cold",
+        io_method="io_uring",
+        eic=32,
+        workload="seq_scan",
+        exec_ms=1000.0,
+        plan_ms=0.5,
+        shared_read_blocks=1000,
+        io_read_ms=500.0,
+        cycles=1_000_000,
+        instructions=1_000_000,
+        ctx_switches=50,
+        sectors_read_delta=1000,
+    )
+    (p_parallel_seq / "explain.json").write_text(
+        json.dumps(
+            [
+                {
+                    "Plan": {
+                        "Node Type": "Finalize Aggregate",
+                        "Plans": [
+                            {
+                                "Node Type": "Gather",
+                                "Plans": [
+                                    {
+                                        "Node Type": "Partial Aggregate",
+                                        "Plans": [{"Node Type": "Parallel Seq Scan"}],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    "Execution Time": 1000.0,
+                    "Planning Time": 0.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (p_parallel_seq / "perf_stat.json").write_text(
+        perf_mux.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+
+    p_bad_bmp = _write_pass_fixture(
+        iter_dir,
+        cache_mode="cold",
+        io_method="io_uring",
+        eic=16,
+        workload="bitmap_heap_scan",
+        exec_ms=500.0,
+        plan_ms=0.5,
+        shared_read_blocks=500,
+        io_read_ms=200.0,
+        cycles=500_000,
+        instructions=500_000,
+        ctx_switches=20,
+        sectors_read_delta=500,
+    )
+    (p_bad_bmp / "explain.json").write_text(
+        json.dumps(
+            [
+                {
+                    "Plan": {
+                        "Node Type": "Aggregate",
+                        "Plans": [{"Node Type": "Index Only Scan"}],
+                    },
+                    "Execution Time": 500.0,
+                    "Planning Time": 0.5,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ex_seq = parse_explain_json(p_parallel_seq / "explain.json")
+    assert validate_plan_shape("seq_scan", ex_seq) is True
+    assert validate_plan_shape("bitmap_heap_scan", ex_seq) is False
+
+    ex_bad_bmp = parse_explain_json(p_bad_bmp / "explain.json")
+    assert validate_plan_shape("bitmap_heap_scan", ex_bad_bmp) is False
+
+    artifacts = analyze_showdown_run(run_dir, out_dir=tmp_path / "out")
+    by_wl = {r["workload"]: r for r in artifacts.table.to_pylist()}
+    assert by_wl["seq_scan"]["plan_shape_valid"] is True
+    assert by_wl["seq_scan"]["perf_pmu_multiplexed"] is True
+    assert by_wl["seq_scan"]["perf_min_pcnt_running"] == pytest.approx(62.5)
+    assert by_wl["bitmap_heap_scan"]["plan_shape_valid"] is False
+    assert "PMU Multiplexing Warning" in artifacts.markdown
+    assert "Plan Shape Warning" in artifacts.markdown

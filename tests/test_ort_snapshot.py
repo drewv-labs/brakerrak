@@ -34,10 +34,13 @@ from brakerrak_ort import (
     parse_ganesha_exports,
     parse_kv_content,
     read_sysctl_baseline,
+    redact_dmesg_line,
+    redact_proc_cmdline,
     sign_snapshot,
     verify_snapshot_signature,
     write_snapshot_pair,
 )
+from brakerrak_ort.profiles import SOC_ALIASES, resolve_profile
 
 
 class FakeSystemProbe:
@@ -166,13 +169,18 @@ def _make_probe(
     nvme_speed: str = "8.0 GT/s PCIe",
     nvme_width: str = "4",
     nvme_logical_bs: str = "4096",
+    nvme_mount_fstype: str | None = "xfs",
+    mount_point: str = "/mnt/nvme_pgdata",
     lspci_output: str = "",
     pci_sysfs: dict[str, str] | None = None,
+    hailo_runtime_ok: bool = True,
+    tenstorrent_runtime_ok: bool = True,
     nic_name: str = "end0",
     nic_up: bool = True,
     nic_ipv4: str | None = "198.51.100.25",
     pg_active: bool = True,
     pg_io_method: str = "io_uring",
+    pg_huge_pages_status: str = "on",
     nr_hugepages: str = "2048",
     mqtt_active: bool = True,
     nfs_ganesha_active: bool = True,
@@ -180,7 +188,21 @@ def _make_probe(
     ganesha_conf: str | None = None,
     proc_cmdline: str = "console=ttyS0 root=PARTUUID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     dmesg_output: str = "",
+    lsblk_devices: list[dict[str, Any]] | None = None,
+    extra_mounts: Sequence[tuple[str, str, str]] = (),
+    btrfs_stats_by_mount: dict[str, CommandResult] | None = None,
 ) -> FakeSystemProbe:
+    mount_lines: list[str] = ["/dev/mmcblk0p2 / ext4 rw,relatime 0 0"]
+    mounts: set[str] = {"/"}
+    if nvme_present and nvme_mount_fstype:
+        mount_lines.append(
+            f"/dev/mapper/vg_braker-lv_pgdata {mount_point} {nvme_mount_fstype} rw,noatime 0 0"
+        )
+        mounts.add(mount_point)
+    for src, target, fstype in extra_mounts:
+        mount_lines.append(f"{src} {target} {fstype} rw,relatime 0 0")
+        mounts.add(target)
+
     files: dict[str, str] = {
         "/proc/device-tree/model": dt_model + "\x00",
         "/proc/cpuinfo": _make_cpuinfo(harts),
@@ -190,6 +212,7 @@ def _make_probe(
         ),
         "/proc/uptime": "12345.67 45678.90\n",
         "/proc/cmdline": proc_cmdline,
+        "/proc/mounts": "\n".join(mount_lines) + "\n",
         "/etc/os-release": 'PRETTY_NAME="Ubuntu 24.04.1 LTS"\n',
         "/etc/resolv.conf": "nameserver 198.51.100.1\n",
         "/sys/class/thermal/thermal_zone0/type": "soc-thermal",
@@ -250,32 +273,34 @@ def _make_probe(
     ]
     ip_routes = [{"dst": "default", "dev": nic_name}]
 
+    default_devices: list[dict[str, Any]] = [
+        {
+            "name": "nvme0n1",
+            "path": "/dev/nvme0n1",
+            "size": 2_000_398_934_016,
+            "type": "disk",
+            "tran": "nvme",
+            "rota": False,
+            "serial": "SN-NVME-TEST-0001",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "partuuid": None,
+            "mountpoint": None,
+            "children": [
+                {
+                    "name": "nvme0n1p1",
+                    "path": "/dev/nvme0n1p1",
+                    "size": 1_000_000_000_000,
+                    "type": "part",
+                    "serial": None,
+                    "uuid": "22222222-3333-4444-5555-666666666666",
+                    "partuuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "mountpoint": "/home/benchuser/mnt",
+                }
+            ],
+        }
+    ]
     lsblk_doc = {
-        "blockdevices": [
-            {
-                "name": "nvme0n1",
-                "path": "/dev/nvme0n1",
-                "size": 2_000_398_934_016,
-                "type": "disk",
-                "tran": "nvme",
-                "serial": "SN-NVME-TEST-0001",
-                "uuid": "11111111-2222-3333-4444-555555555555",
-                "partuuid": None,
-                "mountpoint": None,
-                "children": [
-                    {
-                        "name": "nvme0n1p1",
-                        "path": "/dev/nvme0n1p1",
-                        "size": 1_000_000_000_000,
-                        "type": "part",
-                        "serial": None,
-                        "uuid": "22222222-3333-4444-5555-666666666666",
-                        "partuuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-                        "mountpoint": "/home/benchuser/mnt",
-                    }
-                ],
-            }
-        ]
+        "blockdevices": lsblk_devices if lsblk_devices is not None else default_devices
     }
 
     pg_json = json.dumps(
@@ -293,7 +318,7 @@ def _make_probe(
                 "track_io_timing": "on",
                 "shared_buffers": "8GB",
                 "huge_pages": "try",
-                "huge_pages_status": "on",
+                "huge_pages_status": pg_huge_pages_status,
                 "effective_cache_size": "24GB",
                 "work_mem": "64MB",
                 "maintenance_work_mem": "1GB",
@@ -340,9 +365,26 @@ def _make_probe(
         ("python3", "--version"): CommandResult(stdout="Python 3.12.14"),
     }
 
+    if "1e60:" in lspci_output.lower() and hailo_runtime_ok:
+        existing.update({"/dev/hailo0", "/sys/module/hailo_pci"})
+        commands[("hailortcli", "fw-control", "identify")] = CommandResult(
+            stdout="Firmware Version: 5.0.0\nBoard Name: Hailo-10H\n"
+        )
+
+    if "1e52:" in lspci_output.lower() and tenstorrent_runtime_ok:
+        existing.update({"/dev/tenstorrent/0", "/sys/module/tenstorrent"})
+        commands[("tt-smi", "-s")] = CommandResult(
+            stdout='{"device_info": [{"board_type": "p150a"}]}'
+        )
+
+    if btrfs_stats_by_mount:
+        for mp, res in btrfs_stats_by_mount.items():
+            commands[("btrfs", "device", "stats", mp)] = res
+
     return FakeSystemProbe(
         files=files,
         existing_paths=existing,
+        mounts=mounts,
         commands=commands,
         total_ram_kb=total_ram_kb,
     )
@@ -920,3 +962,614 @@ def test_brakerrak_ort_is_strictly_stdlib_only() -> None:
                 assert top == "brakerrak_ort" or top in stdlib_names, (
                     f"Non-stdlib import {node.module!r} in {py_file.name}"
                 )
+
+
+def test_multislot_nvme_and_accelerator_independent_plus_day1_runtimes() -> None:
+    lspci_both = (
+        "0000:01:00.0 Co-processor [0b40]: Hailo Technologies Ltd. Hailo-10H [1e60:2864]\n"
+        "0000:02:00.0 Processing accelerators [1200]: Tenstorrent Inc Blackhole p150a [1e52:401e]\n"
+    )
+    probe_ok = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=True,
+        nvme_speed="8.0 GT/s PCIe",
+        nvme_width="4",
+        lspci_output=lspci_both,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_speed": "16.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_width": "8",
+        },
+        hailo_runtime_ok=True,
+        tenstorrent_runtime_ok=True,
+    )
+    payload_ok, _, _, _ = collect_snapshot(
+        probe_ok,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "devbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_ok = _assertions_by_id(payload_ok)
+    assert checks_ok["ORT-03_PCIE_NVME_LINK"]["status"] == "PASS"
+    assert checks_ok["ORT-03B_PCIE_ACCELERATOR_LINK"]["status"] == "PASS"
+    assert "1e60:2864" in str(checks_ok["ORT-03B_PCIE_ACCELERATOR_LINK"]["actual"])
+    assert "1e52:401e" in str(checks_ok["ORT-03B_PCIE_ACCELERATOR_LINK"]["actual"])
+    assert checks_ok["ORT-D1_HAILO_RUNTIME"]["status"] == "PASS"
+    assert checks_ok["ORT-D1_TENSTORRENT_RUNTIME"]["status"] == "PASS"
+    assert payload_ok["operational_readiness_test"]["overall_status"] == "PASS"
+
+    # Day-1 runtime failure when kmod/device/cli missing, while Day-0 stays PASS
+    probe_missing_rt = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=True,
+        lspci_output=lspci_both,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_speed": "16.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_width": "8",
+        },
+        hailo_runtime_ok=False,
+        tenstorrent_runtime_ok=False,
+    )
+    day0_payload, _, _, _ = collect_snapshot(
+        probe_missing_rt,
+        soc="eswin-eic7700x",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "devbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    day0_checks = _assertions_by_id(day0_payload)
+    assert "ORT-D1_HAILO_RUNTIME" not in day0_checks
+    assert "ORT-D1_TENSTORRENT_RUNTIME" not in day0_checks
+    assert day0_payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+    day1_fail_payload, _, _, _ = collect_snapshot(
+        probe_missing_rt,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "devbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    day1_fail_checks = _assertions_by_id(day1_fail_payload)
+    assert day1_fail_checks["ORT-D1_HAILO_RUNTIME"]["status"] == "FAIL"
+    assert day1_fail_checks["ORT-D1_TENSTORRENT_RUNTIME"]["status"] == "FAIL"
+    assert day1_fail_payload["operational_readiness_test"]["overall_status"] == "FAIL"
+
+    # Multi-slot visionbox with NVMe seated but accelerator missing must FAIL ORT-03B
+    probe_missing_acc = _make_probe(
+        nvme_present=True,
+        lspci_output="",
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    missing_acc_payload, _, _, _ = collect_snapshot(
+        probe_missing_acc,
+        soc="eswin-eic7700x",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "visionbox", "ENABLE_POSTGRES": "false"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    missing_acc_checks = _assertions_by_id(missing_acc_payload)
+    assert missing_acc_checks["ORT-03_PCIE_NVME_LINK"]["status"] == "PASS"
+    assert missing_acc_checks["ORT-03B_PCIE_ACCELERATOR_LINK"]["status"] == "FAIL"
+
+
+def test_hugepages_requires_both_sysctl_and_pg_huge_pages_status() -> None:
+    probe_pg_hp_off = _make_probe(
+        nr_hugepages="2048",
+        pg_huge_pages_status="off",
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    payload_off, _, _, _ = collect_snapshot(
+        probe_pg_hp_off,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_off = _assertions_by_id(payload_off)
+    assert checks_off["ORT-D1_VM_HUGEPAGES"]["status"] == "FAIL"
+    assert "huge_pages_status=off" in str(checks_off["ORT-D1_VM_HUGEPAGES"]["actual"])
+
+    probe_pg_hp_on = _make_probe(
+        nr_hugepages="2048",
+        pg_huge_pages_status="on",
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    payload_on, _, _, _ = collect_snapshot(
+        probe_pg_hp_on,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_on = _assertions_by_id(payload_on)
+    assert checks_on["ORT-D1_VM_HUGEPAGES"]["status"] == "PASS"
+
+
+def test_day1_xfs_mount_and_btrfs_raid_mount_stats() -> None:
+    raid_cfg = json.dumps(
+        [
+            {
+                "name": "WarmVault",
+                "id": "warmvault",
+                "type": "warm",
+                "label": "WARM_VAULT",
+                "mount": "/mnt/warm_vault",
+                "disks": 2,
+                "min_bytes": 1_000_000_000_000,
+                "max_bytes": 2_000_000_000_000,
+            }
+        ]
+    )
+    raid_disks = [
+        {
+            "name": "sda",
+            "path": "/dev/sda",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "usb",
+            "rota": True,
+            "model": "HDD-A",
+            "serial": "SN-HDD-A",
+        },
+        {
+            "name": "sdb",
+            "path": "/dev/sdb",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "usb",
+            "rota": True,
+            "model": "HDD-B",
+            "serial": "SN-HDD-B",
+        },
+    ]
+
+    clean_stats = (
+        "[/dev/sda].write_io_errs    0\n"
+        "[/dev/sda].read_io_errs     0\n"
+        "[/dev/sda].flush_io_errs    0\n"
+        "[/dev/sda].corruption_errs  0\n"
+        "[/dev/sda].generation_errs  0\n"
+        "[/dev/sdb].write_io_errs    0\n"
+        "[/dev/sdb].read_io_errs     0\n"
+        "[/dev/sdb].flush_io_errs    0\n"
+        "[/dev/sdb].corruption_errs  0\n"
+        "[/dev/sdb].generation_errs  0\n"
+    )
+    probe_ok = _make_probe(
+        nvme_mount_fstype="xfs",
+        extra_mounts=[("/dev/sda", "/mnt/warm_vault", "btrfs")],
+        lsblk_devices=raid_disks,
+        btrfs_stats_by_mount={"/mnt/warm_vault": CommandResult(stdout=clean_stats)},
+    )
+    node_env = {
+        "NODE_ROLE": "databroker",
+        "WITH_RAID": "true",
+        "RAID_ARRAYS_JSON": raid_cfg,
+    }
+    payload_ok, _, _, _ = collect_snapshot(
+        probe_ok,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env=node_env,
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_ok = _assertions_by_id(payload_ok)
+    assert checks_ok["ORT-D1_NVME_XFS_MOUNT"]["status"] == "PASS"
+    assert checks_ok["ORT-D1_WARMVAULT_BTRFS_MOUNT"]["status"] == "PASS"
+    assert checks_ok["ORT-D1_WARMVAULT_BTRFS_STATS"]["status"] == "PASS"
+    assert payload_ok["operational_readiness_test"]["overall_status"] == "PASS"
+
+    # Non-zero btrfs stats and wrong NVMe fstype must FAIL
+    err_stats = clean_stats.replace(
+        "[/dev/sdb].corruption_errs  0", "[/dev/sdb].corruption_errs  3"
+    )
+    probe_bad = _make_probe(
+        nvme_mount_fstype="ext4",
+        extra_mounts=[("/dev/sda", "/mnt/warm_vault", "btrfs")],
+        lsblk_devices=raid_disks,
+        btrfs_stats_by_mount={"/mnt/warm_vault": CommandResult(stdout=err_stats)},
+    )
+    payload_bad, _, _, _ = collect_snapshot(
+        probe_bad,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env=node_env,
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_bad = _assertions_by_id(payload_bad)
+    assert checks_bad["ORT-D1_NVME_XFS_MOUNT"]["status"] == "FAIL"
+    assert checks_bad["ORT-D1_WARMVAULT_BTRFS_STATS"]["status"] == "FAIL"
+    assert "/dev/sdb.corruption_errs=3" in str(checks_bad["ORT-D1_WARMVAULT_BTRFS_STATS"]["actual"])
+
+
+def test_mqtt_demoted_to_warn_when_optional_and_fail_when_required() -> None:
+    probe_no_mqtt = _make_probe(mqtt_active=False, nfs_ganesha_active=False)
+
+    # devbench treats MQTT as supplemental -> WARN
+    dev_payload, _, _, _ = collect_snapshot(
+        probe_no_mqtt,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "devbench", "ENABLE_MQTT_BROKER": "true"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    dev_checks = _assertions_by_id(dev_payload)
+    assert dev_checks["ORT-D1_MQTT_ACTIVE"]["status"] == "WARN"
+    assert dev_payload["operational_readiness_test"]["overall_status"] == "WARN"
+
+    # Explicit REQUIRE_MQTT_BROKER=true -> FAIL
+    req_payload, _, _, _ = collect_snapshot(
+        probe_no_mqtt,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={
+            "NODE_ROLE": "devbench",
+            "ENABLE_MQTT_BROKER": "true",
+            "REQUIRE_MQTT_BROKER": "true",
+        },
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(req_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+
+    # databroker requires MQTT by default -> FAIL
+    broker_payload, _, _, _ = collect_snapshot(
+        probe_no_mqtt,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databroker", "ENABLE_MQTT_BROKER": "true"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(broker_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+
+
+def test_redact_cmdline_and_dmesg_scrubs_ips_without_mangling_versions_or_bdfs() -> None:
+    cmdline = (
+        "BOOT_IMAGE=/boot/vmlinuz-6.6.20.1-riscv64 root=UUID=11111111-2222-3333-4444-555555555555 "
+        "ip=198.51.100.25::198.51.100.1:255.255.255.0:node01:end0:off "
+        "nfsroot=2001:db8::10:/srv/nfs net=fd00:abcd::/48 v6_any=::/0 "
+        "ep=[198.51.100.99]:5432 mac=02:42:ac:11:00:09"
+    )
+    red_cmd = redact_proc_cmdline(cmdline)
+    assert "/boot/vmlinuz-6.6.20.1-riscv64" in red_cmd
+    assert "198.51.100.25" not in red_cmd
+    assert "198.51.100.1" not in red_cmd
+    assert "255.255.255.0" not in red_cmd
+    assert "198.51.100.99" not in red_cmd
+    assert "[REDACTED_IP]:5432" in red_cmd
+    assert "2001:db8::10" not in red_cmd
+    assert "fd00:abcd::/48" not in red_cmd
+    assert "::/0" not in red_cmd
+    assert "v6_any=REDACTED_IP" in red_cmd
+    assert "02:42:ac:11:00:09" not in red_cmd
+    assert "REDACTED_IP::REDACTED_IP:REDACTED_IP" in red_cmd
+    assert "REDACTED_MAC" in red_cmd
+
+    dmesg_line = (
+        "[   12.34] Linux version 6.1.83.2 (gcc 13.2.0) pcieport 0000:01:00.0: "
+        "usb 1-1.4.2.3: reset SuperSpeed USB device number 5 usb 2-1.1.1.1:1.0 "
+        "AER error from peer 192.0.2.44 "
+        "v6=fe80::1ff:fe23:4567:890a%end0 full=2001:0db8:0000:0000:0000:ff00:0042:8329 "
+        "mapped=::ffff:203.0.113.7 mac=aa:bb:cc:dd:ee:ff"
+    )
+    red_dmesg = redact_dmesg_line(dmesg_line)
+    assert "Linux version 6.1.83.2" in red_dmesg
+    assert "0000:01:00.0" in red_dmesg
+    assert "usb 1-1.4.2.3:" in red_dmesg
+    assert "usb 2-1.1.1.1:1.0" in red_dmesg
+    assert "192.0.2.44" not in red_dmesg
+    assert "fe80::1ff:fe23:4567:890a" not in red_dmesg
+    assert "2001:0db8:0000:0000:0000:ff00:0042:8329" not in red_dmesg
+    assert "203.0.113.7" not in red_dmesg
+    assert "aa:bb:cc:dd:ee:ff" not in red_dmesg
+    assert "REDACTED_MAC" in red_dmesg
+    assert red_dmesg.count("REDACTED_IP") == 4
+
+
+def test_raid_filtering_requires_rota_and_excludes_os_disks() -> None:
+    mixed_disks: list[dict[str, Any]] = [
+        # Non-rotational SSD in size window -> must be excluded by rota=1 filter
+        {
+            "name": "nvme1n1",
+            "path": "/dev/nvme1n1",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "nvme",
+            "rota": False,
+        },
+        # Rotational disk hosting / -> must be excluded
+        {
+            "name": "sda",
+            "path": "/dev/sda",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "sata",
+            "rota": True,
+            "children": [{"name": "sda1", "type": "part", "mountpoint": "/"}],
+        },
+        # Rotational disk hosting /boot/efi -> must be excluded
+        {
+            "name": "sdb",
+            "path": "/dev/sdb",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "sata",
+            "rota": 1,
+            "children": [{"name": "sdb1", "type": "part", "mountpoint": "/boot/efi"}],
+        },
+        # Rotational disk hosting swap -> must be excluded
+        {
+            "name": "sdc",
+            "path": "/dev/sdc",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "sata",
+            "rota": "1",
+            "children": [
+                {"name": "sdc1", "type": "part", "mountpoint": "[SWAP]", "fstype": "swap"}
+            ],
+        },
+        # Valid rotational data disk
+        {
+            "name": "sdd",
+            "path": "/dev/sdd",
+            "size": 1_500_000_000_000,
+            "type": "disk",
+            "tran": "usb",
+            "rota": True,
+        },
+    ]
+    raid_cfg = json.dumps(
+        [
+            {
+                "name": "WarmVault",
+                "id": "warmvault",
+                "disks": 1,
+                "mount": "/mnt/warm_vault",
+                "min_bytes": 1_000_000_000_000,
+                "max_bytes": 2_000_000_000_000,
+            }
+        ]
+    )
+    probe = _make_probe(lsblk_devices=mixed_disks)
+    payload, _, _, _ = collect_snapshot(
+        probe,
+        soc="eswin-eic7700x",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "databroker", "WITH_RAID": "true", "RAID_ARRAYS_JSON": raid_cfg},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    detected = payload["hardware_inventory"]["usb_raid_arrays"]["warmvault"]["detected_disks"]
+    assert [d["path"] for d in detected] == ["/dev/sdd"]
+
+    # Explicit devices[] override allows non-rotational disk, but still excludes OS root disk
+    override_cfg = json.dumps(
+        [
+            {
+                "name": "FlashVault",
+                "id": "flashvault",
+                "disks": 1,
+                "mount": "/mnt/flash_vault",
+                "devices": ["/dev/nvme1n1", "/dev/sda"],
+            }
+        ]
+    )
+    payload_override, _, _, _ = collect_snapshot(
+        probe,
+        soc="eswin-eic7700x",
+        stage="day0-pre-forge",
+        node_env={
+            "NODE_ROLE": "databroker",
+            "WITH_RAID": "true",
+            "RAID_ARRAYS_JSON": override_cfg,
+        },
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    override_detected = payload_override["hardware_inventory"]["usb_raid_arrays"]["flashvault"][
+        "detected_disks"
+    ]
+    assert [d["path"] for d in override_detected] == ["/dev/nvme1n1"]
+
+
+def test_all_cli_aliases_dt_substrings_resolve_profile_and_min_widths() -> None:
+    expected_cli_aliases: dict[str, tuple[str, ...]] = {
+        "eswin-eic7700x": (
+            "eswin-eic7700x",
+            "eswin/eic7700x",
+            "sifive-p550",
+            "sifive/p550",
+            "p550",
+            "premier-p550",
+            "milkv-megrez",
+            "milkv/megrez",
+            "megrez",
+            "pine64-starpro64",
+            "pine64/starpro64",
+            "starpro64",
+        ),
+        "sifive-fu740": (
+            "sifive-fu740",
+            "sifive/fu740",
+            "sifive-unmatched",
+            "sifive/unmatched",
+            "unmatched",
+            "fu740",
+        ),
+        "starfive-jh7110": (
+            "starfive-vf2-lite",
+            "starfive/vf2-lite",
+            "vf2-lite",
+            "vf2lite",
+            "milkv-mars",
+            "milkv/mars",
+            "mars",
+            "pine64-star64",
+            "pine64/star64",
+            "star64",
+            "orangepi-rv",
+            "orangepi/rv",
+            "opirv",
+            "starfive-jh7110",
+            "starfive/jh7110",
+            "starfive-vf2",
+            "starfive/vf2",
+            "vf2",
+            "visionfive2",
+        ),
+        "spacemit-k1": (
+            "orangepi-rv2",
+            "orangepi/rv2",
+            "rv2",
+            "orangepi-r2s",
+            "orangepi/r2s",
+            "r2s",
+            "bananapi-f3",
+            "bananapi/f3",
+            "bpi-f3",
+            "bpif3",
+            "bananapi-cm6",
+            "bananapi/cm6",
+            "bpi-cm6",
+            "bpicm6",
+            "spacemit-k1",
+            "spacemit/k1",
+            "milkv-jupiter",
+            "milkv/jupiter",
+            "jupiter",
+            "jptr1",
+            "muse-pi",
+            "musepi",
+        ),
+        "spacemit-k3": (
+            "firefly-aibox-k3",
+            "firefly/aibox-k3",
+            "aibox-k3",
+            "aiboxk3",
+            "spacemit-k3",
+            "spacemit/k3",
+            "milkv-jupiter2",
+            "milkv/jupiter2",
+            "jupiter2",
+            "jptr2",
+        ),
+        "ultrarisc-dp1000": (
+            "ultrarisc-dp1000",
+            "ultrarisc/dp1000",
+            "milkv-titan",
+            "milkv/titan",
+            "titan",
+            "dp1000",
+        ),
+        "tenstorrent-atlantis": (
+            "tenstorrent-atlantis",
+            "tenstorrent/atlantis",
+            "atlantis",
+            "ascalon",
+        ),
+        "generic-riscv64": ("generic-riscv64", "generic", "riscv64"),
+    }
+    for canon_slug, aliases in expected_cli_aliases.items():
+        for alias in aliases:
+            assert SOC_ALIASES[alias] == canon_slug
+            assert resolve_profile(alias).slug == canon_slug
+
+    expected_dt_substrings: dict[str, tuple[str, ...]] = {
+        "eswin-eic7700x": ("Premier P550", "Megrez", "StarPro64", "EIC7700"),
+        "sifive-fu740": ("SiFive HiFive Unmatched", "FU740"),
+        "starfive-jh7110": (
+            "VisionFive 2",
+            "VF2",
+            "JH7110",
+            "JH-7110",
+            "Milk-V Mars",
+            "milkv-mars",
+            "Milkv Mars",
+            "Star64",
+            "orangepi-rv",
+            "OrangePi RV",
+            "Orange Pi RV",
+        ),
+        "spacemit-k1": (
+            "orangepi-rv2",
+            "OrangePi RV2",
+            "Orange Pi RV2",
+            "orangepi-r2s",
+            "OrangePi R2S",
+            "Orange Pi R2S",
+            "BPI-F3",
+            "Banana Pi F3",
+            "bananapi-f3",
+            "BPI-CM6",
+            "Banana Pi CM6",
+            "bananapi-cm6",
+            "Milk-V Jupiter",
+            "milkv-jupiter",
+            "Milkv Jupiter",
+            "SpacemiT K1",
+            "spacemit-k1",
+            "SpacemiT M1",
+            "spacemit-m1",
+            "SpacemiT X60",
+            "Ky X1",
+            "ky-x1",
+            "Muse Pi",
+            "Muse Book",
+        ),
+        "spacemit-k3": (
+            "aibox-k3",
+            "firefly-k3",
+            "Firefly K3",
+            "Jupiter 2",
+            "Jupiter2",
+            "SpacemiT K3",
+            "spacemit-k3",
+        ),
+        "ultrarisc-dp1000": ("Milk-V Titan", "milkv-titan", "Milkv Titan", "UltraRISC", "DP1000"),
+        "tenstorrent-atlantis": ("Tenstorrent Atlantis", "Ascalon"),
+    }
+    for canon_slug, models in expected_dt_substrings.items():
+        for model in models:
+            assert detect_soc_from_dt_model(model) == canon_slug
+            assert resolve_profile(None, dt_model=model).slug == canon_slug
+            assert resolve_profile(model).slug == canon_slug
+
+    assert resolve_profile("unknown-board", dt_model="Unknown Model").slug == "generic-riscv64"
+
+    # Tightened PCIe min_width floors
+    assert get_soc_profile("ultrarisc-dp1000").min_width == 4
+    assert get_soc_profile("tenstorrent-atlantis").min_width == 4
+    assert get_soc_profile("spacemit-k3").min_width == 2
+    assert get_soc_profile("sifive-fu740").min_width == 4

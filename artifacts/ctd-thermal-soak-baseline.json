@@ -8,16 +8,16 @@
     "total_fans": 8,
     "zones": [
       {
-        "rack_unit": "U02",
+        "rack_unit": "Slot-A",
         "enclosure": "1U Vented Honeycomb Spacer + Shelf",
         "fans": "5x 40x40mm PWM (Front Intake across youyeetoo fins & under-PCB cutouts)",
         "targets": [
-          "visionferret-h8",
+          "vision-node",
           "brakerbench-vf2"
         ]
       },
       {
-        "rack_unit": "U03",
+        "rack_unit": "Slot-B",
         "enclosure": "SilverStone SST-RM100 1U Rackmount Chassis",
         "fans": "3x 40x40mm Chassis Fans + ESWIN EIC7700X Closed-Loop SOM Blower",
         "targets": [
@@ -106,7 +106,7 @@
         }
       }
     },
-    "visionferret-h8": {
+    "vision-node": {
       "soc": "StarFive JH7110 (4x SiFive U74 2-Wide InO @ 1.5GHz)",
       "m2_device": "Hailo-8 M.2 NPU (26 TOPS, Quiescent Deep-Idle)",
       "sensors": {
@@ -133,10 +133,10 @@
         }
       }
     },
-    "rakwrt-r6s": {
+    "edge-router": {
       "soc": "Rockchip RK3588S (Passive Aluminum Enclosure)",
       "quiescent_idle_c": 36.0
     }
   },
-  "sha256_provenance_digest": "c4e97238a4dca9a40aba1fd460ccb9eca40066f00f33301a433a66f1d6bb31f9"
+  "sha256_provenance_digest": "1ccd2c9fc311fad8974a444ffac75fdc03d4c5085a615206f038f2195e556b26"
 }

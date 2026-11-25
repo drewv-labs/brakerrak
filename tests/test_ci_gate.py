@@ -16,6 +16,7 @@ from tools.brakerrak_ci import (
     inspect_jpeg_metadata,
     inspect_png_metadata,
     inspect_webp_metadata,
+    main,
 )
 
 
@@ -170,3 +171,70 @@ def test_check_thermal_artifact_pass_and_tamper(tmp_path: Path) -> None:
     tamper_errors = check_thermal_artifact(tmp_path)
     assert len(tamper_errors) == 1
     assert "canonical SHA-256 mismatch" in tamper_errors[0]
+
+
+def test_check_hygiene_new_retired_astro_and_macos_path_rules(tmp_path: Path) -> None:
+    # Construct all forbidden tokens dynamically so this file stays hygiene-clean.
+    samples: list[tuple[str, str]] = [
+        ("ham" + "stak", "Retired entity literal (" + "ham" + "stak/" + "ham" + "stack)"),
+        ("Ham" + "Stack", "Retired entity literal (" + "ham" + "stak/" + "ham" + "stack)"),
+        ("dark" + "silicon", "Retired entity literal (" + "dark" + "silicon)"),
+        ("pogger" + "box", "Retired entity literal (" + "pogger" + "box)"),
+        ("coda" + "box", "Retired entity literal (" + "coda" + "box)"),
+        ("coffee" + "can", "Retired entity literal (" + "coffee" + "can)"),
+        ("snitch" + "mesh", "Retired entity literal (" + "snitch" + "mesh)"),
+        ("ada" + "stak", "Downstream astro literal (" + "ada" + "stak)"),
+        ("ada" + "scope", "Downstream astro literal (" + "ada" + "scope)"),
+        ("alone" + "-v", "Downstream astro literal (" + "alone" + "-v)"),
+        ("/Users/" + "drew/work", "Personal macOS home directory literal (" + "/Users/" + "drew)"),
+        ("/users/" + "Drew", "Personal macOS home directory literal (" + "/Users/" + "drew)"),
+    ]
+
+    for idx, (token, expected_desc_fragment) in enumerate(samples):
+        probe = tmp_path / f"probe_{idx}.txt"
+        probe.write_text(f"value={token}\n", encoding="utf-8")
+        errors, checked = check_hygiene(tmp_path, [probe])
+        assert checked == 1
+        assert len(errors) == 1, f"Expected 1 error for {expected_desc_fragment}, got {errors}"
+        assert expected_desc_fragment in errors[0]
+
+    clean = tmp_path / "clean.txt"
+    clean.write_text(
+        'host="/Users/ubuntu/work"\nproject="BrakerRak"\n',
+        encoding="utf-8",
+    )
+    clean_errors, clean_checked = check_hygiene(tmp_path, [clean])
+    assert clean_checked == 1
+    assert clean_errors == []
+
+
+def test_update_baseline_sha_cli_updates_tmp_copy_atomically(tmp_path: Path) -> None:
+    repo_artifacts = Path(__file__).resolve().parent.parent / "artifacts"
+    src_baseline = repo_artifacts / "ctd-thermal-soak-baseline.json"
+    loaded: dict[str, object] = json.loads(src_baseline.read_text(encoding="utf-8"))
+
+    art_dir = tmp_path / "artifacts"
+    art_dir.mkdir()
+    dst_baseline = art_dir / "ctd-thermal-soak-baseline.json"
+
+    stale = dict(loaded)
+    stale["ambient_celsius"] = 23.5
+    stale["sha256_provenance_digest"] = "0" * 64
+    stale_text = json.dumps(stale, indent=2) + "\n"
+    dst_baseline.write_text(stale_text, encoding="utf-8")
+
+    # --check must remain strictly read-only and reject the stale digest.
+    rc_check = main(["--check", "--skip-shellcheck", "--skip-python", "--repo-root", str(tmp_path)])
+    assert rc_check == 1
+    assert dst_baseline.read_text(encoding="utf-8") == stale_text
+
+    # --update-baseline-sha must recompute and atomically update the file.
+    rc_update = main(["--update-baseline-sha", "--repo-root", str(tmp_path)])
+    assert rc_update == 0
+    assert check_thermal_artifact(tmp_path) == []
+
+    updated: dict[str, object] = json.loads(dst_baseline.read_text(encoding="utf-8"))
+    assert updated["ambient_celsius"] == 23.5
+    assert updated["campaign_id"] == loaded["campaign_id"]
+    assert updated["sha256_provenance_digest"] != "0" * 64
+    assert list(art_dir.iterdir()) == [dst_baseline]

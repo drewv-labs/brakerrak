@@ -19,6 +19,9 @@
 # ==============================================================================
 
 if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" == "1" ]]; then
+    if [[ "${BASHPID:-$$}" != "${_BRAK_TRAP_PID:-}" ]]; then
+        _BRAK_LEGACY_TMPFILES_PID="${BASHPID:-$$}"
+    fi
     return 0
 fi
 _BRAKERRAK_COMMON_SOURCED="1"
@@ -56,6 +59,24 @@ _BRAK_LOG_TAG="${_BRAK_LOG_TAG:-BRAKERRAK}"
 
 if [[ -z "${_BRAK_TMPFILES+x}" ]]; then
     _BRAK_TMPFILES=()
+fi
+if [[ -z "${_BRAK_OWNED_TMPFILES+x}" ]]; then
+    _BRAK_OWNED_TMPFILES=()
+fi
+if [[ -z "${_BRAK_EXIT_HOOKS+x}" ]]; then
+    _BRAK_EXIT_HOOKS=()
+fi
+if [[ -z "${_BRAK_EXIT_RAN+x}" ]]; then
+    _BRAK_EXIT_RAN="0"
+fi
+if [[ -z "${_BRAK_ROOT_PID+x}" ]]; then
+    _BRAK_ROOT_PID="${BASHPID:-$$}"
+fi
+if [[ -z "${_BRAK_TRAP_PID+x}" ]]; then
+    _BRAK_TRAP_PID="${BASHPID:-$$}"
+fi
+if [[ -z "${_BRAK_LEGACY_TMPFILES_PID+x}" ]]; then
+    _BRAK_LEGACY_TMPFILES_PID="${BASHPID:-$$}"
 fi
 
 brak_log_init() {
@@ -157,12 +178,179 @@ brak_runtime_dir() {
     return 0
 }
 
+_brak_tmp_manifest_path() {
+    local owner_pid="${1:-${BASHPID:-$$}}"
+    local base_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
+    base_dir="${base_dir%/}"
+    local uid_val="${UID:-$(id -u 2>/dev/null || echo 0)}"
+    printf '%s/.brak-tmp-%s-%s\n' "$base_dir" "$uid_val" "$owner_pid"
+}
+
 _brak_cleanup_tmpfiles() {
+    local cur_pid="${BASHPID:-$$}"
     local _tf
-    for _tf in ${_BRAK_TMPFILES[@]+"${_BRAK_TMPFILES[@]}"}; do
-        [[ -n "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+
+    # Clean entries owned by this specific shell PID (safe across pipeline subshells)
+    local -a remaining_owned=()
+    for _tf in ${_BRAK_OWNED_TMPFILES[@]+"${_BRAK_OWNED_TMPFILES[@]}"}; do
+        [[ -n "$_tf" ]] || continue
+        if [[ "$_tf" == "${cur_pid}:"* ]]; then
+            local owned_path="${_tf#*:}"
+            [[ -n "$owned_path" ]] && rm -rf -- "$owned_path" 2>/dev/null || true
+        else
+            remaining_owned+=("$_tf")
+        fi
     done
-    _BRAK_TMPFILES=()
+    _BRAK_OWNED_TMPFILES=(${remaining_owned[@]+"${remaining_owned[@]}"})
+
+    # Clean legacy _BRAK_TMPFILES only in the shell PID that sourced lib-common.sh or called brak_prog_init
+    if [[ "$cur_pid" == "${_BRAK_LEGACY_TMPFILES_PID:-}" ]]; then
+        for _tf in ${_BRAK_TMPFILES[@]+"${_BRAK_TMPFILES[@]}"}; do
+            [[ -n "$_tf" ]] && rm -rf -- "$_tf" 2>/dev/null || true
+        done
+        _BRAK_TMPFILES=()
+    fi
+
+    # Only clean the subshell manifest belonging to this exiting shell PID
+    local manifest=""
+    manifest="$(_brak_tmp_manifest_path "$cur_pid")"
+    if [[ -n "$manifest" && -f "$manifest" && ! -L "$manifest" && -O "$manifest" ]]; then
+        while IFS= read -r _tf || [[ -n "$_tf" ]]; do
+            [[ -n "$_tf" ]] && rm -rf -- "$_tf" 2>/dev/null || true
+        done < "$manifest"
+        rm -f -- "$manifest" 2>/dev/null || true
+    fi
+}
+
+_brak_append_exit_hook() {
+    local candidate="${1:-}"
+    [[ -n "$candidate" ]] || return 0
+    local existing
+    for existing in ${_BRAK_EXIT_HOOKS[@]+"${_BRAK_EXIT_HOOKS[@]}"}; do
+        if [[ "$existing" == "$candidate" ]]; then
+            return 0
+        fi
+    done
+    _BRAK_EXIT_HOOKS+=("$candidate")
+}
+
+_brak_run_exit_hooks() {
+    local rc=$?
+    if [[ "${_BRAK_EXIT_RAN:-0}" == "1" ]]; then
+        return "$rc"
+    fi
+    _BRAK_EXIT_RAN="1"
+
+    local hook
+    for hook in ${_BRAK_EXIT_HOOKS[@]+"${_BRAK_EXIT_HOOKS[@]}"}; do
+        [[ -n "$hook" ]] || continue
+        if declare -F "$hook" >/dev/null 2>&1; then
+            "$hook" "$rc" || true
+        elif [[ "$hook" == __BRAK_RAW_TRAP__:* ]]; then
+            local raw_cmd="${hook#__BRAK_RAW_TRAP__:}"
+            eval "$raw_cmd" || true
+        fi
+    done
+    return "$rc"
+}
+
+_brak_on_signal() {
+    local sig="$1"
+    _brak_run_exit_hooks
+    trap - "$sig" EXIT
+    kill -"$sig" "${BASHPID:-$$}"
+}
+
+# Register a cleanup callback to run in order on EXIT/INT/TERM without
+# double-running or clobbering prior EXIT traps.
+# Usage: brak_register_exit_hook <function_name>
+brak_register_exit_hook() {
+    local fn="${1:-}"
+    [[ -n "$fn" ]] || return 1
+
+    local cur_pid="${BASHPID:-$$}"
+    if [[ "${_BRAK_TRAP_PID:-}" != "$cur_pid" ]]; then
+        _BRAK_EXIT_RAN="0"
+        _BRAK_TRAP_PID="$cur_pid"
+        # Do not inherit parent shell callbacks into forked subshells/pipelines
+        _BRAK_EXIT_HOOKS=()
+    fi
+
+    local cur_exit_trap=""
+    cur_exit_trap="$(trap -p EXIT 2>/dev/null || true)"
+    if [[ -n "$cur_exit_trap" && "$cur_exit_trap" != *"_brak_run_exit_hooks"* ]]; then
+        local prior_cmd="$cur_exit_trap"
+        prior_cmd="${prior_cmd#trap -- \'}"
+        prior_cmd="${prior_cmd%\' EXIT}"
+        prior_cmd="${prior_cmd//\'\\\'\'/\'}"
+        if [[ -n "$prior_cmd" ]]; then
+            if declare -F "$prior_cmd" >/dev/null 2>&1; then
+                _brak_append_exit_hook "$prior_cmd"
+            else
+                _brak_append_exit_hook "__BRAK_RAW_TRAP__:${prior_cmd}"
+            fi
+        fi
+    fi
+
+    _brak_append_exit_hook "$fn"
+
+    trap '_brak_run_exit_hooks' EXIT
+    trap '_brak_on_signal INT' INT
+    trap '_brak_on_signal TERM' TERM
+    return 0
+}
+
+# Create a private temp file (or directory with -d) registered for cleanup on EXIT/INT/TERM.
+# Supports both subshell capture `f="$(brak_mktemp)"` and direct `-v var` assignment.
+# Usage: brak_mktemp [-d] [-v var_name] [template]
+brak_mktemp() {
+    local is_dir="false"
+    local out_var=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d) is_dir="true"; shift ;;
+            -v)
+                brak_require_arg "$1" "${2:-}"
+                out_var="$2"
+                shift 2
+                ;;
+            --) shift; break ;;
+            *) break ;;
+        esac
+    done
+
+    local template="${1:-${TMPDIR:-/tmp}/brakerrak.XXXXXX}"
+    local created=""
+    if [[ "$is_dir" == "true" ]]; then
+        created="$(mktemp -d "$template")"
+        chmod 0700 "$created"
+    else
+        created="$(mktemp "$template")"
+        chmod 0600 "$created"
+    fi
+
+    if (( ${BASH_SUBSHELL:-0} > 0 )); then
+        local owner_pid="${_BRAK_TRAP_PID:-${BASHPID:-$$}}"
+        local manifest=""
+        manifest="$(_brak_tmp_manifest_path "$owner_pid")"
+        (
+            set -o noclobber
+            : > "$manifest"
+        ) 2>/dev/null || true
+        if [[ -f "$manifest" && ! -L "$manifest" && -O "$manifest" ]]; then
+            chmod 0600 "$manifest" 2>/dev/null || true
+            printf '%s\n' "$created" >> "$manifest"
+        fi
+    else
+        _BRAK_OWNED_TMPFILES+=("${BASHPID:-$$}:${created}")
+        brak_register_exit_hook _brak_cleanup_tmpfiles
+    fi
+
+    if [[ -n "$out_var" ]]; then
+        printf -v "$out_var" '%s' "$created"
+    else
+        printf '%s\n' "$created"
+    fi
 }
 
 # Atomically write stdin to <target_path> via same-directory temp file + mv -f.
@@ -177,17 +365,10 @@ brak_atomic_write() {
     base="$(basename "$target_path")"
     mkdir -p "$dir"
 
-    if [[ "${_BRAK_TMP_TRAP_SET:-0}" != "1" ]]; then
-        _BRAK_TMP_TRAP_SET="1"
-        if [[ -z "$(trap -p EXIT 2>/dev/null || true)" ]]; then
-            trap '_brak_cleanup_tmpfiles' EXIT
-            trap '_brak_cleanup_tmpfiles; trap - INT; kill -INT $$' INT
-            trap '_brak_cleanup_tmpfiles; trap - TERM; kill -TERM $$' TERM
-        fi
-    fi
+    brak_register_exit_hook _brak_cleanup_tmpfiles
 
     tmp_file="$(mktemp "${dir}/.${base}.brak.XXXXXX")"
-    _BRAK_TMPFILES+=("$tmp_file")
+    _BRAK_OWNED_TMPFILES+=("${BASHPID:-$$}:${tmp_file}")
 
     cat > "$tmp_file"
     chmod "$file_mode" "$tmp_file"
@@ -604,9 +785,9 @@ brak_resolve_silicon() {
                 board="spacemit-k1"; tag="r2s"; factory_user="orangepi" ;;
             *"orangepi-rv"*|*"orangepi rv"*|*"orange pi rv"*)
                 board="starfive-jh7110"; tag="opirv"; factory_user="user" ;;
-            *"jh7110"*)
+            *"jh7110"*|*"jh-7110"*)
                 board="starfive-jh7110"; tag="vf2"; factory_user="user" ;;
-            *"aibox-k3"*|*"firefly"*k3*)
+            *"aibox-k3"*|*"firefly-k3"*|*"firefly k3"*|*"firefly"*k3*)
                 board="spacemit-k3"; tag="aiboxk3" ;;
             *"jupiter 2"*|*"jupiter2"*|*"spacemit k3"*|*"spacemit-k3"*|*"spacemit"*k3*)
                 board="spacemit-k3"; tag="jptr2" ;;
@@ -614,7 +795,7 @@ brak_resolve_silicon() {
                 board="spacemit-k1"; tag="bpif3" ;;
             *"bpi-cm6"*|*"banana pi cm6"*|*"bananapi-cm6"*)
                 board="spacemit-k1"; tag="bpicm6" ;;
-            *"milk-v jupiter"*|*"milkv-jupiter"*|*"milkv jupiter"*|*"jupiter"*|*"spacemit k1"*|*"spacemit-k1"*|*"spacemit m1"*|*"spacemit-m1"*|*"spacemit"*|*"ky x1"*|*"ky-x1"*|*"muse pi"*|*"muse book"*)
+            *"milk-v jupiter"*|*"milkv-jupiter"*|*"milkv jupiter"*|*"jupiter"*|*"spacemit k1"*|*"spacemit-k1"*|*"spacemit m1"*|*"spacemit-m1"*|*"spacemit x60"*|*"spacemit"*|*"ky x1"*|*"ky-x1"*|*"muse pi"*|*"muse book"*)
                 board="spacemit-k1"; tag="jptr1" ;;
             *"milk-v titan"*|*"milkv-titan"*|*"milkv titan"*|*"ultrarisc"*"dp1000"*|*"ultrarisc"*|*"dp1000"*)
                 board="ultrarisc-dp1000"; tag="titan" ;;
@@ -659,7 +840,7 @@ brak_resolve_silicon() {
                 board="spacemit-k1"; [[ -z "$tag" ]] && tag="bpif3" ;;
             bananapi-cm6|bananapi/cm6|bpi-cm6|bpicm6)
                 board="spacemit-k1"; [[ -z "$tag" ]] && tag="bpicm6" ;;
-            spacemit-k1|spacemit/k1|milkv-jupiter|milkv/jupiter|jupiter|jptr1)
+            spacemit-k1|spacemit/k1|milkv-jupiter|milkv/jupiter|jupiter|jptr1|muse-pi|musepi)
                 board="spacemit-k1"; [[ -z "$tag" ]] && tag="jptr1" ;;
             firefly-aibox-k3|firefly/aibox-k3|aibox-k3|aiboxk3)
                 board="spacemit-k3"; [[ -z "$tag" ]] && tag="aiboxk3" ;;
@@ -699,3 +880,5 @@ brak_resolve_silicon() {
     export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER
     return 0
 }
+
+brak_register_exit_hook _brak_cleanup_tmpfiles
