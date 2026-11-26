@@ -8,6 +8,7 @@ import re
 import shlex
 import signal
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -15,9 +16,11 @@ import pytest
 from brakerrak_ort.profiles import SOC_ALIASES, detect_soc_from_dt_model, resolve_profile
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+FORGE_SH = REPO_ROOT / "forge.sh"
 LIB_COMMON_SH = REPO_ROOT / "scripts" / "lib-common.sh"
 LIB_PROGBAR_SH = REPO_ROOT / "scripts" / "lib-progbar.sh"
 RESET_DAY0_SH = REPO_ROOT / "scripts" / "reset-day0.sh"
+VERIFY_CONVERGENCE_SH = REPO_ROOT / "scripts" / "verify-convergence.sh"
 PROFILES_PY = REPO_ROOT / "brakerrak_ort" / "profiles.py"
 
 # Fallback globs intentionally broader in lib-common.sh than vendor-qualified DT matching in Python.
@@ -421,3 +424,824 @@ def test_brak_resolve_silicon_p4_resolves_espressif_esp32p4_and_tag() -> None:
     )
     assert proc.returncode == 0, proc.stderr
     assert proc.stdout.strip() == "espressif-esp32p4|p4|devbench-p4"
+
+
+def _extract_shell_functions(script_path: Path, fn_names: Sequence[str]) -> str:
+    text = script_path.read_text(encoding="utf-8")
+    chunks: list[str] = []
+    for name in fn_names:
+        pattern = re.compile(rf"^{re.escape(name)}\(\)\s*\{{.*?^\}}", re.MULTILINE | re.DOTALL)
+        match = pattern.search(text)
+        assert match is not None, f"Failed to locate shell function {name}() in {script_path}"
+        chunks.append(match.group(0))
+    return "\n".join(chunks)
+
+
+def _extract_verify_destructive_re() -> str:
+    text = VERIFY_CONVERGENCE_SH.read_text(encoding="utf-8")
+    match = re.search(r"^DESTRUCTIVE_RE=.*$", text, re.MULTILINE)
+    assert match is not None, "Failed to locate DESTRUCTIVE_RE in scripts/verify-convergence.sh"
+    return match.group(0)
+
+
+def _extract_forge_storage_case() -> str:
+    text = FORGE_SH.read_text(encoding="utf-8")
+    start = text.index("    storage)\n")
+    end = text.index("    ort)\n", start)
+    return 'case "$ACTION" in\n' + text[start:end] + "esac\n"
+
+
+def _write_executable(path: Path, content: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_verify_destructive_re_ignores_skip_lines_including_ansi(tmp_path: Path) -> None:
+    log_file = tmp_path / "pass2.log"
+    log_file.write_text(
+        "\n".join(
+            [
+                "=== [12:00:00] 1. RVDK Day-0 OS ===",
+                "[SKIP] Already converged",
+                "=== [12:00:01] 2. RVDK Hot NVMe ===",
+                "[SKIP] Skipping nvme format /dev/nvme0n1 --lbaf=1 (already 4Kn)",
+                "\x1b[1;33m[SKIP]\x1b[0m Skipping mkfs.xfs -s size=4096 /dev/vg_braker/lv_pgdata",
+                "  \x1b[1;33m[SKIP]\x1b[0m Skipping mkfs.ext4 on /dev/vg_braker/lv_pgdata",
+                "=== [12:00:02] 3. RVDK PostgreSQL 18.6 ===",
+                "\x1b[1;33m[SKIP]\x1b[0m Skipping pg_createcluster 18 main\r",
+                "[SKIP]: Skipping initdb -D /mnt/nvme_pgdata/pgdata",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        (
+            "_verify_strip_ansi_stream",
+            "_verify_filter_non_skip_lines",
+            "_verify_check_destructive_pass2_log",
+        ),
+    )
+    script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            _extract_verify_destructive_re(),
+            helpers,
+            f"_verify_check_destructive_pass2_log {shlex.quote(str(log_file))}",
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"Expected [SKIP] lines to be ignored:\n{proc.stderr}"
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "nvme format /dev/nvme0n1 --lbaf=1 --force",
+        "\x1b[1;32m[EXEC]\x1b[0m mkfs.xfs -f /dev/vg_braker/lv_pgdata",
+        "Running mkfs.ext4 /dev/vg_braker/lv_pgdata",
+        "pg_createcluster 18 main --start",
+        "\x1b[1;31m[ERR]\x1b[0m initdb -D /mnt/nvme_pgdata/pgdata",
+        "mkfs.xfs /mnt/[SKIP] # trailing skip token must not bypass",
+    ],
+)
+def test_verify_destructive_re_catches_real_destructive_lines(
+    tmp_path: Path, bad_line: str
+) -> None:
+    log_file = tmp_path / "pass2-bad.log"
+    log_file.write_text(f"[SKIP] Benign skip\n{bad_line}\n", encoding="utf-8")
+    helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        (
+            "_verify_strip_ansi_stream",
+            "_verify_filter_non_skip_lines",
+            "_verify_check_destructive_pass2_log",
+        ),
+    )
+    script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            _extract_verify_destructive_re(),
+            helpers,
+            f"_verify_check_destructive_pass2_log {shlex.quote(str(log_file))}",
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode != 0, f"Expected failure for destructive line {bad_line!r}"
+    assert "Pass 2 must not execute" in proc.stderr
+
+
+def test_verify_stage_skip_coverage_enforces_expected_stages(tmp_path: Path) -> None:
+    helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        ("_verify_strip_ansi_stream", "_verify_assert_stage_skip_coverage"),
+    )
+    valid_log = tmp_path / "valid.log"
+    valid_log.write_text(
+        "\n".join(
+            [
+                "=== [12:00:00] 1. RVDK Day-0 OS ===",
+                "\x1b[1;33m[SKIP]\x1b[0m Kernel sysctl already converged",
+                "=== [12:00:01] 2. RVDK Hot NVMe ===",
+                "[SKIP] NVMe already 4Kn",
+                "=== [12:00:02] 3. RVDK PostgreSQL 18.6 ===",
+                "[SKIP] PG18 cluster initialized",
+                "=== [12:00:03] 4. Btrfs RAID 10 Vault Provisioning Skipped ===",
+                "[SKIP] Btrfs RAID 10 disabled",
+                "=== [12:00:04] 5A. Mosquitto MQTT Broker Skipped ===",
+                "[SKIP] Mosquitto disabled",
+                "=== [12:00:05] 5B. NFSv4 Vault Server Skipped ===",
+                "[SKIP] NFS disabled",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ok_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            f'_verify_assert_stage_skip_coverage {shlex.quote(str(valid_log))} '
+            '"false" "false" "false" "false"',
+            'printf "%s|%s\\n" "$SKIP_MARKER_COUNT" "$STAGE_SKIP_SUMMARY"',
+        ]
+    )
+    ok_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", ok_script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ok_proc.returncode == 0, ok_proc.stderr
+    assert ok_proc.stdout.strip() == "6|stages=1:1,2:1,3:1,4:1,5A:1,5B:1"
+
+    # Stage 1 has [SKIP] (total > 0), but Stage 2 & Stage 3 lack [SKIP] markers: MUST fail!
+    partial_log = tmp_path / "partial.log"
+    partial_log.write_text(
+        "\n".join(
+            [
+                "=== [12:00:00] 1. RVDK Day-0 OS ===",
+                "[SKIP] Kernel sysctl already converged",
+                "=== [12:00:01] 2. RVDK Hot NVMe ===",
+                "[OK] Did something without skip",
+                "=== [12:00:02] 3. RVDK PostgreSQL 18.6 ===",
+                "[OK] Rebuilt cluster",
+                "=== [12:00:03] 4. Btrfs RAID 10 Vault Provisioning Skipped ===",
+                "[SKIP] Btrfs RAID 10 disabled",
+                "=== [12:00:04] 5A. Mosquitto MQTT Broker Skipped ===",
+                "[SKIP] Mosquitto disabled",
+                "=== [12:00:05] 5B. NFSv4 Vault Server Skipped ===",
+                "[SKIP] NFS disabled",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fail_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            f'_verify_assert_stage_skip_coverage {shlex.quote(str(partial_log))} '
+            '"false" "false" "false" "false"',
+        ]
+    )
+    fail_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", fail_script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fail_proc.returncode != 0
+    assert "stage-level [SKIP] coverage" in fail_proc.stderr
+    assert "2 3" in fail_proc.stderr
+
+    # Disabled Stage 5A/5B without [SKIP] markers must also fail.
+    disabled_miss_log = tmp_path / "disabled-miss.log"
+    disabled_miss_log.write_text(
+        "\n".join(
+            [
+                "=== [12:00:00] 1. RVDK Day-0 OS ===",
+                "[SKIP] Kernel sysctl already converged",
+                "=== [12:00:01] 2. RVDK Hot NVMe ===",
+                "[SKIP] NVMe already 4Kn",
+                "=== [12:00:02] 3. RVDK PostgreSQL 18.6 ===",
+                "[SKIP] PG18 cluster initialized",
+                "=== [12:00:03] 4. Btrfs RAID 10 Vault Provisioning Skipped ===",
+                "[SKIP] Btrfs RAID 10 disabled",
+                "=== [12:00:04] 5A. Mosquitto MQTT Broker Skipped ===",
+                "[OK] No skip marker emitted",
+                "=== [12:00:05] 5B. NFSv4 Vault Server Skipped ===",
+                "[OK] No skip marker emitted",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    miss_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            f'_verify_assert_stage_skip_coverage {shlex.quote(str(disabled_miss_log))} '
+            '"false" "false" "false" "false"',
+        ]
+    )
+    miss_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", miss_script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert miss_proc.returncode != 0
+    assert "5A 5B" in miss_proc.stderr
+
+    # SD target mode allows Stage 1 without [SKIP] when Stages 2..5B all skip cleanly.
+    sd_log = tmp_path / "sd.log"
+    sd_log.write_text(
+        "\n".join(
+            [
+                "=== [12:00:00] 1. RVDK ESP32-P4 BSP Provenance ===",
+                "[OK] BSP converged",
+                "=== [12:00:01] 2. NVMe 4Kn LVM Provisioning Skipped ===",
+                "[SKIP] SD media target",
+                "=== [12:00:02] 3. PostgreSQL 18.6 Convergence Skipped ===",
+                "[SKIP] PostgreSQL skipped",
+                "=== [12:00:03] 4. Btrfs RAID 10 Vault Provisioning Skipped ===",
+                "[SKIP] Btrfs RAID skipped",
+                "=== [12:00:04] 5A. Mosquitto MQTT Broker Skipped ===",
+                "[SKIP] Mosquitto skipped",
+                "=== [12:00:05] 5B. NFSv4 Vault Server Skipped ===",
+                "[SKIP] NFSv4 skipped",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    sd_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            f'_verify_assert_stage_skip_coverage {shlex.quote(str(sd_log))} '
+            '"true" "false" "false" "false"',
+            'printf "%s\\n" "$STAGE_SKIP_SUMMARY"',
+        ]
+    )
+    sd_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", sd_script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert sd_proc.returncode == 0, sd_proc.stderr
+    assert sd_proc.stdout.strip() == "stages=1:0,2:1,3:1,4:1,5A:1,5B:1"
+
+
+def _extract_forge_rvdk_startup() -> str:
+    text = FORGE_SH.read_text(encoding="utf-8")
+    start = text.index('_BRAK_RVDK_BIN_EXPLICIT="false"\n')
+    end = text.index("\n_brak_resolve_rvdk_cmd()", start)
+    return text[start:end]
+
+
+def test_forge_storage_missing_rvdk_bin_guard_and_dispatch(tmp_path: Path) -> None:
+    rvdk_startup = _extract_forge_rvdk_startup()
+    helpers = _extract_shell_functions(FORGE_SH, ("_brak_resolve_rvdk_cmd",))
+    storage_case = _extract_forge_storage_case()
+    node_env = tmp_path / "node.env"
+    node_env.write_text(
+        'VG_NAME="vg_braker"\nLV_NAME="lv_pgdata"\nNFS_LV_NAME="lv_nfsvault"\n',
+        encoding="utf-8",
+    )
+
+    path_rvdk_calls = tmp_path / "path_rvdk.calls"
+    path_bin = tmp_path / "path_bin"
+    _write_executable(
+        path_bin / "rvdk",
+        (
+            "#!/usr/bin/env bash\n"
+            f'printf "PATH_DISPATCH:%s\\n" "$*" >> {shlex.quote(str(path_rvdk_calls))}\n'
+            'printf "PATH_DISPATCH:%s\\n" "$*"\n'
+        ),
+    )
+
+    # Case 1: Explicit non-executable RVDK_BIN must fail fast even when `rvdk` exists on PATH
+    fail_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            rvdk_startup,
+            helpers,
+            f"NODE_ENV={shlex.quote(str(node_env))}",
+            'ACTION="storage"',
+            'set -- "status"',
+            storage_case,
+        ]
+    )
+    env_missing = _isolated_shell_env(tmp_path)
+    env_missing["RVDK_BIN"] = "/nonexistent/rvdk"
+    env_missing["PATH"] = f"{path_bin}:{env_missing.get('PATH', '/usr/bin:/bin')}"
+    fail_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", fail_script],
+        env=env_missing,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fail_proc.returncode != 0
+    assert "RVDK CLI not found at '/nonexistent/rvdk'" in fail_proc.stderr
+    assert not path_rvdk_calls.exists()
+
+    # Case 2: Unset RVDK_BIN falls back cleanly to `rvdk` on PATH when system bins are absent
+    env_path_fallback = _isolated_shell_env(tmp_path)
+    env_path_fallback.pop("RVDK_BIN", None)
+    env_path_fallback["PATH"] = f"{path_bin}:{env_path_fallback.get('PATH', '/usr/bin:/bin')}"
+    path_ok_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", fail_script],
+        env=env_path_fallback,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if not Path("/usr/local/bin/rvdk").exists() and not Path("/usr/bin/rvdk").exists():
+        assert path_ok_proc.returncode == 0, path_ok_proc.stderr
+        assert path_ok_proc.stdout.strip() == "PATH_DISPATCH:storage status"
+
+    # Case 3: Valid explicit RVDK_BIN resolves and dispatches storage subcommands cleanly
+    mock_rvdk = _write_executable(
+        tmp_path / "bin" / "rvdk",
+        '#!/usr/bin/env bash\nprintf "DISPATCH:%s\\n" "$*"\n',
+    )
+    for sub_args, expected in [
+        (["grow-psql", "--gb", "10"], "DISPATCH:storage grow --lv lv_pgdata --gb 10"),
+        (["grow-nfs", "--gb", "20"], "DISPATCH:storage grow --lv lv_nfsvault --gb 20"),
+        (["shrink-nfs", "--gb", "5"], "DISPATCH:storage shrink --lv lv_nfsvault --gb 5"),
+        (["status"], "DISPATCH:storage status"),
+    ]:
+        ok_script = "\n".join(
+            [
+                f"source {shlex.quote(str(LIB_COMMON_SH))}",
+                rvdk_startup,
+                helpers,
+                f"NODE_ENV={shlex.quote(str(node_env))}",
+                'ACTION="storage"',
+                "set -- " + " ".join(shlex.quote(a) for a in sub_args),
+                storage_case,
+            ]
+        )
+        ok_env = _isolated_shell_env(tmp_path)
+        ok_env["RVDK_BIN"] = str(mock_rvdk)
+        ok_proc = subprocess.run(
+            ["bash", "-euo", "pipefail", "-c", ok_script],
+            env=ok_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert ok_proc.returncode == 0, ok_proc.stderr
+        assert ok_proc.stdout.strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("target_board", "fstype", "proc_fs_content", "should_pass"),
+    [
+        ("starfive-jh7110", "xfs", "nodev\tsysfs\n\text4\n\txfs\n", True),
+        ("starfive-jh7110", "ext4", "nodev\tsysfs\n\text4\n\txfs\n", True),
+        ("starfive-jh7110", "btrfs", "nodev\tsysfs\n\text4\n\txfs\n", False),
+        ("eswin-eic7700x", "xfs", "nodev\tsysfs\n\text4\n\txfs\n", True),
+        ("eswin-eic7700x", "ext4", "nodev\tsysfs\n\text4\n\txfs\n", False),
+        ("eswin-eic7700x", "ext4", "nodev\tsysfs\n\text4\n", True),
+    ],
+)
+def test_verify_get_data_fs_uuid_jh7110_and_proc_filesystems(
+    tmp_path: Path,
+    target_board: str,
+    fstype: str,
+    proc_fs_content: str,
+    should_pass: bool,
+) -> None:
+    verify_text = VERIFY_CONVERGENCE_SH.read_text(encoding="utf-8")
+    assert "_verify_get_xfs_uuid" not in verify_text
+    assert "_verify_get_data_fs_uuid" in verify_text
+
+    mock_bin = tmp_path / "bin"
+    _write_executable(
+        mock_bin / "findmnt",
+        (
+            "#!/usr/bin/env bash\n"
+            'case "$3" in\n'
+            f'  FSTYPE) printf "{fstype}\\n" ;;\n'
+            '  SOURCE) printf "/dev/vg_braker/lv_pgdata\\n" ;;\n'
+            '  UUID)   printf "11111111-2222-3333-4444-555555555555\\n" ;;\n'
+            "esac\n"
+        ),
+    )
+    proc_fs = tmp_path / "proc_filesystems"
+    proc_fs.write_text(proc_fs_content, encoding="utf-8")
+
+    helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        (
+            "_verify_kernel_has_xfs",
+            "_verify_allows_ext4_data_fs",
+            "_verify_get_data_fs_uuid",
+        ),
+    )
+    script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            f"TARGET_BOARD={shlex.quote(target_board)}",
+            f"PROC_FILESYSTEMS_PATH={shlex.quote(str(proc_fs))}",
+            '_verify_get_data_fs_uuid "/mnt/nvme_pgdata"',
+        ]
+    )
+    env = _isolated_shell_env(tmp_path)
+    env["PATH"] = f"{mock_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if should_pass:
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "11111111-2222-3333-4444-555555555555"
+    else:
+        assert proc.returncode != 0
+        assert "Convergence assertion FAILED" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("role", "enable_pg", "enable_nfs", "nvme_dev", "expected_skip"),
+    [
+        ("visionbox", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("visionbench", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("babbagebox", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("babbagebench", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("vh", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("bab", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("VisionBench", "false", "false", "/dev/nonexistent-nvme0n1", True),
+        ("visionbox", "true", "false", "/dev/nonexistent-nvme0n1", False),
+        ("visionbench", "false", "true", "/dev/nonexistent-nvme0n1", False),
+        ("databench", "false", "false", "/dev/nonexistent-nvme0n1", False),
+        ("databroker", "false", "false", "/dev/nonexistent-nvme0n1", False),
+        ("devbench", "false", "false", "/dev/nonexistent-nvme0n1", False),
+    ],
+)
+def test_accel_nvme_skip_parity_between_forge_and_verify(
+    tmp_path: Path,
+    role: str,
+    enable_pg: str,
+    enable_nfs: str,
+    nvme_dev: str,
+    expected_skip: bool,
+) -> None:
+    forge_helpers = _extract_shell_functions(
+        FORGE_SH, ("_brak_is_accel_persona", "_brak_should_skip_accel_nvme")
+    )
+    verify_helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        (
+            "_verify_is_accel_persona",
+            "_verify_is_accel_nvme_skip",
+            "_verify_refresh_node_vars",
+        ),
+    )
+    node_env = tmp_path / "node.env"
+    node_env.write_text(
+        "\n".join(
+            [
+                f'NODE_ROLE="{role}"',
+                f'ENABLE_POSTGRES="{enable_pg}"',
+                f'ENABLE_NFS_SERVER="{enable_nfs}"',
+                f'NVME_DEV="{nvme_dev}"',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            forge_helpers,
+            verify_helpers,
+            f"NODE_ENV={shlex.quote(str(node_env))}",
+            'CLI_ROLE="" CLI_TARGET="" CLI_MOUNT_POINT="" CLI_NVME_DEV=""',
+            'CLI_ENABLE_PG="" CLI_ENABLE_NFS="" CLI_ENABLE_MQTT="" CLI_WITH_RAID=""',
+            'CLI_MEDIA="" CLI_STAGE_DIR=""',
+            "_verify_refresh_node_vars",
+            'f_skip="false"; _brak_should_skip_accel_nvme "$NODE_ROLE" && f_skip="true"',
+            'v_skip="false"; _verify_is_accel_nvme_skip && v_skip="true"',
+            'alias_skip="false"; _brak_should_skip_accel_nvme '
+            f"{shlex.quote(role)} && alias_skip=\"true\"",
+            'printf "%s|%s|%s\\n" "$f_skip" "$v_skip" "$alias_skip"',
+        ]
+    )
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        env=_isolated_shell_env(tmp_path),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    expected_str = "true|true|true" if expected_skip else "false|false|false"
+    assert proc.stdout.strip() == expected_str
+
+
+def test_forge_deeptune_board_slug_parameterization_and_graceful_skip(tmp_path: Path) -> None:
+    rvdk_engine = tmp_path / "rvdk-engine"
+    _write_executable(
+        rvdk_engine / "bsp" / "espressif" / "esp32p4" / "deeptune.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        rvdk_engine / "boards" / "waveshare" / "esp32-p4-wifi6" / "deeptune.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    _write_executable(
+        rvdk_engine / "boards" / "acme" / "esp32-p4-custom" / "deeptune.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    rvdk_log = tmp_path / "rvdk.calls"
+    mock_rvdk = _write_executable(
+        rvdk_engine / "rvdk",
+        (
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> {shlex.quote(str(rvdk_log))}\n'
+        ),
+    )
+
+    stage_dir = tmp_path / "p4-sd"
+    (stage_dir / "config").mkdir(parents=True)
+    (stage_dir / "config" / "node.env").write_text(
+        'NODE_ROLE="lilsnitch"\nRVDK_TUNE_PROFILE="iot"\n',
+        encoding="utf-8",
+    )
+
+    base_env = _isolated_shell_env(tmp_path)
+    base_env["RVDK_BIN"] = str(mock_rvdk)
+    base_env["RVDK_ENGINE_DIR"] = str(rvdk_engine)
+
+    # 1. Default BOARD_SLUG -> waveshare/esp32-p4-wifi6
+    p1 = subprocess.run(
+        ["bash", str(FORGE_SH), "deeptune", "--target", "p4", "--stage-dir", str(stage_dir)],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p1.returncode == 0, p1.stderr
+    calls_1 = rvdk_log.read_text(encoding="utf-8").splitlines()
+    assert calls_1 == [
+        f"bsp/espressif/esp32p4/deeptune.sh --tune iot --stage-dir {stage_dir}",
+        f"boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune iot --stage-dir {stage_dir}",
+    ]
+
+    # 2. Custom BOARD_SLUG -> acme/esp32-p4-custom (status subcommand)
+    rvdk_log.unlink()
+    custom_env = dict(base_env)
+    custom_env["BOARD_SLUG"] = "acme/esp32-p4-custom"
+    p2 = subprocess.run(
+        [
+            "bash",
+            str(FORGE_SH),
+            "deeptune",
+            "--target",
+            "p4",
+            "--stage-dir",
+            str(stage_dir),
+            "status",
+        ],
+        env=custom_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p2.returncode == 0, p2.stderr
+    calls_2 = rvdk_log.read_text(encoding="utf-8").splitlines()
+    assert calls_2 == [
+        f"bsp/espressif/esp32p4/deeptune.sh status --stage-dir {stage_dir}",
+        f"boards/acme/esp32-p4-custom/deeptune.sh status --stage-dir {stage_dir}",
+    ]
+
+    # 3. Missing board script in RVDK -> skips gracefully with [SKIP] and exit 0
+    rvdk_log.unlink()
+    missing_env = dict(base_env)
+    missing_env["BOARD_SLUG"] = "acme/nonexistent-p4"
+    p3 = subprocess.run(
+        ["bash", str(FORGE_SH), "deeptune", "--target", "p4", "--stage-dir", str(stage_dir)],
+        env=missing_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p3.returncode == 0, p3.stderr
+    assert "[SKIP]" in p3.stdout
+    assert "boards/acme/nonexistent-p4/deeptune.sh" in p3.stdout
+    assert rvdk_log.read_text(encoding="utf-8").splitlines() == [
+        f"bsp/espressif/esp32p4/deeptune.sh --tune iot --stage-dir {stage_dir}",
+    ]
+
+    # 4. Path-traversal BOARD_SLUG -> fails fast
+    bad_env = dict(base_env)
+    bad_env["BOARD_SLUG"] = "../etc/passwd"
+    p4 = subprocess.run(
+        ["bash", str(FORGE_SH), "deeptune", "--target", "p4", "--stage-dir", str(stage_dir)],
+        env=bad_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p4.returncode != 0
+    assert "Invalid BOARD_SLUG" in p4.stderr
+
+    # 5. Stage 5D inside forge --stage-dir --deeptune honors BOARD_SLUG and skips gracefully
+    _write_executable(
+        rvdk_engine / "bsp" / "espressif" / "esp32p4" / "forge.sh",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    rvdk_log.unlink()
+    stage5d_proc = subprocess.run(
+        [
+            "bash",
+            str(FORGE_SH),
+            "forge",
+            "--target",
+            "p4",
+            "--role",
+            "lilsnitch",
+            "--stage-dir",
+            str(stage_dir),
+            "--deeptune",
+        ],
+        env=missing_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert stage5d_proc.returncode == 0, stage5d_proc.stderr
+    assert "[SKIP]" in stage5d_proc.stdout
+    assert "boards/acme/nonexistent-p4/deeptune.sh" in stage5d_proc.stdout
+    assert rvdk_log.read_text(encoding="utf-8").splitlines() == [
+        f"bsp/espressif/esp32p4/forge.sh --stage-dir {stage_dir}",
+        f"bsp/espressif/esp32p4/deeptune.sh --tune iot --stage-dir {stage_dir}",
+    ]
+
+
+def test_forge_rvdk_delegation_deprecation_and_compat_gating(tmp_path: Path) -> None:
+    helpers = _extract_shell_functions(
+        FORGE_SH,
+        (
+            "_brak_resolve_rvdk_cmd",
+            "_brak_resolve_rvdk_engine_dir",
+            "_brak_has_rvdk_script",
+            "_brak_legacy_compat_allowed",
+            "_brak_service_active_or_enabled",
+            "_brak_reclaim_hugepages_compat",
+            "_brak_disable_hugepages",
+            "_brak_disable_postgresql",
+            "_brak_disable_mosquitto",
+            "_brak_disable_nfs_server",
+        ),
+    )
+
+    # 1. When RVDK supports --disable hooks, delegate cleanly with zero DEPRECATED warnings
+    mock_bin_deleg = tmp_path / "bin_deleg"
+    sys_calls_deleg = tmp_path / "sys_deleg.calls"
+    _write_executable(
+        mock_bin_deleg / "systemctl",
+        (
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> {shlex.quote(str(sys_calls_deleg))}\n'
+            "exit 0\n"
+        ),
+    )
+    rvdk_calls_deleg = tmp_path / "rvdk_deleg.calls"
+    mock_rvdk_deleg = _write_executable(
+        tmp_path / "rvdk_deleg",
+        (
+            "#!/usr/bin/env bash\n"
+            'if [[ "${2:-}" == "--help" ]]; then\n'
+            '  printf "Usage: rvdk %s [--disable]\\n" "$1"\n'
+            "  exit 0\n"
+            "fi\n"
+            f'printf "%s\\n" "$*" >> {shlex.quote(str(rvdk_calls_deleg))}\n'
+        ),
+    )
+    deleg_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            'ACTION="forge"',
+            'BRAKERRAK_LEGACY_RVDK_COMPAT="true"',
+            'NODE_ROLE="visionbench"',
+            f"RVDK_BIN={shlex.quote(str(mock_rvdk_deleg))}",
+            "_brak_disable_postgresql",
+            "_brak_disable_mosquitto",
+            "_brak_disable_nfs_server",
+        ]
+    )
+    deleg_env = _isolated_shell_env(tmp_path)
+    deleg_env["PATH"] = f"{mock_bin_deleg}:{deleg_env.get('PATH', '/usr/bin:/bin')}"
+    deleg_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", deleg_script],
+        env=deleg_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert deleg_proc.returncode == 0, deleg_proc.stderr
+    assert "DEPRECATED:" not in deleg_proc.stderr
+    assert not sys_calls_deleg.exists()
+    assert rvdk_calls_deleg.read_text(encoding="utf-8").splitlines() == [
+        "postgresql --disable",
+        "mods/mosquitto --disable",
+        "mods/nfs-vault --disable",
+    ]
+
+    # 2. When RVDK lacks --disable hooks & service is active:
+    #    - COMPAT=true emits DEPRECATED warning and calls systemctl disable --now
+    #    - COMPAT=false fails fast before mutating systemctl
+    mock_rvdk_legacy = _write_executable(
+        tmp_path / "rvdk_legacy",
+        "#!/usr/bin/env bash\nexit 0\n",
+    )
+    sys_calls_legacy = tmp_path / "sys_legacy.calls"
+    mock_bin_legacy = tmp_path / "bin_legacy"
+    _write_executable(
+        mock_bin_legacy / "systemctl",
+        (
+            "#!/usr/bin/env bash\n"
+            'if [[ "$1" == "is-active" || "$1" == "is-enabled" ]]; then exit 0; fi\n'
+            f'printf "%s\\n" "$*" >> {shlex.quote(str(sys_calls_legacy))}\n'
+        ),
+    )
+
+    compat_env = _isolated_shell_env(tmp_path)
+    compat_env["PATH"] = f"{mock_bin_legacy}:{compat_env.get('PATH', '/usr/bin:/bin')}"
+
+    compat_on_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            'ACTION="forge"',
+            'BRAKERRAK_LEGACY_RVDK_COMPAT="true"',
+            'NODE_ROLE="visionbench"',
+            f"RVDK_BIN={shlex.quote(str(mock_rvdk_legacy))}",
+            "_brak_disable_mosquitto",
+        ]
+    )
+    compat_on_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", compat_on_script],
+        env=compat_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compat_on_proc.returncode == 0, compat_on_proc.stderr
+    assert "DEPRECATED:" in compat_on_proc.stderr
+    assert sys_calls_legacy.read_text(encoding="utf-8").splitlines() == [
+        "disable --now mosquitto.service",
+    ]
+
+    sys_calls_legacy.unlink()
+    compat_off_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            helpers,
+            'ACTION="forge"',
+            'BRAKERRAK_LEGACY_RVDK_COMPAT="false"',
+            'NODE_ROLE="visionbench"',
+            f"RVDK_BIN={shlex.quote(str(mock_rvdk_legacy))}",
+            "_brak_disable_mosquitto",
+        ]
+    )
+    compat_off_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", compat_off_script],
+        env=compat_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compat_off_proc.returncode != 0
+    assert "BRAKERRAK_LEGACY_RVDK_COMPAT=false" in compat_off_proc.stderr
+    assert not sys_calls_legacy.exists()

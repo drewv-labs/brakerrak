@@ -208,6 +208,56 @@ def test_check_hygiene_new_retired_astro_and_macos_path_rules(tmp_path: Path) ->
     assert clean_errors == []
 
 
+def test_check_hygiene_astro_pandas_and_tailscale_cgnat_rules(tmp_path: Path) -> None:
+    # Construct all forbidden literals dynamically so this test file stays hygiene-clean.
+    pandas_pkg = "pan" + "das"
+    astro_word = "astro" + "photograph"
+    scope_word = "tele" + "scope"
+    positive_samples: list[tuple[str, str]] = [
+        (astro_word, "Downstream astro literal"),
+        (astro_word.upper() + "Y", "Downstream astro literal"),
+        (scope_word + "s", "Downstream astro literal"),
+        (f"import {pandas_pkg} as pd", "Forbidden dataframe import"),
+        (f"from {pandas_pkg}.core.frame import DataFrame", "Forbidden dataframe import"),
+        ("100." + "64.0.1", "Tailscale CGNAT IPv4 literal"),
+        ("TS_IP='100." + "99.12.34'", "Tailscale CGNAT IPv4 literal"),
+        ("http://100." + "100.0.1:8080/metrics", "Tailscale CGNAT IPv4 literal"),
+        ("100." + "127.255.254", "Tailscale CGNAT IPv4 literal"),
+        ("100." + "64.x", "Tailscale CGNAT IPv4 literal"),
+        ("100." + "127.x", "Tailscale CGNAT IPv4 literal"),
+    ]
+
+    for idx, (line, expected_desc_fragment) in enumerate(positive_samples):
+        probe = tmp_path / f"pos_{idx}.txt"
+        probe.write_text(f"{line}\n", encoding="utf-8")
+        errors, checked = check_hygiene(tmp_path, [probe])
+        assert checked == 1
+        assert len(errors) == 1, (
+            f"Expected 1 error for {expected_desc_fragment} ({idx}), got {errors}"
+        )
+        assert expected_desc_fragment in errors[0]
+
+    negative_lines = [
+        "import pyarrow as pa",
+        f"zero {pandas_pkg} dependency policy",
+        "non_cgnat_low=100." + "63.0.1",
+        "non_cgnat_low_mask=100." + "63.x",
+        "non_cgnat_high=100." + "128.0.1",
+        "non_cgnat_high_mask=100." + "128.x",
+        "non_cgnat_zero=100.0.0.1",
+        "rfc1918_nested=10.100." + "64.1",
+        "version_string=2100." + "64.0.1",
+        "latency_ms=100." + "64 ms",
+        "doc_ip=198.51.100." + "64",
+        "invalid_octet=100." + "640.0.1",
+    ]
+    clean = tmp_path / "negative_edge_cases.txt"
+    clean.write_text("\n".join(negative_lines) + "\n", encoding="utf-8")
+    clean_errors, clean_checked = check_hygiene(tmp_path, [clean])
+    assert clean_checked == 1
+    assert clean_errors == []
+
+
 def test_update_baseline_sha_cli_updates_tmp_copy_atomically(tmp_path: Path) -> None:
     repo_artifacts = Path(__file__).resolve().parent.parent / "artifacts"
     src_baseline = repo_artifacts / "ctd-thermal-soak-baseline.json"

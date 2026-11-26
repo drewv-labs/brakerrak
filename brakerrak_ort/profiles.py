@@ -38,6 +38,19 @@ class RoleDefaults:
     enable_nfs_server: bool
 
 
+@dataclass(frozen=True)
+class AcceleratorLinkSpec:
+    """Expected PCIe link speed (GT/s) and minimum lane width for an accelerator vendor."""
+
+    min_gt_s: float
+    min_width: int
+
+
+ACCELERATOR_PERSONAS: frozenset[str] = frozenset(
+    {"visionbox", "visionbench", "babbagebox", "babbagebench"}
+)
+
+
 SOC_PROFILES: dict[str, SocProfile] = {
     "eswin-eic7700x": SocProfile(
         slug="eswin-eic7700x",
@@ -391,6 +404,28 @@ GPU_ACCELERATOR_VENDORS: dict[str, str] = {
 
 ACCELERATOR_PCI_CLASSES: frozenset[str] = frozenset({"0300", "0302", "0380", "0b40", "1200"})
 
+# Expected native PCIe link floors per accelerator vendor (capped by board bus capability).
+ACCELERATOR_LINK_SPECS: dict[str, AcceleratorLinkSpec] = {
+    "1e60": AcceleratorLinkSpec(min_gt_s=8.0, min_width=4),
+    "1e52": AcceleratorLinkSpec(min_gt_s=16.0, min_width=8),
+    "1ac1": AcceleratorLinkSpec(min_gt_s=5.0, min_width=1),
+    "1002": AcceleratorLinkSpec(min_gt_s=8.0, min_width=4),
+    "10de": AcceleratorLinkSpec(min_gt_s=8.0, min_width=4),
+}
+
+
+def get_accelerator_link_floor(vendor_id: str, profile: SocProfile) -> tuple[float, int]:
+    """Return expected (min_gt_s, min_width) for an accelerator capped by board bus capability."""
+    if not profile.has_pcie:
+        return (0.0, 0)
+    spec = ACCELERATOR_LINK_SPECS.get(vendor_id.strip().lower())
+    if spec is None:
+        return (profile.min_gt_s, profile.min_width)
+    return (
+        min(spec.min_gt_s, profile.min_gt_s),
+        min(spec.min_width, profile.min_width),
+    )
+
 
 def normalize_soc_slug(raw_slug: str | None) -> str:
     """Normalize a SoC or board alias to one of the 9 canonical SoC slugs."""
@@ -527,7 +562,7 @@ def normalize_role(raw_role: str | None) -> str | None:
 
 def get_role_defaults(node_role: str) -> RoleDefaults:
     """Return service enablement and stem defaults for a node role."""
-    cleaned = node_role.strip().lower()
+    cleaned = normalize_role(node_role) or node_role.strip().lower()
     if cleaned in ROLE_DEFAULTS:
         return ROLE_DEFAULTS[cleaned]
     return RoleDefaults(

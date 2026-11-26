@@ -277,11 +277,15 @@ _reset_source_touches_disk() {
     return 1
 }
 
+_reset_is_block_device() {
+    [[ -b "${1:-}" ]]
+}
+
 # Returns 0 if <dev> backs /, /boot, /boot/efi, critical OS paths, an active root/boot
 # LVM/mapper/md volume, multi-mount, or any active swap device.
 _reset_device_is_protected() {
     local dev="$1"
-    [[ -b "$dev" ]] || return 1
+    _reset_is_block_device "$dev" || return 1
 
     local dev_real target_kname
     dev_real="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
@@ -343,6 +347,296 @@ _reset_device_is_protected() {
     fi
 
     return 1
+}
+
+# Validate single-label RFC 1123 hostname without spaces, slashes, or control chars.
+_reset_validate_hostname() {
+    local host="${1:-}"
+    [[ -n "$host" ]] || return 1
+    [[ "$host" =~ [[:space:][:cntrl:]] ]] && return 1
+    (( ${#host} <= 63 )) || return 1
+
+    local _rfc1123_re='^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$'
+    local _had_lc=0 _prev_lc=""
+    if [[ -n "${LC_ALL+x}" ]]; then
+        _had_lc=1
+        _prev_lc="$LC_ALL"
+    fi
+    LC_ALL=C
+    local _rc=1
+    if [[ "$host" =~ $_rfc1123_re ]]; then
+        _rc=0
+    fi
+    if (( _had_lc == 1 )); then
+        LC_ALL="$_prev_lc"
+    else
+        unset LC_ALL
+    fi
+    return "$_rc"
+}
+
+# Safely rewrite 127.0.1.1 entries in hosts file via awk + brak_atomic_write.
+_reset_update_hosts_file() {
+    local new_hostname="${1:-}"
+    local hosts_path="${2:-/etc/hosts}"
+    if ! _reset_validate_hostname "$new_hostname"; then
+        log_fatal "Invalid hostname '${new_hostname}' for hosts update: must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+    fi
+    [[ -f "$hosts_path" ]] || return 0
+
+    local orig_mode="0644"
+    orig_mode="$(stat -c '%a' "$hosts_path" 2>/dev/null || stat -f '%Lp' "$hosts_path" 2>/dev/null || echo "0644")"
+    [[ "$orig_mode" =~ ^0?[0-7]{3,4}$ ]] || orig_mode="0644"
+
+    local owner_group=""
+    if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+        owner_group="0:0"
+    fi
+
+    local tmp_hosts=""
+    brak_mktemp -v tmp_hosts
+    if ! BRAK_RESET_HOSTNAME="$new_hostname" awk '
+        BEGIN { host = ENVIRON["BRAK_RESET_HOSTNAME"]; updated = 0 }
+        /^[[:space:]]*(#|$)/ { print; next }
+        $1 == "127.0.1.1" {
+            if (!updated) {
+                printf "127.0.1.1\t%s\n", host
+                updated = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!updated) {
+                printf "127.0.1.1\t%s\n", host
+            }
+        }
+    ' "$hosts_path" > "$tmp_hosts"; then
+        rm -f -- "$tmp_hosts" 2>/dev/null || true
+        log_fatal "Failed to rewrite hosts file '${hosts_path}'."
+    fi
+
+    brak_atomic_write "$hosts_path" "$orig_mode" "$owner_group" < "$tmp_hosts"
+    rm -f -- "$tmp_hosts" 2>/dev/null || true
+}
+
+_reset_dev_is_mounted() {
+    local dev="${1:-}"
+    local proc_mounts_path="${2:-/proc/mounts}"
+    [[ -n "$dev" ]] || return 1
+
+    local dev_real
+    dev_real="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
+
+    if command -v findmnt >/dev/null 2>&1; then
+        local mnts=""
+        mnts="$(findmnt -rn -o TARGET --source "$dev" 2>/dev/null || true)"
+        if [[ -z "$mnts" && "$dev_real" != "$dev" ]]; then
+            mnts="$(findmnt -rn -o TARGET --source "$dev_real" 2>/dev/null || true)"
+        fi
+        [[ -n "$mnts" ]] && return 0
+    fi
+
+    if command -v lsblk >/dev/null 2>&1; then
+        local mnt_lines="" line=""
+        mnt_lines="$(lsblk -nr -d -o MOUNTPOINTS "$dev" 2>/dev/null || lsblk -nr -d -o MOUNTPOINT "$dev" 2>/dev/null || true)"
+        while IFS= read -r line; do
+            [[ -n "$line" && "$line" != "[SWAP]" ]] && return 0
+        done <<< "$mnt_lines"
+    fi
+
+    if [[ -r "$proc_mounts_path" ]]; then
+        local src src_clean src_real
+        while IFS= read -r src; do
+            src_clean="${src%%\[*}"
+            [[ "$src_clean" == /dev/* ]] || continue
+            src_real="$(readlink -f "$src_clean" 2>/dev/null || echo "$src_clean")"
+            if [[ "$src_clean" == "$dev" || "$src_real" == "$dev_real" ]]; then
+                return 0
+            fi
+        done < <(awk '{print $1}' "$proc_mounts_path" 2>/dev/null || true)
+    fi
+
+    return 1
+}
+
+_reset_dev_tree_is_mounted() {
+    local dev="${1:-}"
+    local proc_mounts_path="${2:-/proc/mounts}"
+    [[ -n "$dev" ]] || return 1
+
+    if _reset_dev_is_mounted "$dev" "$proc_mounts_path"; then
+        return 0
+    fi
+
+    if command -v lsblk >/dev/null 2>&1; then
+        local mnt_lines="" line=""
+        mnt_lines="$(lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null || lsblk -nr -o MOUNTPOINT "$dev" 2>/dev/null || true)"
+        while IFS= read -r line; do
+            [[ -n "$line" && "$line" != "[SWAP]" ]] && return 0
+        done <<< "$mnt_lines"
+    fi
+
+    if [[ -r "$proc_mounts_path" ]]; then
+        local dev_real target_kname
+        dev_real="$(readlink -f "$dev" 2>/dev/null || echo "$dev")"
+        target_kname="$(basename "$dev_real")"
+        local src
+        while IFS= read -r src; do
+            [[ -n "$src" ]] || continue
+            if _reset_source_touches_disk "$src" "$target_kname"; then
+                return 0
+            fi
+        done < <(awk '$1 ~ /^\/dev\// {print $1}' "$proc_mounts_path" 2>/dev/null || true)
+    fi
+
+    return 1
+}
+
+_reset_report_active_holders() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || return 0
+    if command -v fuser >/dev/null 2>&1; then
+        log_warn "Active holders on '${target}':"
+        fuser -vm "$target" >&2 || true
+    fi
+}
+
+_reset_strict_umount() {
+    local target="${1:-}"
+    [[ -n "$target" ]] || return 0
+
+    if command -v fuser >/dev/null 2>&1; then
+        fuser -km "$target" 2>/dev/null || true
+    fi
+
+    local umount_err=""
+    if ! umount_err="$(umount "$target" 2>&1)"; then
+        [[ -n "$umount_err" ]] && log_warn "umount(${target}): ${umount_err}"
+        _reset_report_active_holders "$target"
+        log_fatal "Safety Interlock: failed to unmount '${target}'; aborting before destructive cleanup."
+    fi
+}
+
+_reset_unmount_vg_devices() {
+    local cand_vg="${1:-}"
+    local mapper_dir="${2:-/dev/mapper}"
+    local dev_root="${3:-/dev}"
+    [[ -n "$cand_vg" ]] || return 0
+
+    local vg_dm_prefix="${cand_vg//-/--}"
+    local _had_nullglob=0
+    shopt -q nullglob && _had_nullglob=1
+    shopt -s nullglob
+    local -a dm_devs=("${mapper_dir}/${vg_dm_prefix}-"* "${dev_root}/${cand_vg}/"*)
+    if (( _had_nullglob == 0 )); then
+        shopt -u nullglob
+    fi
+
+    local dm_dev
+    for dm_dev in ${dm_devs[@]+"${dm_devs[@]}"}; do
+        _reset_is_block_device "$dm_dev" || continue
+        if _reset_dev_is_mounted "$dm_dev"; then
+            _reset_strict_umount "$dm_dev"
+        fi
+        if _reset_dev_tree_is_mounted "$dm_dev"; then
+            _reset_report_active_holders "$dm_dev"
+            log_fatal "Safety Interlock: '${dm_dev}' remains mounted after umount; aborting before vgremove."
+        fi
+    done
+}
+
+# Collect exact NVMe device + numeric partition nodes (never sibling namespaces like nvme0n10)
+# and filter out any protected OS/swap device.
+_reset_nvme_wipe_candidates() {
+    local nvme_dev="${1:-}"
+    [[ -n "$nvme_dev" ]] || return 0
+
+    local _had_nullglob=0
+    shopt -q nullglob && _had_nullglob=1
+    shopt -s nullglob
+    local -a part_globs=("${nvme_dev}"p[0-9]*)
+    if (( _had_nullglob == 0 )); then
+        shopt -u nullglob
+    fi
+
+    local -a raw_candidates=("$nvme_dev")
+    local part_cand part_suffix
+    for part_cand in ${part_globs[@]+"${part_globs[@]}"}; do
+        part_suffix="${part_cand#"${nvme_dev}p"}"
+        if [[ "$part_suffix" =~ ^[0-9]+$ ]]; then
+            raw_candidates+=("$part_cand")
+        fi
+    done
+
+    local cand
+    for cand in "${raw_candidates[@]}"; do
+        _reset_is_block_device "$cand" || continue
+        if _reset_device_is_protected "$cand"; then
+            log_warn "Safety Interlock: excluding protected block device '${cand}' from NVMe wipe candidates."
+            continue
+        fi
+        printf '%s\n' "$cand"
+    done
+}
+
+_reset_wipe_nvme_targets() {
+    local nvme_dev="${1:-}"
+    [[ -n "$nvme_dev" ]] || return 0
+
+    local -a wipe_cands=()
+    local cand
+    while IFS= read -r cand; do
+        [[ -n "$cand" ]] && wipe_cands+=("$cand")
+    done < <(_reset_nvme_wipe_candidates "$nvme_dev")
+
+    # Phase 1: Validate protection and strictly unmount partitions BEFORE whole disk,
+    # then verify no direct or descendant mounts remain on ANY candidate before wiping.
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        if _reset_device_is_protected "$cand"; then
+            log_fatal "Safety Interlock: refusing wipe on protected block device '${cand}'."
+        fi
+    done
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        [[ "$cand" == "$nvme_dev" ]] && continue
+        if _reset_dev_is_mounted "$cand"; then
+            _reset_strict_umount "$cand"
+        fi
+    done
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        [[ "$cand" == "$nvme_dev" ]] || continue
+        if _reset_dev_is_mounted "$cand"; then
+            _reset_strict_umount "$cand"
+        fi
+    done
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        if _reset_dev_tree_is_mounted "$cand"; then
+            _reset_report_active_holders "$cand"
+            log_fatal "Safety Interlock: '${cand}' (or a descendant volume) remains mounted; aborting before NVMe wipe."
+        fi
+    done
+
+    # Phase 2: Remove LVM PV labels (partitions before whole disk)
+    if command -v pvremove >/dev/null 2>&1; then
+        for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+            [[ "$cand" == "$nvme_dev" ]] && continue
+            pvremove -ff -y "$cand" 2>/dev/null || true
+        done
+        for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+            [[ "$cand" == "$nvme_dev" ]] || continue
+            pvremove -ff -y "$cand" 2>/dev/null || true
+        done
+    fi
+
+    # Phase 3: Wipe partition signatures before whole-disk label metadata
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        [[ "$cand" == "$nvme_dev" ]] && continue
+        wipefs -af "$cand" >/dev/null 2>&1 || true
+    done
+    for cand in ${wipe_cands[@]+"${wipe_cands[@]}"}; do
+        [[ "$cand" == "$nvme_dev" ]] || continue
+        wipefs -af "$cand" >/dev/null 2>&1 || true
+    done
 }
 
 # Atomically strip exact LABEL=<lbl> ($1) and mountpoint ($2) entries from /etc/fstab,
@@ -479,9 +773,16 @@ _reset_legacy_rvdk_compat() {
 }
 
 _reset_rvdk_teardown() {
-    if command -v rvdk >/dev/null 2>&1; then
-        log_brak "Delegating RVDK service & drop-in teardown to 'rvdk reset'..."
-        if rvdk reset; then
+    local rvdk_cmd=""
+    if [[ -n "${RVDK_BIN:-}" && -x "${RVDK_BIN}" ]]; then
+        rvdk_cmd="${RVDK_BIN}"
+    elif command -v rvdk >/dev/null 2>&1; then
+        rvdk_cmd="$(command -v rvdk)"
+    fi
+
+    if [[ -n "$rvdk_cmd" ]]; then
+        log_brak "Delegating RVDK service & drop-in teardown to '${rvdk_cmd} reset'..."
+        if "$rvdk_cmd" reset; then
             log_ok "Completed RVDK teardown via 'rvdk reset'"
             return 0
         fi
@@ -491,6 +792,43 @@ _reset_rvdk_teardown() {
     fi
 
     _reset_legacy_rvdk_compat
+}
+
+_reset_prevalidate_cli_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config)
+                brak_require_arg "$1" "${2:-}"
+                shift 2
+                ;;
+            --config=*)
+                brak_require_arg "--config" "${1#*=}"
+                shift
+                ;;
+            --hostname)
+                brak_require_arg "$1" "${2:-}"
+                if ! _reset_validate_hostname "$2"; then
+                    log_fatal "Invalid --hostname '${2}': must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+                fi
+                shift 2
+                ;;
+            --hostname=*)
+                local _hval="${1#*=}"
+                brak_require_arg "--hostname" "$_hval"
+                if ! _reset_validate_hostname "$_hval"; then
+                    log_fatal "Invalid --hostname '${_hval}': must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+                fi
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
 }
 
 _reset_main() {
@@ -504,9 +842,11 @@ _reset_main() {
         fi
     done
 
+    _reset_prevalidate_cli_args "$@"
+
     if [[ $EUID -ne 0 ]]; then
         if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-            local _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
+            local _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_BIN,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
             exec sudo --preserve-env="$_sudo_preserve_env" bash "${BASH_SOURCE[0]}" "$@"
         else
             log_fatal "Run as root or via 'sudo brakerrak reset --confirm-destroy'."
@@ -583,12 +923,18 @@ _reset_main() {
             --purge-config)    PURGE_CONFIG="true"; shift ;;
             --hostname)
                 brak_require_arg "$1" "${2:-}"
+                if ! _reset_validate_hostname "$2"; then
+                    log_fatal "Invalid --hostname '${2}': must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+                fi
                 RESET_HOSTNAME="$2"
                 shift 2
                 ;;
             --hostname=*)
                 RESET_HOSTNAME="${1#*=}"
                 brak_require_arg "--hostname" "$RESET_HOSTNAME"
+                if ! _reset_validate_hostname "$RESET_HOSTNAME"; then
+                    log_fatal "Invalid --hostname '${RESET_HOSTNAME}': must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+                fi
                 shift
                 ;;
             -h|--help)
@@ -600,6 +946,10 @@ _reset_main() {
                 ;;
         esac
     done
+
+    if ! _reset_validate_hostname "$RESET_HOSTNAME"; then
+        log_fatal "Invalid factory reset hostname '${RESET_HOSTNAME}': must match RFC 1123 (^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$)."
+    fi
 
     if [[ "$CONFIRM_DESTROY" != "true" ]]; then
         log_fatal "Destructive Day-0 rollback requires --confirm-destroy flag."
@@ -617,7 +967,7 @@ _reset_main() {
         fi
     fi
 
-    if [[ "$_is_sd_target" != "true" && -b "$NVME_DEV" ]] && _reset_device_is_protected "$NVME_DEV"; then
+    if [[ "$_is_sd_target" != "true" ]] && _reset_is_block_device "$NVME_DEV" && _reset_device_is_protected "$NVME_DEV"; then
         log_fatal "Safety Interlock: ${NVME_DEV} backs an active OS filesystem (/, /boot, /boot/efi), root LVM/mapper volume, or active swap! Aborting."
     fi
 
@@ -690,9 +1040,9 @@ _reset_main() {
             umount_target="$(_reset_canonicalize_path "$mp")"
         fi
         if mountpoint -q "$umount_target" 2>/dev/null; then
-            fuser -km "$umount_target" 2>/dev/null || true
-            umount "$umount_target" 2>/dev/null || umount -l "$umount_target" 2>/dev/null || true
+            _reset_strict_umount "$umount_target"
             if mountpoint -q "$umount_target" 2>/dev/null; then
+                _reset_report_active_holders "$umount_target"
                 log_fatal "Safety Interlock: '${umount_target}' remains mounted after umount! Aborting before destructive cleanup."
             fi
             log_ok "Unmounted $umount_target"
@@ -708,7 +1058,15 @@ _reset_main() {
         local -a MD_MEMBER_DISKS=()
         local md _md_real _md_kname _leaf
         for md in ${RAID_MDS[@]+"${RAID_MDS[@]}"}; do
-            [[ -n "$md" && -b "$md" ]] || continue
+            [[ -n "$md" ]] || continue
+            _reset_is_block_device "$md" || continue
+            if _reset_dev_is_mounted "$md"; then
+                _reset_strict_umount "$md"
+            fi
+            if _reset_dev_tree_is_mounted "$md"; then
+                _reset_report_active_holders "$md"
+                log_fatal "Safety Interlock: '${md}' remains mounted after umount! Aborting before mdadm stop."
+            fi
             _md_real="$(readlink -f "$md" 2>/dev/null || echo "$md")"
             _md_kname="$(basename "$_md_real")"
             while IFS= read -r _leaf; do
@@ -817,8 +1175,8 @@ _reset_main() {
     if [[ "$_is_sd_target" == "true" ]]; then
         CUR_LBA="n/a (sd)"
         log_skip "SD media target (STORAGE_MEDIA=${STORAGE_MEDIA}, TARGET_ARCH=${TARGET_ARCH}); skipping LVM (${VG_NAME}) and NVMe 512e teardown"
-    elif [[ -b "$NVME_DEV" ]]; then
-        local cand_vg pv_list pv_line pv_trimmed pv_count p
+    elif _reset_is_block_device "$NVME_DEV"; then
+        local cand_vg pv_list pv_line pv_trimmed pv_count
         for cand_vg in "$VG_NAME" "vg_rvdk"; do
             [[ -z "$cand_vg" ]] && continue
             if command -v vgs >/dev/null 2>&1 && vgs "$cand_vg" >/dev/null 2>&1; then
@@ -830,7 +1188,7 @@ _reset_main() {
                     pv_trimmed="$(awk '{$1=$1; print}' <<< "$pv_line")"
                     [[ -n "$pv_trimmed" ]] || continue
                     pv_count=$(( pv_count + 1 ))
-                    if [[ ! -b "$pv_trimmed" ]]; then
+                    if ! _reset_is_block_device "$pv_trimmed"; then
                         log_fatal "Safety Interlock: VG '${cand_vg}' references unreadable/non-block PV '${pv_trimmed}'. Aborting vgremove."
                     fi
                     if _reset_device_is_protected "$pv_trimmed"; then
@@ -841,20 +1199,25 @@ _reset_main() {
                     log_fatal "Safety Interlock: VG '${cand_vg}' returned an empty PV list. Aborting vgremove."
                 fi
 
-                umount "/dev/mapper/${cand_vg}-"* 2>/dev/null || umount -l "/dev/mapper/${cand_vg}-"* 2>/dev/null || true
+                _reset_unmount_vg_devices "$cand_vg"
                 lvchange -an "$cand_vg" 2>/dev/null || true
                 vgchange -an "$cand_vg" 2>/dev/null || true
                 vgremove -ff -y "$cand_vg" 2>/dev/null || true
             fi
             dmsetup remove "${cand_vg}-${LV_NAME}" "${cand_vg}-${NFS_LV_NAME}" 2>/dev/null || true
         done
-        pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
-        for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
-        wipefs -af "$NVME_DEV" >/dev/null 2>&1 || true
+        _reset_wipe_nvme_targets "$NVME_DEV"
         udevadm settle 2>/dev/null || true
         sleep 1
 
         if command -v nvme >/dev/null 2>&1; then
+            if _reset_device_is_protected "$NVME_DEV"; then
+                log_fatal "Safety Interlock: refusing nvme format on protected block device '${NVME_DEV}'."
+            fi
+            if _reset_dev_tree_is_mounted "$NVME_DEV"; then
+                _reset_report_active_holders "$NVME_DEV"
+                log_fatal "Safety Interlock: refusing nvme format while '${NVME_DEV}' or a descendant volume is mounted."
+            fi
             LBA_512_INDEX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:9/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
             if [[ -n "$LBA_512_INDEX" ]]; then
                 nvme format "$NVME_DEV" -l "$LBA_512_INDEX" -s 1 --force 2>/dev/null || nvme format "$NVME_DEV" -l "$LBA_512_INDEX" --force
@@ -925,11 +1288,13 @@ _reset_main() {
     elif command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "$RESET_HOSTNAME"
     else
-        echo "$RESET_HOSTNAME" > /etc/hostname
+        local _hn_owner=""
+        [[ "${EUID:-$(id -u)}" -eq 0 ]] && _hn_owner="0:0"
+        printf '%s\n' "$RESET_HOSTNAME" | brak_atomic_write /etc/hostname 0644 "$_hn_owner"
         hostname "$RESET_HOSTNAME"
     fi
-    if [[ "$_is_sd_target" != "true" && -f /etc/hosts ]]; then
-        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${RESET_HOSTNAME}/g" /etc/hosts 2>/dev/null || true
+    if [[ "$_is_sd_target" != "true" ]]; then
+        _reset_update_hosts_file "$RESET_HOSTNAME" /etc/hosts
     fi
 
     if [[ "$PURGE_CONFIG" == "true" ]]; then

@@ -195,7 +195,7 @@ done
 
 if [[ $EUID -ne 0 && "$_HAS_STAGE_DIR" != "true" ]]; then
     if [[ -n "$SCRIPT_SELF" && -f "$SCRIPT_SELF" ]] && command -v sudo >/dev/null 2>&1; then
-        _BRAK_SUDO_KEEP_ENV="BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,BRAKERRAK_NODE_ENV,BRAKERRAK_TARGET,BRAKERRAK_NO_PROGBAR,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_INSTALL_SHA256,BRAKERRAK_SYSTEM_ENGINE_DIR,BRAKERRAK_SYSTEM_ETC_DIR,BRAKERRAK_SYSTEM_NODE_ENV,NO_PROGBAR,RVDK_BIN,RVDK_BASE_URL,RVDK_INSTALL_SHA256,RVDK_NO_PROGBAR,RVDK_ENV_FILE,APT_UPDATED,TS_AUTHKEY,TERM,COLORTERM,NO_COLOR"
+        _BRAK_SUDO_KEEP_ENV="BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,BRAKERRAK_NODE_ENV,BRAKERRAK_TARGET,BRAKERRAK_NO_PROGBAR,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_INSTALL_SHA256,BRAKERRAK_SYSTEM_ENGINE_DIR,BRAKERRAK_SYSTEM_ETC_DIR,BRAKERRAK_SYSTEM_NODE_ENV,BRAKERRAK_LEGACY_RVDK_COMPAT,BOARD_SLUG,NO_PROGBAR,RVDK_BIN,RVDK_ENGINE_DIR,RVDK_BASE_URL,RVDK_INSTALL_SHA256,RVDK_NO_PROGBAR,RVDK_ENV_FILE,APT_UPDATED,TS_AUTHKEY,TERM,COLORTERM,NO_COLOR"
         exec sudo --preserve-env="$_BRAK_SUDO_KEEP_ENV" bash "$SCRIPT_SELF" "$@"
     else
         echo "[BRAKERRAK:FATAL] Pipe into 'sudo bash' or 'sudo zsh': curl -fsSL https://brakerrak.dev/forge.sh | sudo bash" >&2
@@ -278,8 +278,19 @@ case "$APT_UPDATED" in
     *)                   APT_UPDATED="false" ;;
 esac
 
-RVDK_BIN="${RVDK_BIN:-/usr/local/bin/rvdk}"
-if [[ ! -x "$RVDK_BIN" ]]; then
+BRAKERRAK_LEGACY_RVDK_COMPAT="${BRAKERRAK_LEGACY_RVDK_COMPAT:-true}"
+case "$BRAKERRAK_LEGACY_RVDK_COMPAT" in
+    1|true|TRUE|yes|YES) BRAKERRAK_LEGACY_RVDK_COMPAT="true" ;;
+    *)                   BRAKERRAK_LEGACY_RVDK_COMPAT="false" ;;
+esac
+
+_BRAK_RVDK_BIN_EXPLICIT="false"
+if [[ -n "${RVDK_BIN:-}" ]]; then
+    _BRAK_RVDK_BIN_EXPLICIT="true"
+else
+    RVDK_BIN="/usr/local/bin/rvdk"
+fi
+if [[ "$_BRAK_RVDK_BIN_EXPLICIT" != "true" && ! -x "$RVDK_BIN" ]]; then
     if [[ -x /usr/bin/rvdk ]]; then
         RVDK_BIN="/usr/bin/rvdk"
     elif command -v rvdk >/dev/null 2>&1; then
@@ -288,13 +299,119 @@ if [[ ! -x "$RVDK_BIN" ]]; then
 fi
 
 _brak_resolve_rvdk_cmd() {
+    if [[ "${_BRAK_RVDK_BIN_EXPLICIT:-false}" == "true" ]]; then
+        [[ -n "${RVDK_BIN:-}" && -x "${RVDK_BIN}" ]] || return 1
+        printf '%s\n' "$RVDK_BIN"
+        return 0
+    fi
+    if [[ -n "${RVDK_BIN:-}" ]]; then
+        if [[ -x "${RVDK_BIN}" ]]; then
+            printf '%s\n' "$RVDK_BIN"
+            return 0
+        fi
+        if [[ "$RVDK_BIN" != "/usr/local/bin/rvdk" && "$RVDK_BIN" != "/usr/bin/rvdk" ]]; then
+            return 1
+        fi
+    fi
     if command -v rvdk >/dev/null 2>&1; then
         command -v rvdk
-    elif [[ -x "${RVDK_BIN:-}" ]]; then
-        printf '%s\n' "$RVDK_BIN"
+    elif [[ -x /usr/local/bin/rvdk ]]; then
+        printf '/usr/local/bin/rvdk\n'
+    elif [[ -x /usr/bin/rvdk ]]; then
+        printf '/usr/bin/rvdk\n'
     else
         return 1
     fi
+}
+
+_brak_resolve_rvdk_engine_dir() {
+    if [[ -n "${RVDK_ENGINE_DIR:-}" && -d "${RVDK_ENGINE_DIR}" ]]; then
+        printf '%s\n' "${RVDK_ENGINE_DIR%/}"
+        return 0
+    fi
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        local resolved="" dir="" parent=""
+        resolved="$(readlink -f "$rvdk_cmd" 2>/dev/null || realpath "$rvdk_cmd" 2>/dev/null || printf '%s\n' "$rvdk_cmd")"
+        dir="$(dirname "$resolved")"
+        if [[ -d "${dir}/boards" || -d "${dir}/bsp" || -d "${dir}/utils" ]]; then
+            printf '%s\n' "$dir"
+            return 0
+        fi
+        parent="$(cd "${dir}/.." 2>/dev/null && pwd || true)"
+        if [[ -n "$parent" && ( -d "${parent}/boards" || -d "${parent}/bsp" || -d "${parent}/utils" ) ]]; then
+            printf '%s\n' "$parent"
+            return 0
+        fi
+    fi
+    if [[ -z "$rvdk_cmd" || "$rvdk_cmd" == "/usr/local/bin/rvdk" || "$rvdk_cmd" == "/usr/bin/rvdk" ]] && [[ -d /usr/local/share/rvdk/engine ]]; then
+        printf '/usr/local/share/rvdk/engine\n'
+        return 0
+    fi
+    return 1
+}
+
+_brak_has_rvdk_script() {
+    local rel_path="${1:-}"
+    [[ -n "$rel_path" && "$rel_path" != /* && "$rel_path" != *".."* ]] || return 1
+    local engine_dir=""
+    engine_dir="$(_brak_resolve_rvdk_engine_dir || true)"
+    [[ -n "$engine_dir" && -f "${engine_dir}/${rel_path}" ]]
+}
+
+_brak_resolve_board_slug() {
+    local raw="${BOARD_SLUG:-}"
+    if [[ -z "$raw" && -n "${NODE_ENV:-}" && -r "${NODE_ENV}" ]]; then
+        BOARD_SLUG=""
+        brak_load_kv_env "$NODE_ENV" BOARD_SLUG || true
+        raw="${BOARD_SLUG:-}"
+    fi
+    if [[ -z "$raw" ]]; then
+        raw="waveshare/esp32-p4-wifi6"
+    fi
+    if [[ "$raw" == *".."* || ! "$raw" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*(/[a-zA-Z0-9][a-zA-Z0-9._-]*)*$ ]]; then
+        log_fatal "Invalid BOARD_SLUG '${raw}' (expected relative vendor/board slug)."
+    fi
+    BOARD_SLUG="$raw"
+    export BOARD_SLUG
+}
+
+_brak_is_accel_persona() {
+    local role="${1:-}"
+    if declare -F brak_normalize_role >/dev/null 2>&1; then
+        local norm=""
+        norm="$(brak_normalize_role "$role")"
+        [[ -n "$norm" ]] && role="$norm"
+    else
+        role="$(tr '[:upper:]' '[:lower:]' <<< "$role")"
+    fi
+    case "$role" in
+        visionbox|visionbench|babbagebox|babbagebench) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_brak_should_skip_accel_nvme() {
+    local role="${1:-${NODE_ROLE:-}}"
+    local enable_pg="${2:-${ENABLE_POSTGRES:-}}"
+    local enable_nfs="${3:-${ENABLE_NFS_SERVER:-}}"
+    local nvme_dev="${4:-${NVME_DEV:-/dev/nvme0n1}}"
+    _brak_is_accel_persona "$role" || return 1
+    [[ "$enable_pg" != "true" && "$enable_nfs" != "true" && ! -b "$nvme_dev" ]]
+}
+
+_brak_legacy_compat_allowed() {
+    [[ "${ACTION:-}" == "forge" && "${BRAKERRAK_LEGACY_RVDK_COMPAT:-true}" == "true" ]]
+}
+
+_brak_service_active_or_enabled() {
+    local unit="${1:-}"
+    [[ -n "$unit" ]] || return 1
+    command -v systemctl >/dev/null 2>&1 || return 1
+    systemctl is-active --quiet "$unit" 2>/dev/null && return 0
+    systemctl is-enabled --quiet "$unit" 2>/dev/null && return 0
+    return 1
 }
 
 # Download a remote shell script to a 0700 temp file, validate non-empty + valid
@@ -523,6 +640,15 @@ else
     brak_resolve_node_env --migrate
 fi
 
+# Quarantined fallback for legacy `/opt/drewv-pgdg-riscv64` APT repo cleanup.
+_brak_legacy_pgdg_migration_compat() {
+    if ! _brak_legacy_compat_allowed; then
+        log_fatal "Legacy /opt/drewv-pgdg-riscv64 cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks a migration hook."
+    fi
+    log_warn "DEPRECATED: Falling back to legacy compat removal of /etc/apt/sources.list.d/drewv-local-pgdg.list (upgrade RVDK to support utils/migrate-pgdg.sh, migrate-pgdg, or postgresql --migrate-legacy)."
+    rm -f /etc/apt/sources.list.d/drewv-local-pgdg.list /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* 2>/dev/null || true
+}
+
 # Delegate pre-FHS `/opt/drewv-pgdg-riscv64` APT repo migration to RVDK when present;
 # strictly gated behind `ACTION == "forge"` so read-only/utility commands never mutate APT state.
 _brak_delegate_legacy_pgdg_migration() {
@@ -532,7 +658,7 @@ _brak_delegate_legacy_pgdg_migration() {
     local rvdk_cmd=""
     rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
     if [[ -n "$rvdk_cmd" ]]; then
-        if [[ -f /usr/local/share/rvdk/engine/utils/migrate-pgdg.sh ]]; then
+        if _brak_has_rvdk_script "utils/migrate-pgdg.sh"; then
             "$rvdk_cmd" utils/migrate-pgdg.sh
             log_ok "Delegated legacy /opt/drewv-pgdg-riscv64 APT migration to RVDK"
             return 0
@@ -545,52 +671,228 @@ _brak_delegate_legacy_pgdg_migration() {
             log_ok "Delegated legacy /opt/drewv-pgdg-riscv64 APT migration to RVDK"
             return 0
         fi
-        log_warn "Legacy /opt/drewv-pgdg-riscv64 detected; delegating PGDG APT repo setup to RVDK (removing stale drewv-local-pgdg.list)."
-    else
-        log_warn "Legacy /opt/drewv-pgdg-riscv64 detected before RVDK CLI install; removing stale drewv-local-pgdg.list."
     fi
-    rm -f /etc/apt/sources.list.d/drewv-local-pgdg.list /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* 2>/dev/null || true
+    _brak_legacy_pgdg_migration_compat
 }
 
 # Quarantined fallback for reclaiming PG18 Sv39 HugePages when RVDK is absent or lacks a hook.
 _brak_reclaim_hugepages_compat() {
-    local _hp_reclaimed="false"
-    if [[ -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf ]]; then
-        rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
-        _hp_reclaimed="true"
-    fi
+    local _has_conf="false"
+    [[ -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf ]] && _has_conf="true"
     local _cur_hp
     _cur_hp="$(awk '/HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
-    if [[ "$_hp_reclaimed" == "true" ]] || { [[ "$_cur_hp" =~ ^[0-9]+$ ]] && (( _cur_hp > 0 )); }; then
-        sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
-        log_ok "Reclaimed static 2MB Sv39 HugePages (removed 90-rvdk-pg18-hugepages.conf & set vm.nr_hugepages=0)"
+    local _has_hp="false"
+    [[ "$_cur_hp" =~ ^[0-9]+$ ]] && (( _cur_hp > 0 )) && _has_hp="true"
+
+    if [[ "$_has_conf" != "true" && "$_has_hp" != "true" ]]; then
+        return 0
     fi
+    if ! _brak_legacy_compat_allowed; then
+        log_fatal "HugePages reclamation required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks a HugePages reclaim subcommand."
+    fi
+    log_warn "DEPRECATED: RVDK lacks HugePages reclaim subcommand; falling back to legacy compat removal of /etc/sysctl.d/90-rvdk-pg18-hugepages.conf and vm.nr_hugepages=0."
+
+    if [[ "$_has_conf" == "true" ]]; then
+        rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
+    fi
+    sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
+    log_ok "Reclaimed static 2MB Sv39 HugePages (removed 90-rvdk-pg18-hugepages.conf & set vm.nr_hugepages=0)"
 }
 
 # Delegate HugePages disablement to RVDK CLI/hooks when available.
 _brak_disable_hugepages() {
+    local mode="${1:-all}"
     local rvdk_cmd=""
     rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
     if [[ -n "$rvdk_cmd" ]]; then
-        if [[ -f /usr/local/share/rvdk/engine/utils/reclaim-hugepages.sh ]]; then
+        if _brak_has_rvdk_script "utils/reclaim-hugepages.sh"; then
             "$rvdk_cmd" utils/reclaim-hugepages.sh
             log_ok "Delegated HugePages disablement to RVDK"
             return 0
-        elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--disable'; then
-            run_rvdk postgresql --disable
+        elif [[ "$mode" != "--reclaim-only" ]] && "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--disable'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk postgresql --disable
+            else
+                "$rvdk_cmd" postgresql --disable
+            fi
             log_ok "Delegated PostgreSQL/HugePages disablement to RVDK"
             return 0
         elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--reclaim-hugepages'; then
-            run_rvdk postgresql --reclaim-hugepages
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk postgresql --reclaim-hugepages
+            else
+                "$rvdk_cmd" postgresql --reclaim-hugepages
+            fi
             log_ok "Delegated HugePages disablement to RVDK"
             return 0
         elif "$rvdk_cmd" deeptune --help 2>/dev/null | grep -qE -- '--reclaim-hugepages'; then
-            run_rvdk deeptune --reclaim-hugepages
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk deeptune --reclaim-hugepages
+            else
+                "$rvdk_cmd" deeptune --reclaim-hugepages
+            fi
             log_ok "Delegated HugePages disablement to RVDK"
             return 0
         fi
     fi
     _brak_reclaim_hugepages_compat
+}
+
+# Delegate PostgreSQL teardown & HugePages reclamation to RVDK first; emit deprecation warning on legacy fallback.
+_brak_disable_postgresql() {
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if _brak_has_rvdk_script "utils/disable-postgresql.sh"; then
+            "$rvdk_cmd" utils/disable-postgresql.sh
+            log_ok "Delegated PostgreSQL disablement to RVDK"
+            _brak_disable_hugepages --reclaim-only
+            return 0
+        elif "$rvdk_cmd" postgresql --help 2>/dev/null | grep -qE -- '--disable'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk postgresql --disable
+            else
+                "$rvdk_cmd" postgresql --disable
+            fi
+            log_ok "Delegated PostgreSQL/HugePages disablement to RVDK"
+            return 0
+        fi
+    fi
+
+    if _brak_service_active_or_enabled postgresql.service || _brak_service_active_or_enabled postgresql; then
+        if ! _brak_legacy_compat_allowed; then
+            log_fatal "PostgreSQL disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'postgresql --disable'."
+        fi
+        log_warn "DEPRECATED: RVDK lacks 'postgresql --disable'; falling back to legacy direct systemctl disablement for postgresql."
+        systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
+        log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE:-node} workloads"
+    fi
+    _brak_disable_hugepages
+}
+
+# Delegate legacy pre-RVDK Mosquitto drop-in cleanup to RVDK first; warn on compat fallback.
+_brak_cleanup_legacy_mosquitto() {
+    [[ -e /etc/mosquitto/conf.d/brakerrak.conf || -e /etc/mosquitto/conf.d/99-brakerrak.conf ]] || return 0
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if _brak_has_rvdk_script "utils/migrate-mosquitto.sh"; then
+            "$rvdk_cmd" utils/migrate-mosquitto.sh
+            log_ok "Delegated legacy Mosquitto config cleanup to RVDK"
+            return 0
+        elif "$rvdk_cmd" mods/mosquitto --help 2>/dev/null | grep -qE -- '--cleanup-legacy'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk mods/mosquitto --cleanup-legacy
+            else
+                "$rvdk_cmd" mods/mosquitto --cleanup-legacy
+            fi
+            log_ok "Delegated legacy Mosquitto config cleanup to RVDK"
+            return 0
+        fi
+    fi
+    if ! _brak_legacy_compat_allowed; then
+        log_fatal "Legacy Mosquitto config cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks migration hook."
+    fi
+    log_warn "DEPRECATED: Removing legacy pre-RVDK Mosquitto drop-in(s) directly (upgrade RVDK to support utils/migrate-mosquitto.sh or mods/mosquitto --cleanup-legacy)."
+    rm -f /etc/mosquitto/conf.d/brakerrak.conf /etc/mosquitto/conf.d/99-brakerrak.conf 2>/dev/null || true
+}
+
+# Delegate Mosquitto disablement to RVDK first; warn on legacy systemctl fallback.
+_brak_disable_mosquitto() {
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if _brak_has_rvdk_script "utils/disable-mosquitto.sh"; then
+            "$rvdk_cmd" utils/disable-mosquitto.sh
+            log_ok "Delegated Mosquitto disablement to RVDK"
+            return 0
+        elif "$rvdk_cmd" mods/mosquitto --help 2>/dev/null | grep -qE -- '--disable'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk mods/mosquitto --disable
+            else
+                "$rvdk_cmd" mods/mosquitto --disable
+            fi
+            log_ok "Delegated Mosquitto disablement to RVDK"
+            return 0
+        fi
+    fi
+    if _brak_service_active_or_enabled mosquitto.service; then
+        if ! _brak_legacy_compat_allowed; then
+            log_fatal "Mosquitto disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'mods/mosquitto --disable'."
+        fi
+        log_warn "DEPRECATED: RVDK lacks 'mods/mosquitto --disable'; falling back to legacy direct systemctl disablement for mosquitto.service."
+        systemctl disable --now mosquitto.service 2>/dev/null || true
+        log_ok "Disabled mosquitto.service for ${NODE_ROLE:-node} isolation"
+    fi
+}
+
+# Delegate legacy pre-RVDK NFS export cleanup to RVDK first; warn on compat fallback.
+_brak_cleanup_legacy_nfs() {
+    [[ -e /etc/exports.d/brakerrak-vaults.exports ]] || return 0
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if _brak_has_rvdk_script "utils/migrate-nfs.sh"; then
+            "$rvdk_cmd" utils/migrate-nfs.sh
+            log_ok "Delegated legacy NFS export cleanup to RVDK"
+            return 0
+        elif "$rvdk_cmd" mods/nfs-vault --help 2>/dev/null | grep -qE -- '--cleanup-legacy'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk mods/nfs-vault --cleanup-legacy
+            else
+                "$rvdk_cmd" mods/nfs-vault --cleanup-legacy
+            fi
+            log_ok "Delegated legacy NFS export cleanup to RVDK"
+            return 0
+        fi
+    fi
+    if ! _brak_legacy_compat_allowed; then
+        log_fatal "Legacy NFS export cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks migration hook."
+    fi
+    log_warn "DEPRECATED: Removing legacy pre-RVDK /etc/exports.d/brakerrak-vaults.exports directly (upgrade RVDK to support utils/migrate-nfs.sh or mods/nfs-vault --cleanup-legacy)."
+    rm -f /etc/exports.d/brakerrak-vaults.exports 2>/dev/null || true
+}
+
+# Delegate NFSv4 service disablement to RVDK first; warn on legacy systemctl fallback.
+_brak_disable_nfs_server() {
+    local rvdk_cmd=""
+    rvdk_cmd="$(_brak_resolve_rvdk_cmd || true)"
+    if [[ -n "$rvdk_cmd" ]]; then
+        if _brak_has_rvdk_script "utils/disable-nfs.sh"; then
+            "$rvdk_cmd" utils/disable-nfs.sh
+            log_ok "Delegated NFSv4 disablement to RVDK"
+            return 0
+        elif "$rvdk_cmd" mods/nfs-vault --help 2>/dev/null | grep -qE -- '--disable'; then
+            if declare -F run_rvdk >/dev/null 2>&1; then
+                run_rvdk mods/nfs-vault --disable
+            else
+                "$rvdk_cmd" mods/nfs-vault --disable
+            fi
+            log_ok "Delegated NFSv4 disablement to RVDK"
+            return 0
+        fi
+    fi
+    local _nfs_kernel_active="false" _nfs_ganesha_active="false"
+    if _brak_service_active_or_enabled nfs-server.service || _brak_service_active_or_enabled nfs-kernel-server; then
+        _nfs_kernel_active="true"
+    fi
+    if _brak_service_active_or_enabled nfs-ganesha.service; then
+        _nfs_ganesha_active="true"
+    fi
+    if [[ "$_nfs_kernel_active" == "true" || "$_nfs_ganesha_active" == "true" ]]; then
+        if ! _brak_legacy_compat_allowed; then
+            log_fatal "NFSv4 disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'mods/nfs-vault --disable'."
+        fi
+        log_warn "DEPRECATED: RVDK lacks 'mods/nfs-vault --disable'; falling back to legacy direct systemctl disablement for NFSv4 services."
+        if [[ "$_nfs_kernel_active" == "true" ]]; then
+            systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
+            log_ok "Disabled nfs-kernel-server for ${NODE_ROLE:-node} isolation"
+        fi
+        if [[ "$_nfs_ganesha_active" == "true" ]]; then
+            systemctl disable --now nfs-ganesha.service 2>/dev/null || true
+            log_ok "Disabled nfs-ganesha for ${NODE_ROLE:-node} isolation"
+        fi
+    fi
 }
 
 # ==============================================================================
@@ -645,13 +947,19 @@ case "$ACTION" in
         elif [[ -z "$DT_TARGET" ]]; then
             brak_resolve_silicon "" >/dev/null 2>&1 || true
         fi
+        _brak_resolve_board_slug
+        _dt_board_script="boards/${BOARD_SLUG}/deeptune.sh"
         for a in ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}; do
             if [[ "$a" == "status" || "$a" == "--status" ]]; then
                 if [[ "${TARGET_BOARD:-}" == "espressif-esp32p4" || -n "$DT_STAGE_DIR" ]]; then
                     _dt_sargs=()
                     [[ -n "$DT_STAGE_DIR" ]] && _dt_sargs=(--stage-dir "$DT_STAGE_DIR")
                     "$RVDK_BIN" bsp/espressif/esp32p4/deeptune.sh status ${_dt_sargs[@]+"${_dt_sargs[@]}"}
-                    exec "$RVDK_BIN" boards/waveshare/esp32-p4-wifi6/deeptune.sh status ${_dt_sargs[@]+"${_dt_sargs[@]}"}
+                    if _brak_has_rvdk_script "$_dt_board_script"; then
+                        exec "$RVDK_BIN" "$_dt_board_script" status ${_dt_sargs[@]+"${_dt_sargs[@]}"}
+                    fi
+                    log_skip "No matching RVDK board script '${_dt_board_script}' (BOARD_SLUG=${BOARD_SLUG}); skipping board-specific DeepTune status"
+                    exit 0
                 fi
                 exec "$RVDK_BIN" deeptune "${DT_PASS_ARGS[@]}"
             fi
@@ -660,7 +968,11 @@ case "$ACTION" in
             _dt_sargs=()
             [[ -n "$DT_STAGE_DIR" ]] && _dt_sargs=(--stage-dir "$DT_STAGE_DIR")
             "$RVDK_BIN" bsp/espressif/esp32p4/deeptune.sh --tune "$DT_EXPLICIT_TUNE" ${_dt_sargs[@]+"${_dt_sargs[@]}"} ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
-            exec "$RVDK_BIN" boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune "$DT_EXPLICIT_TUNE" ${_dt_sargs[@]+"${_dt_sargs[@]}"} ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
+            if _brak_has_rvdk_script "$_dt_board_script"; then
+                exec "$RVDK_BIN" "$_dt_board_script" --tune "$DT_EXPLICIT_TUNE" ${_dt_sargs[@]+"${_dt_sargs[@]}"} ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
+            fi
+            log_skip "No matching RVDK board script '${_dt_board_script}' (BOARD_SLUG=${BOARD_SLUG}); skipping board-specific DeepTune"
+            exit 0
         fi
         exec "$RVDK_BIN" deeptune --tune "$DT_EXPLICIT_TUNE" ${DT_PASS_ARGS[@]+"${DT_PASS_ARGS[@]}"}
         ;;
@@ -678,6 +990,8 @@ case "$ACTION" in
             LV_NAME="lv_data"
         fi
         export VG_NAME LV_NAME NFS_LV_NAME MOUNT_POINT NFS_MOUNT_POINT
+        RVDK_BIN="$(_brak_resolve_rvdk_cmd || echo "$RVDK_BIN")"
+        [[ -x "$RVDK_BIN" ]] || log_fatal "RVDK CLI not found at '${RVDK_BIN}'."
         STORAGE_SUB="${1:-}"
         case "$STORAGE_SUB" in
             grow-psql|extend-psql|add-psql)
@@ -1045,7 +1359,7 @@ fi
 run_rvdk() {
     local subcmd="$1"
     shift
-    if [[ "$APT_UPDATED" == "true" && "$TARGET_BOARD" != "espressif-esp32p4" && -z "$CLI_STAGE_DIR" && "$subcmd" != bsp/espressif/esp32p4/* && "$subcmd" != boards/waveshare/* ]]; then
+    if [[ "$APT_UPDATED" == "true" && "$TARGET_BOARD" != "espressif-esp32p4" && -z "$CLI_STAGE_DIR" && "$subcmd" != bsp/* && "$subcmd" != boards/* && "$subcmd" != utils/* ]]; then
         "$RVDK_BIN" "$subcmd" --no-apt-update "$@"
     else
         "$RVDK_BIN" "$subcmd" "$@"
@@ -1260,9 +1574,9 @@ export NODE_ROLE TARGET_HOSTNAME TARGET_ARCH STORAGE_MEDIA ADMIN_USER LAB_SUBNET
 # 7. ENSURE RVDK CLI IS INSTALLED & DISPATCH MODULAR RVDK PIPELINE
 # ==============================================================================
 if [[ ! -x "$RVDK_BIN" ]]; then
-    if command -v rvdk >/dev/null 2>&1; then
+    if [[ "$_BRAK_RVDK_BIN_EXPLICIT" != "true" ]] && command -v rvdk >/dev/null 2>&1; then
         RVDK_BIN="$(command -v rvdk)"
-    elif [[ $EUID -eq 0 && -z "$CLI_STAGE_DIR" ]]; then
+    elif [[ "$_BRAK_RVDK_BIN_EXPLICIT" != "true" && $EUID -eq 0 && -z "$CLI_STAGE_DIR" ]]; then
         brak_prog 5 "Stage 0A: Installing RVDK CLI..." 0 "Cloning RVDK engine..."
         log_step "0A. Installing RVDK Package Manager CLI (${RVDK_BASE_URL}/install-cli.sh)"
         _brak_fetch_and_exec_script "${RVDK_BASE_URL}/install-cli.sh" "${RVDK_INSTALL_SHA256:-}" --quiet
@@ -1294,6 +1608,10 @@ if [[ "$TARGET_BOARD" == "espressif-esp32p4" || "$STORAGE_MEDIA" == "sd" || -n "
     brak_prog 35 "Stage 2/7: SD Media Target (Skipping 4Kn NVMe LVM)" 100 "mods/nvme-4kn skipped"
     log_step "2. NVMe 4Kn LVM Provisioning Skipped (${TARGET_BOARD} / media=${STORAGE_MEDIA})"
     log_skip "SD media target (${TARGET_BOARD}); skipping 4Kn NVMe LVM stage"
+elif _brak_should_skip_accel_nvme "$NODE_ROLE" "$ENABLE_POSTGRES" "$ENABLE_NFS_SERVER" "$NVME_DEV"; then
+    brak_prog 35 "Stage 2/7: Accelerator-Only Target (Skipping 4Kn NVMe LVM)" 100 "mods/nvme-4kn skipped"
+    log_step "2. NVMe 4Kn LVM Provisioning Skipped (${NODE_ROLE} without ${NVME_DEV})"
+    log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipping 4Kn NVMe LVM stage"
 else
     NVME_FLAGS=(--device "$NVME_DEV" --mount "$MOUNT_POINT" --vg "$VG_NAME" --lv "$LV_NAME" --label "$FS_LABEL")
     USE_DUAL_NFS_LV="false"
@@ -1334,11 +1652,8 @@ else
     if [[ "$TARGET_BOARD" == "espressif-esp32p4" || -n "$CLI_STAGE_DIR" ]]; then
         log_skip "PostgreSQL 18.6 skipped on ${TARGET_BOARD} (${TARGET_ARCH}, media=${STORAGE_MEDIA})"
     else
-        if systemctl is-active --quiet postgresql.service 2>/dev/null || systemctl is-active --quiet postgresql 2>/dev/null; then
-            systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
-            log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE} workloads"
-        fi
-        _brak_disable_hugepages
+        log_skip "PostgreSQL 18.6 disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}; role=${NODE_ROLE})"
+        _brak_disable_postgresql
     fi
 fi
 
@@ -1353,29 +1668,31 @@ else
     log_step "4. Btrfs RAID 10 Vault Provisioning Skipped (WITH_RAID=false)"
     if [[ "$TARGET_BOARD" == "espressif-esp32p4" || -n "$CLI_STAGE_DIR" ]]; then
         log_skip "Btrfs RAID 10 skipped on ${TARGET_BOARD} (${TARGET_ARCH}, media=${STORAGE_MEDIA})"
+    else
+        log_skip "Btrfs RAID 10 disabled (WITH_RAID=${WITH_RAID}; role=${NODE_ROLE})"
     fi
 fi
 
 if [[ "$ENABLE_MQTT_BROKER" == "true" ]]; then
     brak_prog 78 "Stage 5A/7: Eclipse Mosquitto MQTT Broker (:${MQTT_PORT})" 0 "Launching rvdk mods/mosquitto..."
     log_step "5A. RVDK Eclipse Mosquitto MQTT Broker (:${MQTT_PORT} + Unix Socket)"
-    rm -f /etc/mosquitto/conf.d/brakerrak.conf /etc/mosquitto/conf.d/99-brakerrak.conf 2>/dev/null || true
+    _brak_cleanup_legacy_mosquitto
     run_rvdk mods/mosquitto --port "$MQTT_PORT" --data-mount "$MOUNT_POINT"
 else
     brak_prog 82 "Stage 5A/7: Mosquitto MQTT Skipped (ENABLE_MQTT_BROKER=false)" 100 "mods/mosquitto skipped"
     log_step "5A. Mosquitto MQTT Broker Skipped (ENABLE_MQTT_BROKER=false)"
     if [[ "$TARGET_BOARD" == "espressif-esp32p4" || -n "$CLI_STAGE_DIR" ]]; then
         log_skip "Mosquitto MQTT broker skipped on ${TARGET_BOARD} (${TARGET_ARCH}, media=${STORAGE_MEDIA})"
-    elif systemctl is-active --quiet mosquitto.service 2>/dev/null; then
-        systemctl disable --now mosquitto.service 2>/dev/null || true
-        log_ok "Disabled mosquitto.service for ${NODE_ROLE} isolation"
+    else
+        log_skip "Mosquitto MQTT broker disabled (ENABLE_MQTT_BROKER=${ENABLE_MQTT_BROKER}; role=${NODE_ROLE})"
+        _brak_disable_mosquitto
     fi
 fi
 
 if [[ "$ENABLE_NFS_SERVER" == "true" ]]; then
     brak_prog 86 "Stage 5B/7: NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET:-auto-subnet})" 0 "Launching rvdk mods/nfs-vault..."
     log_step "5B. RVDK NFSv4 Vault Exports (${NFS_BACKEND} -> ${LAB_SUBNET:-auto-subnet})"
-    rm -f /etc/exports.d/brakerrak-vaults.exports 2>/dev/null || true
+    _brak_cleanup_legacy_nfs
     NFS_FLAGS=(--data-mount "$MOUNT_POINT" --backend "$NFS_BACKEND")
     if [[ -n "$LAB_SUBNET" ]]; then
         NFS_FLAGS+=(--subnet "$LAB_SUBNET")
@@ -1389,14 +1706,8 @@ else
     if [[ "$TARGET_BOARD" == "espressif-esp32p4" || -n "$CLI_STAGE_DIR" ]]; then
         log_skip "NFSv4 vault server skipped on ${TARGET_BOARD} (${TARGET_ARCH}, media=${STORAGE_MEDIA})"
     else
-        if systemctl is-active --quiet nfs-server.service 2>/dev/null || systemctl is-active --quiet nfs-kernel-server 2>/dev/null; then
-            systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
-            log_ok "Disabled nfs-kernel-server for ${NODE_ROLE} isolation"
-        fi
-        if systemctl is-active --quiet nfs-ganesha.service 2>/dev/null; then
-            systemctl disable --now nfs-ganesha.service 2>/dev/null || true
-            log_ok "Disabled nfs-ganesha for ${NODE_ROLE} isolation"
-        fi
+        log_skip "NFSv4 vault server disabled (ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}; role=${NODE_ROLE})"
+        _brak_disable_nfs_server
     fi
 fi
 
@@ -1417,10 +1728,16 @@ if [[ "$CLI_WITH_DEEPTUNE" == "true" ]]; then
     brak_prog 93 "Stage 5D: Silicon & OS Extreme DeepTune (--tune ${RESOLVED_TUNE})" 0 "Launching rvdk deeptune --tune ${RESOLVED_TUNE}..."
     log_step "5D. RVDK Silicon & OS Extreme DeepTune (Role: ${NODE_ROLE} -> --tune ${RESOLVED_TUNE})"
     if [[ "$TARGET_BOARD" == "espressif-esp32p4" ]]; then
+        _brak_resolve_board_slug
         _dt_stage_args=()
         [[ -n "$CLI_STAGE_DIR" ]] && _dt_stage_args=(--stage-dir "$CLI_STAGE_DIR")
         run_rvdk bsp/espressif/esp32p4/deeptune.sh --tune "$RESOLVED_TUNE" ${_dt_stage_args[@]+"${_dt_stage_args[@]}"}
-        run_rvdk boards/waveshare/esp32-p4-wifi6/deeptune.sh --tune "$RESOLVED_TUNE" ${_dt_stage_args[@]+"${_dt_stage_args[@]}"}
+        _dt_board_script="boards/${BOARD_SLUG}/deeptune.sh"
+        if _brak_has_rvdk_script "$_dt_board_script"; then
+            run_rvdk "$_dt_board_script" --tune "$RESOLVED_TUNE" ${_dt_stage_args[@]+"${_dt_stage_args[@]}"}
+        else
+            log_skip "No matching RVDK board script '${_dt_board_script}' (BOARD_SLUG=${BOARD_SLUG}); skipping board-specific DeepTune"
+        fi
     else
         run_rvdk deeptune --tune "$RESOLVED_TUNE"
     fi
@@ -1480,9 +1797,14 @@ else
         CPU_CLOCK_INFO="${CPU_GOV} (${CPU_HARTS} Harts)"
     fi
 
-    NVME_SHORT="$(basename "$NVME_DEV")"
-    LBA_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
-    NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "unmounted")"
+    if _brak_should_skip_accel_nvme "$NODE_ROLE" "$ENABLE_POSTGRES" "$ENABLE_NFS_SERVER" "$NVME_DEV"; then
+        LBA_SZ="n/a (accelerator-only, no NVMe)"
+        NVME_MNT_INFO="n/a (accelerator-only)"
+    else
+        NVME_SHORT="$(basename "$NVME_DEV")"
+        LBA_SZ="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
+        NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "unmounted")"
+    fi
     NFS_LV_MNT_INFO=""
     if mountpoint -q "$NFS_MOUNT_POINT" 2>/dev/null; then
         NFS_LV_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$NFS_MOUNT_POINT" 2>/dev/null || true)"
@@ -1538,7 +1860,11 @@ else
     printf "  • CarrierPigeons Role: %s\n" "$PIGEON_ROLE"
     printf "  • Kernel / Arch      : %s (%s)\n" "$(uname -r)" "$(uname -m)"
     printf "  • CPU Governor/Clock : %s\n" "$CPU_CLOCK_INFO"
-    printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"
+    if [[ "$LBA_SZ" =~ ^[0-9]+$ ]]; then
+        printf "  • NVMe LBA Block Sz  : %s bytes\n" "$LBA_SZ"
+    else
+        printf "  • NVMe LBA Block Sz  : %s\n" "$LBA_SZ"
+    fi
     printf "  • Hot NVMe Mount     : %s\n" "$NVME_MNT_INFO"
     [[ -n "$NFS_LV_MNT_INFO" ]] && printf "  • Dedicated NFS LV   : %s\n" "$NFS_LV_MNT_INFO"
     [[ -n "$LVM_POOL_INFO" ]]   && printf "  • LVM Elastic Pool   : %s\n" "$LVM_POOL_INFO"

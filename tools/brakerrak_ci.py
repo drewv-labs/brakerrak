@@ -207,6 +207,18 @@ FORBIDDEN_RULES: tuple[ForbiddenRule, ...] = (
         description="Personal macOS home directory literal (/Users/drew)",
         pattern=re.compile(r"/Users/drew\b", re.IGNORECASE),
     ),
+    ForbiddenRule(
+        description="Downstream astro literal (astrophotograph/telescope)",
+        pattern=re.compile(r"astrophotograph|telescope", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Forbidden dataframe import (import/from pandas)",
+        pattern=re.compile(r"\b(?:import|from)\s+pandas\b", re.IGNORECASE),
+    ),
+    ForbiddenRule(
+        description="Tailscale CGNAT IPv4 literal (100.64-127.x)",
+        pattern=re.compile(r"(?<![0-9.])100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\."),
+    ),
 )
 
 SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")

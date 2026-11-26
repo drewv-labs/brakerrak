@@ -163,7 +163,10 @@ Options:
   --randomize-order       Deterministically shuffle pass order per iteration
   --seed <int>            Integer PRNG seed for --randomize-order (default: UTC epoch if omitted)
   --cooldown-sec <int>    Cooldown sleep in seconds between passes (default: 0)
+  --autovacuum-timeout-sec <int>
+                          Max seconds to wait for active autovacuum on target table (default: 60)
   --require-governor <g>  Require active CPU scaling governor (e.g., performance)
+  --allow-fixed-clock     Allow --require-governor to pass with warning when cpufreq is unavailable
   --with-direct-io        Set debug_io_direct = 'data' for passes and restore on teardown
   --nvme-dev <path>       Block device for /proc/diskstats (default: node.env NVME_DEV or auto)
   --snap-dir <dir>        Snapshot root dir (default: ~/.brakerrak/snapshots)
@@ -171,6 +174,7 @@ Options:
   --pg-user <user>        PostgreSQL superuser role (default: postgres)
   --pg-service <unit>     PostgreSQL systemd unit name (default: postgresql)
   --warm-cache            Run an isolated pg_prewarm warm-cache phase after cold-cache passes
+  --allow-warm-spill      Allow --warm-cache even when relation+indexes exceed shared_buffers
   --analyze               Run analyze_showdown.py automatically upon completion
   -h, --help              Show this help message and exit
 EOF
@@ -238,6 +242,350 @@ json_num_or_null() {
     fi
 }
 
+atomic_write_from_stdin() {
+    local target="$1"
+    if declare -F brak_atomic_write >/dev/null 2>&1; then
+        brak_atomic_write "$target" 0644
+    else
+        local dir base tmp_f
+        dir="$(dirname "$target")"
+        base="$(basename "$target")"
+        mkdir -p "$dir"
+        tmp_f="$(mktemp "${dir}/.${base}.tmp.XXXXXX")"
+        cat > "$tmp_f"
+        chmod 0644 "$tmp_f"
+        mv -f "$tmp_f" "$target"
+    fi
+}
+
+# ==============================================================================
+# System, Thermal, Storage & Governor Provenance Probes
+# ==============================================================================
+_cpu_is_online() {
+    local cpu_dir="$1"
+    if [[ -r "${cpu_dir}/online" ]]; then
+        local on_val
+        on_val="$(tr -d '[:space:]' < "${cpu_dir}/online" 2>/dev/null || true)"
+        [[ "$on_val" == "1" ]]
+        return $?
+    fi
+    return 0
+}
+
+detect_scaling_governor() {
+    local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
+    local cpu_dir cpu_name gov_file gov
+    local -a govs=()
+    for cpu_dir in "${sys_root}/devices/system/cpu"/cpu[0-9]*; do
+        [[ -d "$cpu_dir" ]] || continue
+        cpu_name="$(basename "$cpu_dir")"
+        [[ "$cpu_name" =~ ^cpu[0-9]+$ ]] || continue
+        _cpu_is_online "$cpu_dir" || continue
+        gov_file="${cpu_dir}/cpufreq/scaling_governor"
+        if [[ -r "$gov_file" ]]; then
+            gov="$(tr -d '[:space:]' < "$gov_file" 2>/dev/null || true)"
+            if [[ -n "$gov" ]]; then
+                govs+=("$gov")
+            fi
+        fi
+    done
+    if (( ${#govs[@]} == 0 )); then
+        printf 'unavailable'
+        return 0
+    fi
+    local uniq_csv
+    uniq_csv="$(printf '%s\n' "${govs[@]}" | LC_ALL=C sort -u | awk 'NR==1{out=$0;next}{out=out","$0} END{print out}')"
+    printf '%s' "${uniq_csv:-unavailable}"
+}
+
+detect_cpu_mhz_stats() {
+    local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
+    local cpu_dir cpu_name freq_file khz
+    local -a khz_vals=()
+    for cpu_dir in "${sys_root}/devices/system/cpu"/cpu[0-9]*; do
+        [[ -d "$cpu_dir" ]] || continue
+        cpu_name="$(basename "$cpu_dir")"
+        [[ "$cpu_name" =~ ^cpu[0-9]+$ ]] || continue
+        _cpu_is_online "$cpu_dir" || continue
+        khz=""
+        for freq_file in "${cpu_dir}/cpufreq/scaling_cur_freq" "${cpu_dir}/cpufreq/cpuinfo_cur_freq"; do
+            if [[ -r "$freq_file" ]]; then
+                khz="$(tr -d '[:space:]' < "$freq_file" 2>/dev/null || true)"
+                if [[ "$khz" =~ ^[0-9]+$ ]] && (( khz > 0 )); then
+                    khz_vals+=("$khz")
+                    break
+                fi
+                khz=""
+            fi
+        done
+    done
+    if (( ${#khz_vals[@]} > 0 )); then
+        printf '%s\n' "${khz_vals[@]}" | awk '
+            BEGIN { min=-1; max=0; sum=0; n=0 }
+            { m=$1/1000.0; if (min<0 || m<min) min=m; if (m>max) max=m; sum+=m; n++ }
+            END { if (n>0) printf "%.2f %.2f %.2f", sum/n, min, max; else printf "null null null" }
+        '
+        return 0
+    fi
+    if [[ -r /proc/cpuinfo ]]; then
+        local cpuinfo_stats
+        cpuinfo_stats="$(awk -F: '
+            /^cpu MHz[[:space:]]*:/ {
+                gsub(/[[:space:]]/, "", $2)
+                if ($2 ~ /^[0-9]+(\.[0-9]+)?$/ && ($2 + 0) > 0) {
+                    m = $2 + 0
+                    if (min < 0 || m < min) min = m
+                    if (m > max) max = m
+                    sum += m
+                    n++
+                }
+            }
+            END { if (n > 0) printf "%.2f %.2f %.2f", sum / n, min, max }
+        ' /proc/cpuinfo 2>/dev/null || true)"
+        if [[ -n "$cpuinfo_stats" ]]; then
+            printf '%s' "$cpuinfo_stats"
+            return 0
+        fi
+    fi
+    if command -v lscpu >/dev/null 2>&1; then
+        local lscpu_mhz
+        lscpu_mhz="$(lscpu 2>/dev/null | awk -F: '/CPU (max )?MHz:/ { gsub(/[^0-9.]/, "", $2); if ($2 != "") { printf "%.2f", $2; exit } }' || true)"
+        if [[ -n "$lscpu_mhz" ]]; then
+            printf '%s %s %s' "$lscpu_mhz" "$lscpu_mhz" "$lscpu_mhz"
+            return 0
+        fi
+    fi
+    printf 'null null null'
+}
+
+detect_cpu_mhz() {
+    local mode="${1:-}"
+    local mean_mhz min_mhz max_mhz
+    read -r mean_mhz min_mhz max_mhz <<< "$(detect_cpu_mhz_stats)"
+    if [[ "$mode" == "--range" ]]; then
+        if [[ "$min_mhz" == "null" || "$max_mhz" == "null" ]]; then
+            printf 'null'
+        elif [[ "$min_mhz" == "$max_mhz" ]]; then
+            printf '%s' "$min_mhz"
+        else
+            printf '%s..%s' "$min_mhz" "$max_mhz"
+        fi
+        return 0
+    fi
+    printf '%s' "$mean_mhz"
+}
+
+detect_soc_temp_c() {
+    local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
+    local hw hname tf htemp tz ztype ztemp
+    for hw in "${sys_root}/class/hwmon"/hwmon*; do
+        [[ -d "$hw" && -r "${hw}/name" ]] || continue
+        hname="$(tr -d '[:space:]' < "${hw}/name" 2>/dev/null || true)"
+        if grep -qiE '(pvt|sfctemp|soc|cpu|k10temp|starfive|eswin)' <<< "$hname"; then
+            if [[ -r "${hw}/temp1_input" ]]; then
+                htemp="$(tr -d '[:space:]' < "${hw}/temp1_input" 2>/dev/null || true)"
+                if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
+                    awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+                    return 0
+                fi
+            fi
+            for tf in "${hw}"/temp*_input; do
+                [[ -r "$tf" ]] || continue
+                htemp="$(tr -d '[:space:]' < "$tf" 2>/dev/null || true)"
+                if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
+                    awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+                    return 0
+                fi
+            done
+        fi
+    done
+    for tz in "${sys_root}/class/thermal"/thermal_zone*; do
+        [[ -d "$tz" ]] || continue
+        if [[ -r "${tz}/type" && -r "${tz}/temp" ]]; then
+            ztype="$(tr -d '[:space:]' < "${tz}/type" 2>/dev/null || true)"
+            ztemp="$(tr -d '[:space:]' < "${tz}/temp" 2>/dev/null || true)"
+            if [[ "$ztemp" =~ ^-?[0-9]+$ ]] && grep -qiE '(pvt|sfctemp|soc|cpu|package|core|k10temp|starfive|eswin|die)' <<< "$ztype"; then
+                awk -v t="$ztemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+                return 0
+            fi
+        fi
+    done
+    if [[ -r "${sys_root}/class/thermal/thermal_zone0/temp" ]]; then
+        ztemp="$(tr -d '[:space:]' < "${sys_root}/class/thermal/thermal_zone0/temp" 2>/dev/null || true)"
+        if [[ "$ztemp" =~ ^-?[0-9]+$ ]]; then
+            awk -v t="$ztemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+            return 0
+        fi
+    fi
+    printf 'null'
+}
+
+detect_nvme_temp_c() {
+    local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
+    local nvme_short="${NVME_SHORT:-nvme0n1}"
+    local hw hname htemp
+    for hw in "${sys_root}/block/${nvme_short}/device/hwmon"/hwmon* "${sys_root}/block/${nvme_short}/device/device/hwmon"/hwmon*; do
+        if [[ -r "${hw}/temp1_input" ]]; then
+            htemp="$(tr -d '[:space:]' < "${hw}/temp1_input" 2>/dev/null || true)"
+            if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
+                awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+                return 0
+            fi
+        fi
+    done
+    for hw in "${sys_root}/class/hwmon"/hwmon*; do
+        [[ -r "${hw}/name" && -r "${hw}/temp1_input" ]] || continue
+        hname="$(tr -d '[:space:]' < "${hw}/name" 2>/dev/null || true)"
+        if [[ "$hname" == "nvme" ]]; then
+            htemp="$(tr -d '[:space:]' < "${hw}/temp1_input" 2>/dev/null || true)"
+            if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
+                awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
+                return 0
+            fi
+        fi
+    done
+    printf 'null'
+}
+
+detect_loadavg() {
+    if [[ -r /proc/loadavg ]]; then
+        awk '{ printf "%s %s %s", $1, $2, $3 }' /proc/loadavg 2>/dev/null || printf 'unavailable'
+    else
+        printf 'unavailable'
+    fi
+}
+
+detect_nvme_logical_block_size() {
+    local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
+    local nvme_short="${NVME_SHORT:-nvme0n1}"
+    local lbs_file="${sys_root}/block/${nvme_short}/queue/logical_block_size"
+    if [[ -r "$lbs_file" ]]; then
+        local lbs
+        lbs="$(tr -d '[:space:]' < "$lbs_file" 2>/dev/null || true)"
+        if [[ "$lbs" =~ ^[0-9]+$ ]]; then
+            printf '%s' "$lbs"
+            return 0
+        fi
+    fi
+    printf 'null'
+}
+
+validate_scaling_governor() {
+    local gov="${1:-${SCALING_GOVERNOR:-unavailable}}"
+    local req="${2:-${REQUIRE_GOVERNOR:-}}"
+    local allow_fixed="${3:-${ALLOW_FIXED_CLOCK:-false}}"
+    if [[ -n "$req" ]]; then
+        if [[ "$gov" == "unavailable" || "$gov" == "unknown" ]]; then
+            if [[ "$allow_fixed" == "true" ]]; then
+                log_warn "CPU cpufreq scaling_governor is ${gov} (fixed-clock host); continuing due to --allow-fixed-clock while --require-governor=${req}."
+            else
+                log_fatal "CPU cpufreq scaling_governor is '${gov}'; --require-governor=${req} failed (pass --allow-fixed-clock for fixed-clock platforms without cpufreq)."
+            fi
+        elif [[ "$gov" != "$req" ]]; then
+            log_fatal "Active CPU scaling_governor is '${gov}', expected '${req}' (--require-governor)."
+        else
+            log_ok "CPU scaling_governor='${gov}' matches requirement."
+        fi
+    elif [[ "$gov" != "unavailable" && "$gov" != "unknown" && "$gov" != "performance" ]]; then
+        log_warn "Active CPU scaling_governor is '${gov}' (recommended: 'performance' for low-jitter benchmarking)."
+    fi
+}
+
+check_warm_cache_fit() {
+    local enforce_fail="${1:-false}"
+    local rel_bytes="${TOTAL_REL_BYTES:-}"
+    local sb_bytes="${PG_SHARED_BUFFERS_BYTES:-}"
+    local table_name="${TABLE_NAME:-brakerrak_io_torture}"
+    local allow_spill="${ALLOW_WARM_SPILL:-false}"
+
+    if [[ "$enforce_fail" != "true" ]]; then
+        PREWARM_FIT_SHARED_BUFFERS="null"
+        return 0
+    fi
+
+    if [[ "$rel_bytes" =~ ^[0-9]+$ && "$sb_bytes" =~ ^[0-9]+$ ]]; then
+        if (( rel_bytes <= sb_bytes )); then
+            PREWARM_FIT_SHARED_BUFFERS="true"
+        else
+            PREWARM_FIT_SHARED_BUFFERS="false"
+            if [[ "$allow_spill" == "true" ]]; then
+                log_warn "Relation '${table_name}' (${rel_bytes} B) exceeds shared_buffers (${sb_bytes} B); continuing due to --allow-warm-spill (prewarm_fit_shared_buffers=false)."
+            else
+                log_fatal "Relation '${table_name}' (${rel_bytes} B) exceeds shared_buffers (${sb_bytes} B); warm-cache pass cannot fit in shared_buffers (pass --allow-warm-spill to permit partial spill)."
+            fi
+        fi
+    else
+        PREWARM_FIT_SHARED_BUFFERS="null"
+    fi
+}
+
+run_psql() {
+    local target_db="$1"
+    shift
+    local pg_user="${PG_USER:-postgres}"
+    if [[ "$(id -un)" == "$pg_user" ]]; then
+        psql -X -U "$pg_user" -d "$target_db" -v ON_ERROR_STOP=1 "$@"
+    else
+        sudo -u "$pg_user" psql -X -U "$pg_user" -d "$target_db" -v ON_ERROR_STOP=1 "$@"
+    fi
+}
+
+reset_pg_stats() {
+    run_psql "${DB_NAME:-brakerrak}" -q -c "SELECT pg_stat_reset(); SELECT pg_stat_reset_shared('io');"
+}
+
+count_active_autovacuum_on_table() {
+    local db_name="${DB_NAME:-brakerrak}"
+    local tbl="${TABLE_NAME:-brakerrak_io_torture}"
+    local out
+    out="$(run_psql "$db_name" -v tbl="$tbl" -tA <<'SQL' 2>/dev/null || echo "0"
+SELECT count(*)
+FROM pg_stat_activity
+WHERE backend_type = 'autovacuum worker'
+  AND datname = current_database()
+  AND (
+    query ~ ('(^|[^a-zA-Z0-9_])' || :'tbl' || '([^a-zA-Z0-9_]|$)')
+    OR EXISTS (
+      SELECT 1
+      FROM pg_locks l
+      WHERE l.pid = pg_stat_activity.pid
+        AND l.relation = to_regclass('"' || :'tbl' || '"')
+    )
+  );
+SQL
+)"
+    out="$(tr -d '[:space:]' <<< "$out")"
+    printf '%s' "${out:-0}"
+}
+
+wait_for_autovacuum_clear() {
+    local db_name="${DB_NAME:-brakerrak}"
+    local tbl="${TABLE_NAME:-brakerrak_io_torture}"
+    local timeout_sec="${AUTOVACUUM_WAIT_TIMEOUT_SEC:-60}"
+    local poll_sec="${BRAKERRAK_AUTOVACUUM_POLL_SEC:-1}"
+    local active_av waited=0
+    active_av="$(count_active_autovacuum_on_table)"
+    if [[ ! "$active_av" =~ ^[1-9][0-9]*$ ]]; then
+        return 0
+    fi
+    log_warn "Active autovacuum worker(s) (${active_av}) detected on '${db_name}.${tbl}'; waiting up to ${timeout_sec}s before timing..."
+    while (( waited < timeout_sec )); do
+        sleep "$poll_sec"
+        waited=$(( waited + 1 ))
+        active_av="$(count_active_autovacuum_on_table)"
+        if [[ ! "$active_av" =~ ^[1-9][0-9]*$ ]]; then
+            log_ok "Autovacuum worker(s) cleared on '${db_name}.${tbl}' after ${waited}s; resetting pg_stat_io."
+            reset_pg_stats
+            return 0
+        fi
+    done
+    log_warn "Autovacuum worker(s) (${active_av}) still active on '${db_name}.${tbl}' after ${timeout_sec}s; proceeding with benchmark pass."
+}
+
+if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]] && [[ "${BRAKERRAK_SHOWDOWN_PROBES_ONLY:-false}" == "true" ]]; then
+    return 0
+fi
+
 HARTS="$(detect_cpu_harts)"
 DB_NAME="${DB_NAME:-brakerrak}"
 TABLE_NAME="${TABLE_NAME:-brakerrak_io_torture}"
@@ -250,7 +598,9 @@ ITERATIONS="${ITERATIONS:-3}"
 RANDOMIZE_ORDER="${RANDOMIZE_ORDER:-false}"
 PRNG_SEED="${PRNG_SEED:-}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-0}"
+AUTOVACUUM_WAIT_TIMEOUT_SEC="${AUTOVACUUM_WAIT_TIMEOUT_SEC:-60}"
 REQUIRE_GOVERNOR="${REQUIRE_GOVERNOR:-}"
+ALLOW_FIXED_CLOCK="${ALLOW_FIXED_CLOCK:-false}"
 WITH_DIRECT_IO="${WITH_DIRECT_IO:-false}"
 NVME_DEV="${NVME_DEV:-}"
 SNAP_DIR="${SNAP_DIR:-${REAL_HOME}/.brakerrak/snapshots}"
@@ -258,6 +608,7 @@ RUN_ID="${RUN_ID:-}"
 PG_USER="${PG_USER:-postgres}"
 PG_SERVICE="${PG_SERVICE:-postgresql}"
 WARM_CACHE="${WARM_CACHE:-false}"
+ALLOW_WARM_SPILL="${ALLOW_WARM_SPILL:-false}"
 AUTO_ANALYZE="${AUTO_ANALYZE:-false}"
 
 while [[ $# -gt 0 ]]; do
@@ -376,6 +727,16 @@ while [[ $# -gt 0 ]]; do
             brak_require_arg "--cooldown-sec" "$COOLDOWN_SEC"
             shift
             ;;
+        --autovacuum-timeout-sec)
+            brak_require_arg "$1" "${2:-}"
+            AUTOVACUUM_WAIT_TIMEOUT_SEC="$2"
+            shift 2
+            ;;
+        --autovacuum-timeout-sec=*)
+            AUTOVACUUM_WAIT_TIMEOUT_SEC="${1#*=}"
+            brak_require_arg "--autovacuum-timeout-sec" "$AUTOVACUUM_WAIT_TIMEOUT_SEC"
+            shift
+            ;;
         --require-governor)
             brak_require_arg "$1" "${2:-}"
             REQUIRE_GOVERNOR="$2"
@@ -384,6 +745,14 @@ while [[ $# -gt 0 ]]; do
         --require-governor=*)
             REQUIRE_GOVERNOR="${1#*=}"
             brak_require_arg "--require-governor" "$REQUIRE_GOVERNOR"
+            shift
+            ;;
+        --allow-fixed-clock)
+            ALLOW_FIXED_CLOCK="true"
+            shift
+            ;;
+        --no-allow-fixed-clock)
+            ALLOW_FIXED_CLOCK="false"
             shift
             ;;
         --with-direct-io)
@@ -448,6 +817,14 @@ while [[ $# -gt 0 ]]; do
             WARM_CACHE="true"
             shift
             ;;
+        --allow-warm-spill)
+            ALLOW_WARM_SPILL="true"
+            shift
+            ;;
+        --no-allow-warm-spill)
+            ALLOW_WARM_SPILL="false"
+            shift
+            ;;
         --analyze)
             AUTO_ANALYZE="true"
             shift
@@ -477,10 +854,13 @@ fi
 if [[ ! "$COOLDOWN_SEC" =~ ^[0-9]+$ ]]; then
     log_fatal "Invalid --cooldown-sec '${COOLDOWN_SEC}': must be a non-negative integer"
 fi
+if [[ ! "$AUTOVACUUM_WAIT_TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
+    log_fatal "Invalid --autovacuum-timeout-sec '${AUTOVACUUM_WAIT_TIMEOUT_SEC}': must be a non-negative integer"
+fi
 if [[ -n "$REQUIRE_GOVERNOR" && ! "$REQUIRE_GOVERNOR" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     log_fatal "Invalid --require-governor '${REQUIRE_GOVERNOR}': must match ^[a-zA-Z0-9_-]+$"
 fi
-for bool_var in SYNC_ZERO_BASELINE WARM_CACHE AUTO_ANALYZE WITH_DIRECT_IO RANDOMIZE_ORDER; do
+for bool_var in SYNC_ZERO_BASELINE WARM_CACHE ALLOW_WARM_SPILL AUTO_ANALYZE WITH_DIRECT_IO RANDOMIZE_ORDER ALLOW_FIXED_CLOCK; do
     bool_val="${!bool_var}"
     if [[ ! "$bool_val" =~ ^(true|false)$ ]]; then
         log_fatal "Invalid ${bool_var}='${bool_val}': must be 'true' or 'false'"
@@ -532,12 +912,6 @@ for req_bin in systemctl psql sudo; do
         log_fatal "Required command '${req_bin}' not found in PATH."
     fi
 done
-
-run_psql() {
-    local target_db="$1"
-    shift
-    sudo -u "$PG_USER" psql -X -U "$PG_USER" -d "$target_db" -v ON_ERROR_STOP=1 "$@"
-}
 
 wait_for_postgres_ready() {
     local attempts="${1:-60}"
@@ -735,117 +1109,8 @@ else
 fi
 
 # ==============================================================================
-# System, Thermal, Storage & Governor Provenance Probes
+# Mount Provenance Helper & Pre-Flight System Checks
 # ==============================================================================
-detect_scaling_governor() {
-    local gov_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-    if [[ -r "$gov_file" ]]; then
-        local gov
-        gov="$(tr -d '[:space:]' < "$gov_file" 2>/dev/null || true)"
-        printf '%s' "${gov:-unavailable}"
-    else
-        printf 'unavailable'
-    fi
-}
-
-detect_cpu_mhz() {
-    local freq_file="/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"
-    if [[ -r "$freq_file" ]]; then
-        local khz
-        khz="$(tr -d '[:space:]' < "$freq_file" 2>/dev/null || true)"
-        if [[ "$khz" =~ ^[0-9]+$ ]]; then
-            awk -v k="$khz" 'BEGIN { printf "%.2f", k / 1000.0 }'
-            return 0
-        fi
-    fi
-    if [[ -r /proc/cpuinfo ]]; then
-        local mhz
-        mhz="$(awk -F: '/^cpu MHz[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); if ($2 ~ /^[0-9]+(\.[0-9]+)?$/) { printf "%.2f", $2; exit } }' /proc/cpuinfo 2>/dev/null || true)"
-        if [[ -n "$mhz" ]]; then
-            printf '%s' "$mhz"
-            return 0
-        fi
-    fi
-    if command -v lscpu >/dev/null 2>&1; then
-        local lscpu_mhz
-        lscpu_mhz="$(lscpu 2>/dev/null | awk -F: '/CPU (max )?MHz:/ { gsub(/[^0-9.]/, "", $2); if ($2 != "") { printf "%.2f", $2; exit } }' || true)"
-        if [[ -n "$lscpu_mhz" ]]; then
-            printf '%s' "$lscpu_mhz"
-            return 0
-        fi
-    fi
-    printf 'null'
-}
-
-detect_soc_temp_c() {
-    local tz ztype ztemp
-    for tz in /sys/class/thermal/thermal_zone*; do
-        [[ -d "$tz" ]] || continue
-        if [[ -r "${tz}/type" && -r "${tz}/temp" ]]; then
-            ztype="$(tr -d '[:space:]' < "${tz}/type" 2>/dev/null || true)"
-            ztemp="$(tr -d '[:space:]' < "${tz}/temp" 2>/dev/null || true)"
-            if [[ "$ztemp" =~ ^-?[0-9]+$ ]] && grep -qiE '(soc|cpu|package|core|k10temp|starfive|eswin|die)' <<< "$ztype"; then
-                awk -v t="$ztemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
-                return 0
-            fi
-        fi
-    done
-    if [[ -r /sys/class/thermal/thermal_zone0/temp ]]; then
-        ztemp="$(tr -d '[:space:]' < /sys/class/thermal/thermal_zone0/temp 2>/dev/null || true)"
-        if [[ "$ztemp" =~ ^-?[0-9]+$ ]]; then
-            awk -v t="$ztemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
-            return 0
-        fi
-    fi
-    printf 'null'
-}
-
-detect_nvme_temp_c() {
-    local hw hname htemp
-    for hw in /sys/block/"${NVME_SHORT}"/device/hwmon/hwmon* /sys/block/"${NVME_SHORT}"/device/device/hwmon/hwmon*; do
-        if [[ -r "${hw}/temp1_input" ]]; then
-            htemp="$(tr -d '[:space:]' < "${hw}/temp1_input" 2>/dev/null || true)"
-            if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
-                awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
-                return 0
-            fi
-        fi
-    done
-    for hw in /sys/class/hwmon/hwmon*; do
-        [[ -r "${hw}/name" && -r "${hw}/temp1_input" ]] || continue
-        hname="$(tr -d '[:space:]' < "${hw}/name" 2>/dev/null || true)"
-        if [[ "$hname" == "nvme" ]]; then
-            htemp="$(tr -d '[:space:]' < "${hw}/temp1_input" 2>/dev/null || true)"
-            if [[ "$htemp" =~ ^-?[0-9]+$ ]]; then
-                awk -v t="$htemp" 'BEGIN { printf "%.2f", t / 1000.0 }'
-                return 0
-            fi
-        fi
-    done
-    printf 'null'
-}
-
-detect_loadavg() {
-    if [[ -r /proc/loadavg ]]; then
-        awk '{ printf "%s %s %s", $1, $2, $3 }' /proc/loadavg 2>/dev/null || printf 'unavailable'
-    else
-        printf 'unavailable'
-    fi
-}
-
-detect_nvme_logical_block_size() {
-    local lbs_file="/sys/block/${NVME_SHORT}/queue/logical_block_size"
-    if [[ -r "$lbs_file" ]]; then
-        local lbs
-        lbs="$(tr -d '[:space:]' < "$lbs_file" 2>/dev/null || true)"
-        if [[ "$lbs" =~ ^[0-9]+$ ]]; then
-            printf '%s' "$lbs"
-            return 0
-        fi
-    fi
-    printf 'null'
-}
-
 detect_pg_mount_field() {
     local field="$1"
     if command -v findmnt >/dev/null 2>&1; then
@@ -854,19 +1119,9 @@ detect_pg_mount_field() {
 }
 
 SCALING_GOVERNOR="$(detect_scaling_governor)"
-if [[ -n "$REQUIRE_GOVERNOR" ]]; then
-    if [[ "$SCALING_GOVERNOR" == "unavailable" || "$SCALING_GOVERNOR" == "unknown" ]]; then
-        log_warn "CPU cpufreq scaling_governor is unavailable on this host; cannot verify --require-governor=${REQUIRE_GOVERNOR}."
-    elif [[ "$SCALING_GOVERNOR" != "$REQUIRE_GOVERNOR" ]]; then
-        log_fatal "Active CPU scaling_governor is '${SCALING_GOVERNOR}', expected '${REQUIRE_GOVERNOR}' (--require-governor)."
-    else
-        log_ok "CPU scaling_governor='${SCALING_GOVERNOR}' matches requirement."
-    fi
-elif [[ "$SCALING_GOVERNOR" != "unavailable" && "$SCALING_GOVERNOR" != "unknown" && "$SCALING_GOVERNOR" != "performance" ]]; then
-    log_warn "Active CPU scaling_governor is '${SCALING_GOVERNOR}' (recommended: 'performance' for low-jitter benchmarking)."
-fi
+validate_scaling_governor "$SCALING_GOVERNOR" "$REQUIRE_GOVERNOR" "$ALLOW_FIXED_CLOCK"
 
-PRE_CPU_MHZ="$(detect_cpu_mhz)"
+read -r PRE_CPU_MHZ PRE_CPU_MHZ_MIN PRE_CPU_MHZ_MAX <<< "$(detect_cpu_mhz_stats)"
 PRE_SOC_TEMP_C="$(detect_soc_temp_c)"
 PRE_NVME_TEMP_C="$(detect_nvme_temp_c)"
 PRE_LOADAVG="$(detect_loadavg)"
@@ -883,17 +1138,7 @@ PG_IO_COMBINE_LIMIT="$(run_psql "$DB_NAME" -tAc "SHOW io_combine_limit;" 2>/dev/
 PG_IO_MAX_CONCURRENCY="$(run_psql "$DB_NAME" -tAc "SHOW io_max_concurrency;" 2>/dev/null || echo "unknown")"
 TOTAL_REL_BYTES="$(run_psql "$DB_NAME" -tAc "SELECT pg_total_relation_size('\"${TABLE_NAME}\"'::regclass);" 2>/dev/null || echo "")"
 
-PREWARM_FIT_SHARED_BUFFERS="null"
-if [[ "$TOTAL_REL_BYTES" =~ ^[0-9]+$ && "$PG_SHARED_BUFFERS_BYTES" =~ ^[0-9]+$ ]]; then
-    if (( TOTAL_REL_BYTES <= PG_SHARED_BUFFERS_BYTES )); then
-        PREWARM_FIT_SHARED_BUFFERS="true"
-    else
-        PREWARM_FIT_SHARED_BUFFERS="false"
-        if [[ "$WARM_CACHE" == "true" ]]; then
-            log_warn "Relation '${TABLE_NAME}' (${TOTAL_REL_BYTES} B) exceeds shared_buffers (${PG_SHARED_BUFFERS_BYTES} B); warm-cache passes cannot fit entirely in shared_buffers."
-        fi
-    fi
-fi
+check_warm_cache_fit "$WARM_CACHE"
 
 # ==============================================================================
 # Dynamic Hardware/Software PMU Event Probing via `perf list`
@@ -1069,7 +1314,7 @@ DT_MODEL="$(tr -d '\0' </proc/device-tree/model 2>/dev/null || uname -m)"
 CAPTURED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 CAPTURED_EPOCH="$(date -u +%s)"
 
-cat > "${RUN_DIR}/metadata.json" <<EOF
+atomic_write_from_stdin "${RUN_DIR}/metadata.json" <<EOF
 {
   "schema_version": "drewv-ctd-benchmark/v1.0",
   "run_id": "$(json_escape "$RUN_ID")",
@@ -1093,10 +1338,15 @@ cat > "${RUN_DIR}/metadata.json" <<EOF
   "randomize_order": ${RANDOMIZE_ORDER},
   "prng_seed": $(json_num_or_null "${PRNG_SEED}"),
   "cooldown_sec": ${COOLDOWN_SEC},
+  "autovacuum_wait_timeout_sec": ${AUTOVACUUM_WAIT_TIMEOUT_SEC},
   "require_governor": "$(json_escape "$REQUIRE_GOVERNOR")",
+  "allow_fixed_clock": ${ALLOW_FIXED_CLOCK},
+  "allow_warm_spill": ${ALLOW_WARM_SPILL},
   "with_direct_io": ${WITH_DIRECT_IO},
   "scaling_governor": "$(json_escape "$SCALING_GOVERNOR")",
   "cpu_mhz": $(json_num_or_null "$PRE_CPU_MHZ"),
+  "cpu_mhz_min": $(json_num_or_null "$PRE_CPU_MHZ_MIN"),
+  "cpu_mhz_max": $(json_num_or_null "$PRE_CPU_MHZ_MAX"),
   "soc_temp_c": $(json_num_or_null "$PRE_SOC_TEMP_C"),
   "nvme_temp_c": $(json_num_or_null "$PRE_NVME_TEMP_C"),
   "loadavg": "$(json_escape "$PRE_LOADAVG")",
@@ -1186,10 +1436,6 @@ assert_pg_gucs_active() {
     fi
 }
 
-reset_pg_stats() {
-    run_psql "$DB_NAME" -q -c "SELECT pg_stat_reset(); SELECT pg_stat_reset_shared('io');"
-}
-
 # Mandatory 5-step Cold-Cache Isolation Protocol executed before EACH individual workload
 cold_cache_isolate() {
     local expected_method="$1"
@@ -1235,6 +1481,8 @@ execute_workload_pass() {
         sleep "$COOLDOWN_SEC"
     fi
 
+    wait_for_autovacuum_clear
+
     local iter_tag
     iter_tag="$(printf 'iter_%02d' "$iteration")"
     local pass_slug="${cache_mode}__${method}__eic${concurrency}__${workload}"
@@ -1252,12 +1500,16 @@ execute_workload_pass() {
     pass_io_direct="$(run_psql "$DB_NAME" -tAc "SHOW debug_io_direct;" 2>/dev/null || echo "")"
     [[ -z "$pass_io_direct" ]] && pass_io_direct="off"
 
+    local pass_governor
+    pass_governor="$(detect_scaling_governor)"
+    [[ -z "$pass_governor" ]] && pass_governor="$SCALING_GOVERNOR"
+
     log_brak "[${iter_tag}][${cache_mode}] io_method=${method} | eic=${concurrency} | io_direct=${pass_io_direct} | ${workload_label}"
 
-    local pre_soc_temp pre_nvme_temp pre_cpu_mhz
+    local pre_soc_temp pre_nvme_temp pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max
     pre_soc_temp="$(detect_soc_temp_c)"
     pre_nvme_temp="$(detect_nvme_temp_c)"
-    pre_cpu_mhz="$(detect_cpu_mhz)"
+    read -r pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
 
     local started_utc finished_utc start_ns end_ns wall_ms
     started_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -1289,10 +1541,10 @@ execute_workload_pass() {
         wall_ms="0"
     fi
 
-    local post_soc_temp post_nvme_temp post_cpu_mhz
+    local post_soc_temp post_nvme_temp post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max
     post_soc_temp="$(detect_soc_temp_c)"
     post_nvme_temp="$(detect_nvme_temp_c)"
-    post_cpu_mhz="$(detect_cpu_mhz)"
+    read -r post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
 
     run_psql "$DB_NAME" -q -t -A -c "
         SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)
@@ -1304,7 +1556,12 @@ execute_workload_pass() {
         ) t;
     " > "$pg_stat_io_file"
 
-    cat > "$meta_file" <<EOF
+    local pass_prewarm_fit="null"
+    if [[ "$cache_mode" == "warm" ]]; then
+        pass_prewarm_fit="${PREWARM_FIT_SHARED_BUFFERS:-null}"
+    fi
+
+    atomic_write_from_stdin "$meta_file" <<EOF
 {
   "run_id": "$(json_escape "$RUN_ID")",
   "node_id": "$(json_escape "$NODE_HOST")",
@@ -1320,13 +1577,21 @@ execute_workload_pass() {
   "workload": "$(json_escape "$workload")",
   "workload_label": "$(json_escape "$workload_label")",
   "nvme_short": "$(json_escape "$NVME_SHORT")",
-  "prewarm_fit_shared_buffers": ${PREWARM_FIT_SHARED_BUFFERS},
+  "scaling_governor": "$(json_escape "$pass_governor")",
+  "shared_buffers": "$(json_escape "$PG_SHARED_BUFFERS")",
+  "huge_pages_status": "$(json_escape "$PG_HUGE_PAGES_STATUS")",
+  "nvme_logical_block_size": $(json_num_or_null "$NVME_LOGICAL_BLOCK_SIZE"),
+  "prewarm_fit_shared_buffers": ${pass_prewarm_fit},
   "pre_soc_temp_c": $(json_num_or_null "$pre_soc_temp"),
   "post_soc_temp_c": $(json_num_or_null "$post_soc_temp"),
   "pre_nvme_temp_c": $(json_num_or_null "$pre_nvme_temp"),
   "post_nvme_temp_c": $(json_num_or_null "$post_nvme_temp"),
   "pre_cpu_mhz": $(json_num_or_null "$pre_cpu_mhz"),
+  "pre_cpu_mhz_min": $(json_num_or_null "$pre_cpu_mhz_min"),
+  "pre_cpu_mhz_max": $(json_num_or_null "$pre_cpu_mhz_max"),
   "post_cpu_mhz": $(json_num_or_null "$post_cpu_mhz"),
+  "post_cpu_mhz_min": $(json_num_or_null "$post_cpu_mhz_min"),
+  "post_cpu_mhz_max": $(json_num_or_null "$post_cpu_mhz_max"),
   "started_at_utc": "${started_utc}",
   "finished_at_utc": "${finished_utc}",
   "wall_duration_ms": ${wall_ms}
@@ -1352,7 +1617,9 @@ WHERE scatter_key BETWEEN 10000 AND 45000;"
 echo "======================================================================"
 echo " BrakerRak // PostgreSQL ${PG_SERVER_VERSION} Async I/O Ablation Showdown"
 echo " Node    : ${NODE_HOST} | Silicon: ${DT_MODEL} (${HARTS} Harts)"
-echo " Target  : ${DB_NAME}.${TABLE_NAME} | NVMe: ${NVME_DEV} (${NVME_SHORT})"
+echo " Clock   : governor=${SCALING_GOVERNOR} | cpu_mhz=${PRE_CPU_MHZ} (min=${PRE_CPU_MHZ_MIN}, max=${PRE_CPU_MHZ_MAX})"
+echo " Target  : ${DB_NAME}.${TABLE_NAME} | NVMe: ${NVME_DEV} (${NVME_SHORT}, lbs=${NVME_LOGICAL_BLOCK_SIZE}B)"
+echo " PG Mem  : shared_buffers=${PG_SHARED_BUFFERS} | hugepages=${PG_HUGE_PAGES_STATUS} | fit_sb=${PREWARM_FIT_SHARED_BUFFERS}"
 echo " Matrix  : methods=[${METHODS_CSV}] x eic=[${CONCURRENCIES_CSV}] | io_workers=${IO_WORKERS}"
 echo " Rigor   : iterations=${ITERATIONS} | randomize=${RANDOMIZE_ORDER} (seed=${PRNG_SEED:-none}) | cooldown=${COOLDOWN_SEC}s | direct_io=${WITH_DIRECT_IO}"
 echo " Output  : ${RUN_DIR}"
@@ -1399,18 +1666,6 @@ done
 # Phase 2 (Optional): Isolated Warm-Cache Passes via pg_prewarm
 # ==============================================================================
 prewarm_torture_relation() {
-    local sb_bytes rel_bytes
-    sb_bytes="$(run_psql "$DB_NAME" -tAc "SELECT pg_size_bytes(current_setting('shared_buffers'));" 2>/dev/null || echo "")"
-    rel_bytes="$(run_psql "$DB_NAME" -tAc "SELECT pg_total_relation_size('\"${TABLE_NAME}\"'::regclass);" 2>/dev/null || echo "")"
-    if [[ "$rel_bytes" =~ ^[0-9]+$ && "$sb_bytes" =~ ^[0-9]+$ ]]; then
-        if (( rel_bytes > sb_bytes )); then
-            PREWARM_FIT_SHARED_BUFFERS="false"
-            log_warn "Total relation+index size (${rel_bytes} B) exceeds shared_buffers (${sb_bytes} B); warm-cache pass will partially spill."
-        else
-            PREWARM_FIT_SHARED_BUFFERS="true"
-        fi
-    fi
-
     run_psql "$DB_NAME" -q -c "CREATE EXTENSION IF NOT EXISTS pg_prewarm;"
     run_psql "$DB_NAME" -q -c "SELECT pg_prewarm('\"${TABLE_NAME}\"'::regclass, 'buffer');"
 
@@ -1443,10 +1698,20 @@ warm_cache_isolate() {
     wait_for_postgres
     assert_pg_gucs_active "$expected_method" "$expected_conc"
 
-    # 2. Prewarm heap + all indexes strictly into PostgreSQL shared_buffers
+    # 2. Verify relation + indexes fit in shared_buffers unless --allow-warm-spill
+    local sb_bytes rel_bytes
+    sb_bytes="$(run_psql "$DB_NAME" -tAc "SELECT pg_size_bytes(current_setting('shared_buffers'));" 2>/dev/null || echo "")"
+    rel_bytes="$(run_psql "$DB_NAME" -tAc "SELECT pg_total_relation_size('\"${TABLE_NAME}\"'::regclass);" 2>/dev/null || echo "")"
+    if [[ "$rel_bytes" =~ ^[0-9]+$ && "$sb_bytes" =~ ^[0-9]+$ ]]; then
+        PG_SHARED_BUFFERS_BYTES="$sb_bytes"
+        TOTAL_REL_BYTES="$rel_bytes"
+        check_warm_cache_fit "true"
+    fi
+
+    # 3. Prewarm heap + all indexes strictly into PostgreSQL shared_buffers
     prewarm_torture_relation
 
-    # 3. Drop OS page cache again so any shared_buffers miss cannot hit OS page cache
+    # 4. Drop OS page cache again so any shared_buffers miss cannot hit OS page cache
     sync && echo 3 > /proc/sys/vm/drop_caches
     reset_pg_stats
 }

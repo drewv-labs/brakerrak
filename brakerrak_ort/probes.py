@@ -862,6 +862,14 @@ def inspect_btrfs_device_stats(mount_path: str, probe: SystemProbe) -> BtrfsDevi
     )
 
 
+def format_sd_partition_name(sd_name: str) -> str:
+    """Return the Linux first-partition basename for a block device, guarding empty names."""
+    cleaned = os.path.basename(sd_name.strip().rstrip("/"))
+    if not cleaned:
+        return ""
+    return f"{cleaned}p1" if cleaned[-1].isdigit() else f"{cleaned}1"
+
+
 def _coerce_int(value: Any, default: int) -> int:
     if isinstance(value, bool) or value is None:
         return default
@@ -1113,8 +1121,9 @@ class HostProxiedTelemetryProbe:
                 else bool(sd_raw.get("device") or sd_size_bytes > 0)
             )
             if sd_present:
-                sd_dev = str(sd_raw.get("device") or "/dev/mmcblk0")
-                sd_name = os.path.basename(sd_dev)
+                sd_dev_raw = str(sd_raw.get("device") or "/dev/mmcblk0").strip()
+                sd_name = os.path.basename(sd_dev_raw.rstrip("/")) or "mmcblk0"
+                sd_dev = sd_dev_raw if sd_dev_raw and sd_dev_raw != "/" else f"/dev/{sd_name}"
                 sd_bus = str(sd_raw.get("bus") or "sdmmc")
                 sd_mp = str(sd_raw["mountpoint"]) if sd_raw.get("mountpoint") else None
                 sd_fs = str(sd_raw["fstype"]) if sd_raw.get("fstype") else None
@@ -1128,7 +1137,7 @@ class HostProxiedTelemetryProbe:
                 self._existing_paths.add(f"/sys/block/{sd_name}")
                 self._files[f"/sys/block/{sd_name}/size"] = str(sd_size_bytes // 512)
 
-                part_name = f"{sd_name}p1" if not sd_name[-1].isdigit() else f"{sd_name}p1"
+                part_name = format_sd_partition_name(sd_name)
                 part_path = f"/dev/{part_name}"
                 child_entry: dict[str, Any] = {
                     "name": part_name,
@@ -1428,6 +1437,11 @@ def load_esp32p4_telemetry_probe(path: Path | str) -> HostProxiedTelemetryProbe:
     return HostProxiedTelemetryProbe(parsed)
 
 
+MAX_SERIAL_BUFFER_BYTES: int = 1_048_576
+_MAX_SERIAL_DISCARDED_BYTES: int = 16 * MAX_SERIAL_BUFFER_BYTES
+_JSON_WHITESPACE_BYTES: frozenset[int] = frozenset({0x20, 0x09, 0x0D, 0x0A})
+
+
 def _try_parse_json_object(candidate: str) -> dict[str, object] | None:
     stripped = candidate.strip()
     if not stripped:
@@ -1489,6 +1503,95 @@ def capture_serial_telemetry_json(
 
         deadline = time.monotonic() + max(0.05, timeout_sec)
         buf = bytearray()
+        total_discarded = 0
+        scan_idx = 0
+        candidate_start: int | None = None
+        awaiting_key_or_close = False
+        brace_depth = 0
+        in_string = False
+        escape = False
+
+        def _reject_candidate(*, resume_at: int) -> None:
+            nonlocal scan_idx, candidate_start, awaiting_key_or_close, brace_depth
+            nonlocal in_string, escape
+            scan_idx = resume_at
+            candidate_start = None
+            awaiting_key_or_close = False
+            brace_depth = 0
+            in_string = False
+            escape = False
+
+        def _scan_buf_for_json() -> dict[str, object] | None:
+            nonlocal scan_idx, candidate_start, awaiting_key_or_close, brace_depth
+            nonlocal in_string, escape
+            n = len(buf)
+            while scan_idx < n:
+                if candidate_start is None:
+                    next_open = buf.find(b"{", scan_idx)
+                    if next_open == -1:
+                        scan_idx = n
+                        return None
+                    candidate_start = next_open
+                    awaiting_key_or_close = True
+                    brace_depth = 1
+                    in_string = False
+                    escape = False
+                    scan_idx = next_open + 1
+                    continue
+
+                byte = buf[scan_idx]
+                if awaiting_key_or_close:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        scan_idx += 1
+                        continue
+                    if byte == 0x22:  # '"'
+                        awaiting_key_or_close = False
+                        in_string = True
+                        scan_idx += 1
+                        continue
+                    if byte == 0x7D:  # '}'
+                        awaiting_key_or_close = False
+                        brace_depth = 0
+                        scan_idx += 1
+                        snippet = buf[candidate_start:scan_idx].decode("utf-8", errors="replace")
+                        parsed_obj = _try_parse_json_object(snippet)
+                        if parsed_obj is not None:
+                            return parsed_obj
+                        _reject_candidate(resume_at=candidate_start + 1)
+                        continue
+                    # Violates RFC 8259 rule (a): object opening '{' + ws must see '"' or '}'
+                    _reject_candidate(resume_at=scan_idx)
+                    continue
+
+                if in_string:
+                    if byte < 0x20:
+                        # Violates RFC 8259 rule (b): unescaped control char inside JSON string
+                        _reject_candidate(resume_at=candidate_start + 1)
+                        continue
+                    scan_idx += 1
+                    if escape:
+                        escape = False
+                    elif byte == 0x5C:  # '\\'
+                        escape = True
+                    elif byte == 0x22:  # '"'
+                        in_string = False
+                    continue
+
+                scan_idx += 1
+                if byte == 0x22:  # '"'
+                    in_string = True
+                elif byte == 0x7B:  # '{'
+                    brace_depth += 1
+                elif byte == 0x7D:  # '}'
+                    brace_depth -= 1
+                    if brace_depth == 0:
+                        snippet = buf[candidate_start:scan_idx].decode("utf-8", errors="replace")
+                        parsed_obj = _try_parse_json_object(snippet)
+                        if parsed_obj is not None:
+                            return parsed_obj
+                        _reject_candidate(resume_at=candidate_start + 1)
+            return None
+
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1504,26 +1607,42 @@ def capture_serial_telemetry_json(
                 raise RuntimeError(f"Serial read failed on {port!r}: {exc}") from exc
 
             if not chunk:
-                tail = buf.decode("utf-8", errors="replace")
-                parsed_tail = _try_parse_json_object(tail)
-                if parsed_tail is not None:
-                    return parsed_tail
+                for _ in range(32):
+                    if candidate_start is None:
+                        break
+                    tail = buf[candidate_start:].decode("utf-8", errors="replace")
+                    parsed_tail = _try_parse_json_object(tail)
+                    if parsed_tail is not None:
+                        return parsed_tail
+                    _reject_candidate(resume_at=candidate_start + 1)
+                    parsed_next = _scan_buf_for_json()
+                    if parsed_next is not None:
+                        return parsed_next
                 break
 
-            buf.extend(chunk)
-            while b"\n" in buf:
-                line_bytes, _, rest = buf.partition(b"\n")
-                buf = bytearray(rest)
-                line_text = line_bytes.decode("utf-8", errors="replace")
-                parsed_line = _try_parse_json_object(line_text)
-                if parsed_line is not None:
-                    return parsed_line
+            if len(buf) + len(chunk) > MAX_SERIAL_BUFFER_BYTES:
+                raise ValueError(
+                    f"Serial telemetry buffer exceeded {MAX_SERIAL_BUFFER_BYTES} bytes on {port!r}"
+                )
 
-            # Also support a single multi-line JSON object stream before EOF
-            full_text = buf.decode("utf-8", errors="replace")
-            parsed_buf = _try_parse_json_object(full_text)
-            if parsed_buf is not None:
-                return parsed_buf
+            buf.extend(chunk)
+            parsed_obj = _scan_buf_for_json()
+            if parsed_obj is not None:
+                return parsed_obj
+
+            # Discard complete newline-delimited non-JSON log lines when no candidate is open
+            if candidate_start is None and scan_idx > 0:
+                last_nl = buf.rfind(b"\n", 0, scan_idx)
+                if last_nl != -1:
+                    discard = last_nl + 1
+                    total_discarded += discard
+                    del buf[:discard]
+                    scan_idx -= discard
+                    if total_discarded > _MAX_SERIAL_DISCARDED_BYTES:
+                        raise ValueError(
+                            f"Serial telemetry stream exceeded {_MAX_SERIAL_DISCARDED_BYTES} bytes "
+                            f"without valid JSON on {port!r}"
+                        )
 
         raise ValueError(
             f"No valid JSON telemetry payload received from {port!r} within {timeout_sec:.1f}s"

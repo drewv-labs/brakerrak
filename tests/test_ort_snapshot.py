@@ -49,7 +49,13 @@ from brakerrak_ort import (
     verify_snapshot_signature,
     write_snapshot_pair,
 )
-from brakerrak_ort.profiles import SOC_ALIASES, resolve_profile
+from brakerrak_ort.probes import MAX_SERIAL_BUFFER_BYTES, format_sd_partition_name
+from brakerrak_ort.profiles import (
+    ACCELERATOR_PERSONAS,
+    SOC_ALIASES,
+    get_accelerator_link_floor,
+    resolve_profile,
+)
 
 
 class FakeSystemProbe:
@@ -190,7 +196,7 @@ def _make_probe(
     pg_active: bool = True,
     pg_io_method: str = "io_uring",
     pg_huge_pages_status: str = "on",
-    nr_hugepages: str = "2048",
+    nr_hugepages: str = "4352",
     mqtt_active: bool = True,
     nfs_ganesha_active: bool = True,
     nfs_kernel_active: bool = False,
@@ -709,7 +715,7 @@ def test_day0_vs_day1_assertions_single_shot_psql_and_cli_exit_codes(tmp_path: P
         nvme_logical_bs="4096",
         pg_active=True,
         pg_io_method="io_uring",
-        nr_hugepages="2048",
+        nr_hugepages="4352",
         mqtt_active=True,
         nfs_ganesha_active=True,
     )
@@ -804,7 +810,7 @@ def test_nic_requires_global_ipv4_and_ganesha_exports_parsed() -> None:
     assert pg_state["custom_tablespaces"] == ["ts_warm_vault"]
 
     sysctls = read_sysctl_baseline(probe)
-    assert sysctls["vm.nr_hugepages"] == "2048"
+    assert sysctls["vm.nr_hugepages"] == "4352"
 
 
 def test_public_redaction_provenance_signing_and_atomic_permissions(tmp_path: Path) -> None:
@@ -1083,7 +1089,7 @@ def test_multislot_nvme_and_accelerator_independent_plus_day1_runtimes() -> None
 
 def test_hugepages_requires_both_sysctl_and_pg_huge_pages_status() -> None:
     probe_pg_hp_off = _make_probe(
-        nr_hugepages="2048",
+        nr_hugepages="4352",
         pg_huge_pages_status="off",
         mqtt_active=False,
         nfs_ganesha_active=False,
@@ -1102,7 +1108,7 @@ def test_hugepages_requires_both_sysctl_and_pg_huge_pages_status() -> None:
     assert "huge_pages_status=off" in str(checks_off["ORT-D1_VM_HUGEPAGES"]["actual"])
 
     probe_pg_hp_on = _make_probe(
-        nr_hugepages="2048",
+        nr_hugepages="4352",
         pg_huge_pages_status="on",
         mqtt_active=False,
         nfs_ganesha_active=False,
@@ -1222,49 +1228,76 @@ def test_day1_xfs_mount_and_btrfs_raid_mount_stats() -> None:
 
 
 def test_mqtt_demoted_to_warn_when_optional_and_fail_when_required() -> None:
-    probe_no_mqtt = _make_probe(mqtt_active=False, nfs_ganesha_active=False)
+    probe_no_mqtt = _make_probe(mqtt_active=False, nfs_ganesha_active=True)
 
-    # devbench treats MQTT as supplemental -> WARN
-    dev_payload, _, _, _ = collect_snapshot(
-        probe_no_mqtt,
-        soc="eswin-eic7700x",
-        stage="day1-post-forge",
-        node_env={"NODE_ROLE": "devbench", "ENABLE_MQTT_BROKER": "true"},
-        kit_env={},
-        window_sec=0.0,
-        env={},
-    )
-    dev_checks = _assertions_by_id(dev_payload)
-    assert dev_checks["ORT-D1_MQTT_ACTIVE"]["status"] == "WARN"
-    assert dev_payload["operational_readiness_test"]["overall_status"] == "WARN"
+    # All roles (including devbench and databroker) treat MQTT as optional/supplemental -> WARN
+    for role in ("devbench", "databroker"):
+        role_payload, _, _, _ = collect_snapshot(
+            probe_no_mqtt,
+            soc="eswin-eic7700x",
+            stage="day1-post-forge",
+            node_env={"NODE_ROLE": role, "ENABLE_MQTT_BROKER": "true"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        role_checks = _assertions_by_id(role_payload)
+        assert role_checks["ORT-D1_MQTT_ACTIVE"]["status"] == "WARN"
+        assert role_checks["ORT-D1_MQTT_ACTIVE"]["expected"] == "active (optional/supplemental)"
+        assert role_payload["operational_readiness_test"]["overall_status"] == "WARN"
 
-    # Explicit REQUIRE_MQTT_BROKER=true -> FAIL
-    req_payload, _, _, _ = collect_snapshot(
+        # Explicit REQUIRE_MQTT_BROKER=true via node_env -> FAIL
+        req_node_payload, _, _, _ = collect_snapshot(
+            probe_no_mqtt,
+            soc="eswin-eic7700x",
+            stage="day1-post-forge",
+            node_env={
+                "NODE_ROLE": role,
+                "ENABLE_MQTT_BROKER": "true",
+                "REQUIRE_MQTT_BROKER": "true",
+            },
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        assert _assertions_by_id(req_node_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+
+        # Explicit REQUIRE_MQTT_BROKER=true via env -> FAIL
+        req_env_payload, _, _, _ = collect_snapshot(
+            probe_no_mqtt,
+            soc="eswin-eic7700x",
+            stage="day1-post-forge",
+            node_env={"NODE_ROLE": role, "ENABLE_MQTT_BROKER": "true"},
+            kit_env={},
+            window_sec=0.0,
+            env={"REQUIRE_MQTT_BROKER": "true"},
+        )
+        assert _assertions_by_id(req_env_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+
+    # Process env REQUIRE_MQTT_BROKER=false overrides node_env=true -> WARN
+    override_false_payload, _, _, _ = collect_snapshot(
         probe_no_mqtt,
         soc="eswin-eic7700x",
         stage="day1-post-forge",
         node_env={
-            "NODE_ROLE": "devbench",
+            "NODE_ROLE": "databroker",
             "ENABLE_MQTT_BROKER": "true",
             "REQUIRE_MQTT_BROKER": "true",
         },
         kit_env={},
         window_sec=0.0,
-        env={},
+        env={"REQUIRE_MQTT_BROKER": "false"},
     )
-    assert _assertions_by_id(req_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+    assert _assertions_by_id(override_false_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "WARN"
 
-    # databroker requires MQTT by default -> FAIL
-    broker_payload, _, _, _ = collect_snapshot(
-        probe_no_mqtt,
-        soc="eswin-eic7700x",
-        stage="day1-post-forge",
-        node_env={"NODE_ROLE": "databroker", "ENABLE_MQTT_BROKER": "true"},
-        kit_env={},
-        window_sec=0.0,
-        env={},
-    )
-    assert _assertions_by_id(broker_payload)["ORT-D1_MQTT_ACTIVE"]["status"] == "FAIL"
+    # Role env headers document MQTT as optional supplemental telemetry transport
+    repo_root = Path(__file__).resolve().parent.parent
+    for role_file in ("databroker.env", "devbench.env"):
+        text = (repo_root / "roles" / role_file).read_text(encoding="utf-8")
+        assert "optional supplemental" in text.lower()
+        assert "REQUIRE_MQTT_BROKER=true" in text
+        parsed_role = parse_kv_content(text)
+        assert parsed_role["NODE_ROLE"] == role_file.removesuffix(".env")
 
 
 def test_redact_cmdline_and_dmesg_scrubs_ips_without_mangling_versions_or_bdfs() -> None:
@@ -2251,3 +2284,540 @@ def test_cli_role_override_and_normalization_on_host_proxied_runs(tmp_path: Path
     with pytest.raises(SystemExit) as exc_info:
         main(["--role", "invalid-persona", "--telemetry-json", str(tel_path), "--quiet"])
     assert exc_info.value.code == 2
+
+
+def test_jh7110_ext4_fallback_and_non_jh7110_xfs_enforcement() -> None:
+    # starfive-jh7110 allows both xfs and ext4 for ORT-D1_NVME_XFS_MOUNT
+    for fstype, expected_status in (("ext4", "PASS"), ("xfs", "PASS"), ("vfat", "FAIL")):
+        probe_vf2 = _make_probe(
+            dt_model="StarFive VisionFive 2 v1.3B",
+            harts=4,
+            total_ram_kb=7_900_000,
+            nvme_speed="5.0 GT/s PCIe",
+            nvme_width="1",
+            nvme_mount_fstype=fstype,
+            mqtt_active=False,
+            nfs_ganesha_active=False,
+        )
+        payload, _, _, _ = collect_snapshot(
+            probe_vf2,
+            soc="starfive-jh7110",
+            stage="day1-post-forge",
+            node_env={"NODE_ROLE": "databench"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        checks = _assertions_by_id(payload)
+        mount_chk = checks["ORT-D1_NVME_XFS_MOUNT"]
+        assert mount_chk["status"] == expected_status
+        assert mount_chk["expected"] == "mounted (xfs | ext4)"
+
+    # Non-JH7110 with kernel XFS support continues to reject ext4
+    probe_p550 = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_mount_fstype="ext4",
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    probe_p550.files["/proc/filesystems"] = "nodev\tsysfs\n\text4\n\txfs\n"
+    p550_payload, _, _, _ = collect_snapshot(
+        probe_p550,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    p550_chk = _assertions_by_id(p550_payload)["ORT-D1_NVME_XFS_MOUNT"]
+    assert p550_chk["status"] == "FAIL"
+    assert p550_chk["expected"] == "mounted (xfs)"
+
+    # Non-JH7110 board whose kernel /proc/filesystems omits xfs accepts ext4
+    probe_no_xfs = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_mount_fstype="ext4",
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    probe_no_xfs.files["/proc/filesystems"] = "nodev\tsysfs\n\text4\n"
+    no_xfs_payload, _, _, _ = collect_snapshot(
+        probe_no_xfs,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    no_xfs_chk = _assertions_by_id(no_xfs_payload)["ORT-D1_NVME_XFS_MOUNT"]
+    assert no_xfs_chk["status"] == "PASS"
+    assert no_xfs_chk["expected"] == "mounted (xfs | ext4)"
+
+
+def test_accelerator_personas_skip_nvme_xfs_mount_unless_pg_nfs_or_nvme() -> None:
+    assert ACCELERATOR_PERSONAS == frozenset(
+        {"visionbox", "visionbench", "babbagebox", "babbagebench"}
+    )
+    lspci_acc = (
+        "0000:01:00.0 Co-processor [0b40]: Hailo Technologies Ltd. Hailo-10H [1e60:2864]\n"
+    )
+    for role in sorted(ACCELERATOR_PERSONAS):
+        probe_acc_only = _make_probe(
+            dt_model="SiFive HiFive Premier P550",
+            nvme_present=False,
+            nvme_mount_fstype=None,
+            lspci_output=lspci_acc,
+            pci_sysfs={
+                "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+                "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+            },
+            pg_active=False,
+            mqtt_active=False,
+            nfs_ganesha_active=False,
+        )
+        payload, _, _, _ = collect_snapshot(
+            probe_acc_only,
+            soc="eswin-eic7700x",
+            stage="day1-post-forge",
+            node_env={"NODE_ROLE": role},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        checks = _assertions_by_id(payload)
+        assert "ORT-D1_NVME_XFS_MOUNT" not in checks
+        assert "ORT-D1_NVME_4KN" not in checks
+        assert checks["ORT-03_PCIE_ACCELERATOR_LINK"]["status"] == "PASS"
+        assert payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+    # When ENABLE_NFS_SERVER=true on an accelerator persona without NVMe, NVMe checks are enforced
+    probe_nfs_missing_nvme = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=False,
+        nvme_mount_fstype=None,
+        lspci_output=lspci_acc,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+        },
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=True,
+    )
+    nfs_payload, _, _, _ = collect_snapshot(
+        probe_nfs_missing_nvme,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "visionbox", "ENABLE_NFS_SERVER": "true"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    nfs_checks = _assertions_by_id(nfs_payload)
+    assert nfs_checks["ORT-03_PCIE_NVME_LINK"]["status"] == "FAIL"
+    assert nfs_checks["ORT-D1_NVME_XFS_MOUNT"]["status"] == "FAIL"
+
+    # When NVMe IS present on an accelerator persona, ORT-D1_NVME_XFS_MOUNT is checked
+    probe_acc_with_nvme = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=True,
+        nvme_mount_fstype="xfs",
+        lspci_output=lspci_acc,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+        },
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    nvme_acc_payload, _, _, _ = collect_snapshot(
+        probe_acc_with_nvme,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "babbagebox"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    nvme_acc_checks = _assertions_by_id(nvme_acc_payload)
+    assert nvme_acc_checks["ORT-D1_NVME_XFS_MOUNT"]["status"] == "PASS"
+    assert nvme_acc_checks["ORT-03B_PCIE_ACCELERATOR_LINK"]["status"] == "PASS"
+
+
+def test_accelerator_pcie_link_validation_and_nvme_width_zero_warn() -> None:
+    # Vendor floor table capped by board bus capability
+    assert get_accelerator_link_floor("1e60", get_soc_profile("eswin-eic7700x")) == (8.0, 4)
+    assert get_accelerator_link_floor("1e60", get_soc_profile("starfive-jh7110")) == (5.0, 1)
+    assert get_accelerator_link_floor("1e52", get_soc_profile("eswin-eic7700x")) == (8.0, 4)
+    assert get_accelerator_link_floor("1e52", get_soc_profile("starfive-jh7110")) == (5.0, 1)
+    assert get_accelerator_link_floor("1ac1", get_soc_profile("eswin-eic7700x")) == (5.0, 1)
+
+    lspci_p150a = (
+        "0000:02:00.0 Processing accelerators [1200]: "
+        "Tenstorrent Inc Blackhole p150a [1e52:401e]\n"
+    )
+    # Degraded Blackhole p150a at Gen3 x1 -> WARN (both standalone and multi-slot)
+    for nvme_present, assertion_id in (
+        (False, "ORT-03_PCIE_ACCELERATOR_LINK"),
+        (True, "ORT-03B_PCIE_ACCELERATOR_LINK"),
+    ):
+        probe_degraded_tt = _make_probe(
+            dt_model="SiFive HiFive Premier P550",
+            nvme_present=nvme_present,
+            lspci_output=lspci_p150a,
+            pci_sysfs={
+                "/sys/bus/pci/devices/0000:02:00.0/current_link_speed": "8.0 GT/s PCIe",
+                "/sys/bus/pci/devices/0000:02:00.0/current_link_width": "1",
+            },
+            pg_active=False,
+            mqtt_active=False,
+            nfs_ganesha_active=False,
+        )
+        payload, _, _, _ = collect_snapshot(
+            probe_degraded_tt,
+            soc="eswin-eic7700x",
+            stage="day0-pre-forge",
+            node_env={"NODE_ROLE": "babbagebench"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        checks = _assertions_by_id(payload)
+        assert checks[assertion_id]["status"] == "WARN"
+        assert "8.0 GT/s PCIe | x1" in str(checks[assertion_id]["actual"])
+        assert payload["operational_readiness_test"]["overall_status"] == "WARN"
+
+    # Hailo degraded speed (5.0 GT/s x4 on Gen3 x4 board) or width (8.0 GT/s x2) -> WARN
+    lspci_hailo = (
+        "0000:01:00.0 Co-processor [0b40]: Hailo Technologies Ltd. Hailo-10H [1e60:2864]\n"
+    )
+    for speed, width in (
+        ("5.0 GT/s PCIe", "4"),
+        ("8.0 GT/s PCIe", "2"),
+        ("8.0 GT/s PCIe", "0"),
+        ("Unknown", "4"),
+    ):
+        probe_hailo_bad = _make_probe(
+            dt_model="SiFive HiFive Premier P550",
+            nvme_present=False,
+            lspci_output=lspci_hailo,
+            pci_sysfs={
+                "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": speed,
+                "/sys/bus/pci/devices/0000:01:00.0/current_link_width": width,
+            },
+            pg_active=False,
+            mqtt_active=False,
+            nfs_ganesha_active=False,
+        )
+        hailo_payload, _, _, _ = collect_snapshot(
+            probe_hailo_bad,
+            soc="eswin-eic7700x",
+            stage="day0-pre-forge",
+            node_env={"NODE_ROLE": "visionbench"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        assert _assertions_by_id(hailo_payload)["ORT-03_PCIE_ACCELERATOR_LINK"]["status"] == "WARN"
+
+    # Missing / unreadable current_link_speed or current_link_width on accelerator -> WARN
+    for partial_sysfs in (
+        {},
+        {"/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe"},
+        {"/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4"},
+    ):
+        probe_missing_link = _make_probe(
+            dt_model="SiFive HiFive Premier P550",
+            nvme_present=False,
+            lspci_output=lspci_hailo,
+            pci_sysfs=partial_sysfs,
+            pg_active=False,
+            mqtt_active=False,
+            nfs_ganesha_active=False,
+        )
+        miss_payload, _, _, _ = collect_snapshot(
+            probe_missing_link,
+            soc="eswin-eic7700x",
+            stage="day0-pre-forge",
+            node_env={"NODE_ROLE": "visionbox"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        assert _assertions_by_id(miss_payload)["ORT-03_PCIE_ACCELERATOR_LINK"]["status"] == "WARN"
+
+    # NVMe width=0 or unreadable width must WARN on non-generic profiles (not PASS)
+    for bad_width in ("0", "unknown"):
+        probe_nvme_w0 = _make_probe(
+            dt_model="SiFive HiFive Premier P550",
+            nvme_speed="8.0 GT/s PCIe",
+            nvme_width=bad_width,
+        )
+        w0_payload, _, _, _ = collect_snapshot(
+            probe_nvme_w0,
+            soc="eswin-eic7700x",
+            stage="day0-pre-forge",
+            node_env={"NODE_ROLE": "databench"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        assert _assertions_by_id(w0_payload)["ORT-03_PCIE_NVME_LINK"]["status"] == "WARN"
+
+    probe_nvme_missing_w = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_speed="8.0 GT/s PCIe",
+        nvme_width="4",
+    )
+    del probe_nvme_missing_w.files["/sys/class/nvme/nvme0/device/current_link_width"]
+    missing_w_payload, _, _, _ = collect_snapshot(
+        probe_nvme_missing_w,
+        soc="eswin-eic7700x",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(missing_w_payload)["ORT-03_PCIE_NVME_LINK"]["status"] == "WARN"
+
+    # Generic profile remains tolerant when link width is 0 or missing with valid speed,
+    # but still warns when speed is degraded even if link_width_raw is missing
+    probe_generic_w0 = _make_probe(
+        dt_model="Synthetic Generic RISC-V Board",
+        nvme_speed="8.0 GT/s PCIe",
+        nvme_width="0",
+    )
+    gen_payload, _, _, _ = collect_snapshot(
+        probe_generic_w0,
+        soc="generic-riscv64",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(gen_payload)["ORT-03_PCIE_NVME_LINK"]["status"] == "PASS"
+
+    probe_generic_bad_speed = _make_probe(
+        dt_model="Synthetic Generic RISC-V Board",
+        nvme_speed="2.5 GT/s PCIe",
+        nvme_width="4",
+    )
+    del probe_generic_bad_speed.files["/sys/class/nvme/nvme0/device/current_link_width"]
+    gen_bad_payload, _, _, _ = collect_snapshot(
+        probe_generic_bad_speed,
+        soc="generic-riscv64",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "databench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(gen_bad_payload)["ORT-03_PCIE_NVME_LINK"]["status"] == "WARN"
+
+
+def test_role_alias_normalization_in_defaults_assertions_and_stems() -> None:
+    ts = datetime.datetime(2026, 11, 26, 12, 0, 0, tzinfo=datetime.UTC)
+    vh_defaults = get_role_defaults("vh")
+    assert vh_defaults.stem == "visionbench"
+    assert vh_defaults.enable_postgres is False
+    bab_defaults = get_role_defaults("bab")
+    assert bab_defaults.stem == "babbagebox"
+    assert bab_defaults.enable_postgres is False
+    assert build_snapshot_stem("vh", "day1-post-forge", ts).startswith("visionbench-snapshot-")
+    assert build_snapshot_stem("bab", "day1-post-forge", ts).startswith("babbagebox-snapshot-")
+
+    for alias in ("vh", "bab"):
+        checks = evaluate_assertions(
+            profile=get_soc_profile("eswin-eic7700x"),
+            stage="day1-post-forge",
+            node_role=alias,
+            node_env={},
+            harts=[{"hart": str(i)} for i in range(4)],
+            total_ram_kb=32_000_000,
+            nvme_present=False,
+            nvme_info={},
+            pcie_accelerators=[
+                {
+                    "address": "0000:01:00.0",
+                    "vendor_id": "1e60",
+                    "device_id": "2864",
+                    "vendor_name": "Hailo NPU",
+                    "description": "Hailo-10H",
+                    "pcie_link_speed": "8.0 GT/s PCIe",
+                    "pcie_link_width": "4",
+                }
+            ],
+            raid_ort_checks=[],
+            primary_nic=PrimaryNicStatus(name="end0", operstate="UP", has_global_ipv4=True),
+            soc_peak_c=40.0,
+            bus_errors=[],
+            postgres_state={},
+            broker_services_state={},
+            sysctl_baseline={},
+            env={},
+            accelerator_runtime={
+                "hailo": {
+                    "vendor_id": "1e60",
+                    "device_nodes": ["/dev/hailo0"],
+                    "kmod_name": "hailo_pci",
+                    "kmod_loaded": True,
+                    "cli_tool": "hailortcli",
+                    "cli_ok": True,
+                }
+            },
+            nvme_mount_info={"mountpoint": "/mnt/nvme_pgdata", "mounted": False, "fstype": None},
+        )
+        check_ids = {c["id"] for c in checks}
+        assert "ORT-D1_NVME_XFS_MOUNT" not in check_ids
+        assert "ORT-D1_POSTGRES_ACTIVE" not in check_ids
+        assert "ORT-03_PCIE_ACCELERATOR_LINK" in check_ids
+
+
+def test_sd_partition_naming_helper_and_proxy_probe() -> None:
+    assert format_sd_partition_name("mmcblk0") == "mmcblk0p1"
+    assert format_sd_partition_name("nvme0n1") == "nvme0n1p1"
+    assert format_sd_partition_name("sda") == "sda1"
+    assert format_sd_partition_name("/dev/sdb") == "sdb1"
+    assert format_sd_partition_name("") == ""
+    assert format_sd_partition_name("/") == ""
+
+    tel_sda = _make_esp32p4_telemetry()
+    tel_sda["sdmmc"] = {
+        "present": True,
+        "device": "/dev/sda",
+        "bus": "sdmmc",
+        "size_bytes": 16 * 1024**3,
+        "mountpoint": "/sdcard",
+        "fstype": "vfat",
+        "mounted": True,
+        "label": "RVDK_P4_SD",
+    }
+    probe_sda = HostProxiedTelemetryProbe(tel_sda)
+    lsblk_sda = json.loads(probe_sda.run_cmd(["lsblk", "-J"]).stdout)
+    assert lsblk_sda["blockdevices"][0]["children"][0]["name"] == "sda1"
+    assert "/dev/sda1 /sdcard " in (probe_sda.read_text("/proc/mounts") or "")
+
+    # Empty/root device string must not crash with IndexError
+    tel_empty = _make_esp32p4_telemetry()
+    tel_empty["sdmmc"] = {
+        "present": True,
+        "device": "/",
+        "bus": "sdmmc",
+        "size_bytes": 16 * 1024**3,
+        "mountpoint": "/sdcard",
+        "fstype": "vfat",
+        "mounted": True,
+    }
+    probe_empty = HostProxiedTelemetryProbe(tel_empty)
+    lsblk_empty = json.loads(probe_empty.run_cmd(["lsblk", "-J"]).stdout)
+    assert lsblk_empty["blockdevices"][0]["children"][0]["name"] == "mmcblk0p1"
+
+
+def test_serial_telemetry_buffer_cap_and_non_json_noise_efficiency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import select
+    import termios
+
+    import brakerrak_ort.probes as probes_mod
+
+    dummy_port = tmp_path / "ttyACM-mock"
+    dummy_port.write_bytes(b"")
+    orig_attrs = [0, 0, termios.CS8, 0, termios.B115200, termios.B115200, [0] * 32]
+    monkeypatch.setattr(termios, "tcgetattr", lambda _fd: list(orig_attrs))
+    monkeypatch.setattr(termios, "tcsetattr", lambda _fd, _when, _attrs: None)
+
+    def _run_with_chunks(chunks: list[bytes]) -> dict[str, object]:
+        it = iter(chunks)
+        monkeypatch.setattr(select, "select", lambda r, _w, _x, _t: (list(r), [], []))
+        monkeypatch.setattr(os, "read", lambda _fd, _n: next(it, b""))
+        return capture_serial_telemetry_json(str(dummy_port), baud=115200, timeout_sec=2.0)
+
+    # 1. Buffer cap boundary: exactly MAX_SERIAL_BUFFER_BYTES succeeds; +1 byte raises ValueError
+    assert MAX_SERIAL_BUFFER_BYTES == 1_048_576
+    exact_prefix = b" " * (MAX_SERIAL_BUFFER_BYTES - len(b'{"ok":true}'))
+    exact_chunks = [exact_prefix[i : i + 4096] for i in range(0, len(exact_prefix), 4096)]
+    exact_chunks.append(b'{"ok":true}')
+    assert _run_with_chunks(exact_chunks) == {"ok": True}
+
+    overflow_chunks = [b"X" * 4096] * (MAX_SERIAL_BUFFER_BYTES // 4096) + [b"X"]
+    with pytest.raises(ValueError, match=str(MAX_SERIAL_BUFFER_BYTES)):
+        _run_with_chunks(overflow_chunks)
+
+    # Multi-line unclosed '{' exceeding MAX_SERIAL_BUFFER_BYTES also raises ValueError
+    ml_overflow = [b"{\n"] + [
+        f'  "k{idx}": "{"A" * 4070}",\n'.encode("ascii") for idx in range(260)
+    ]
+    with pytest.raises(ValueError, match=str(MAX_SERIAL_BUFFER_BYTES)):
+        _run_with_chunks(ml_overflow)
+
+    # 2. Non-JSON noise without newlines avoids O(N^2) full-buffer decode/JSON parse
+    parse_calls = 0
+    real_try_parse = probes_mod._try_parse_json_object
+
+    def _spy_try_parse(candidate: str) -> dict[str, object] | None:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_try_parse(candidate)
+
+    monkeypatch.setattr(probes_mod, "_try_parse_json_object", _spy_try_parse)
+    noise_chunks = [b"NOISE_BYTES_" * 340] * 128  # ~522 KB without '{' or '\n'
+    noise_chunks.append(b'\n{"hostname": "snitchbench-p4", "ok": true}\n')
+    parsed = _run_with_chunks(noise_chunks)
+    assert parsed == {"hostname": "snitchbench-p4", "ok": True}
+    assert parse_calls == 1
+
+    # 3. Noise containing repeated invalid '{bad}' without newlines is rejected in O(N)
+    parse_calls = 0
+    bad_brace_chunks = [b"{bad} " * 600] * 20  # 12,000 invalid '{bad}' tokens without '\n'
+    bad_brace_chunks.append(b'{"hostname": "snitchbench-p4", "seq": 2}')
+    parsed_braces = _run_with_chunks(bad_brace_chunks)
+    assert parsed_braces == {"hostname": "snitchbench-p4", "seq": 2}
+    assert parse_calls == 1
+
+    # 4. Pretty-printed multi-line JSON with inline nested sub-object returns outer dict
+    parse_calls = 0
+    nested_multiline_chunks = [
+        b"I (10) boot: ready\n{\n",
+        b'  "hostname": "p4-multiline",\n',
+        b'  "cpu": {"harts": 2}\n',
+        b"}\n",
+    ]
+    parsed_ml = _run_with_chunks(nested_multiline_chunks)
+    assert parsed_ml == {"hostname": "p4-multiline", "cpu": {"harts": 2}}
+    assert parse_calls == 1
+
+    # 5. Unclosed boot-log '{' prefix (both multi-line and inline) does not swallow valid JSON
+    parse_calls = 0
+    unclosed_ml = [
+        b"I (10) boot: state={init\n",
+        b'{\n  "hostname": "p4"\n}\n',
+    ]
+    assert _run_with_chunks(unclosed_ml) == {"hostname": "p4"}
+    assert parse_calls == 1
+
+    parse_calls = 0
+    unclosed_inline = [b'log: {wrapper {"hostname": "p4"}}']
+    assert _run_with_chunks(unclosed_inline) == {"hostname": "p4"}
+    assert parse_calls == 1
+
+    # 6. Repeated '}\n' lines after unclosed/invalid '{{' stay O(N) with zero parse loops
+    parse_calls = 0
+    closing_flood_bad = (
+        [b'boot: {{"bad":\n'] + [b"}\n" * 1000] * 10 + [b'{"hostname": "p4", "ok": 1}\n']
+    )
+    assert _run_with_chunks(closing_flood_bad) == {"hostname": "p4", "ok": 1}
+    assert parse_calls == 2  # once for '{"bad":\n}', once for final valid JSON
+
+    parse_calls = 0
+    closing_flood_log = (
+        [b"boot: {{init\n"] + [b"}\n" * 1000] * 10 + [b'{"hostname": "p4", "ok": 2}\n']
+    )
+    assert _run_with_chunks(closing_flood_log) == {"hostname": "p4", "ok": 2}
+    assert parse_calls == 1

@@ -22,6 +22,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -138,6 +139,21 @@ SHOWDOWN_SCHEMA: pa.Schema = pa.schema(
         pa.field("plan_shape_valid", pa.bool_(), nullable=False),
         pa.field("perf_pmu_multiplexed", pa.bool_(), nullable=False),
         pa.field("perf_min_pcnt_running", pa.float64(), nullable=True),
+        # Additive nullable provenance, thermal/clock drift, and bitmap spill telemetry
+        pa.field("pass_order_index", pa.int32(), nullable=True),
+        pa.field("pre_soc_temp_c", pa.float64(), nullable=True),
+        pa.field("post_soc_temp_c", pa.float64(), nullable=True),
+        pa.field("pre_nvme_temp_c", pa.float64(), nullable=True),
+        pa.field("post_nvme_temp_c", pa.float64(), nullable=True),
+        pa.field("pre_cpu_mhz", pa.float64(), nullable=True),
+        pa.field("post_cpu_mhz", pa.float64(), nullable=True),
+        pa.field("prewarm_fit_shared_buffers", pa.bool_(), nullable=True),
+        pa.field("exact_heap_blocks", pa.int64(), nullable=True),
+        pa.field("lossy_heap_blocks", pa.int64(), nullable=True),
+        pa.field("scaling_governor", pa.string(), nullable=True),
+        pa.field("shared_buffers", pa.string(), nullable=True),
+        pa.field("huge_pages_status", pa.string(), nullable=True),
+        pa.field("nvme_logical_block_size", pa.int32(), nullable=True),
     ]
 )
 
@@ -159,6 +175,8 @@ class ExplainMetrics:
     wal_bytes: int
     top_node_type: str
     plan_node_types: tuple[str, ...] = ()
+    exact_heap_blocks: int | None = None
+    lossy_heap_blocks: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +245,11 @@ class RunMetadata:
     table_name: str
     nvme_device: str
     nvme_short: str
+    scaling_governor: str | None = None
+    shared_buffers: str | None = None
+    huge_pages_status: str | None = None
+    nvme_logical_block_size: int | None = None
+    prewarm_fit_shared_buffers: bool | None = None
 
 
 @runtime_checkable
@@ -327,6 +350,20 @@ class ShowdownPassRow:
     io_direct: str = "off"
     wall_duration_ms: float | None = None
     plan_shape_valid: bool = True
+    pass_order_index: int | None = None
+    pre_soc_temp_c: float | None = None
+    post_soc_temp_c: float | None = None
+    pre_nvme_temp_c: float | None = None
+    post_nvme_temp_c: float | None = None
+    pre_cpu_mhz: float | None = None
+    post_cpu_mhz: float | None = None
+    prewarm_fit_shared_buffers: bool | None = None
+    exact_heap_blocks: int | None = None
+    lossy_heap_blocks: int | None = None
+    scaling_governor: str | None = None
+    shared_buffers: str | None = None
+    huge_pages_status: str | None = None
+    nvme_logical_block_size: int | None = None
 
     @property
     def execution_time_ms(self) -> float:
@@ -414,6 +451,90 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         except ValueError:
             return default
     return default
+
+
+def _opt_str(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() == "null":
+        return None
+    return cleaned
+
+
+def _opt_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value)) if math.isfinite(value) else None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned or cleaned.lower() == "null":
+            return None
+        try:
+            parsed = float(cleaned)
+        except ValueError:
+            return None
+        return int(round(parsed)) if math.isfinite(parsed) else None
+    return None
+
+
+def _opt_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+    if isinstance(value, str):
+        cleaned = value.strip().replace(",", "")
+        if not cleaned or cleaned.lower() == "null":
+            return None
+        try:
+            parsed = float(cleaned)
+        except ValueError:
+            return None
+        return parsed if math.isfinite(parsed) else None
+    return None
+
+
+def _opt_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+    return None
+
+
+def _extract_optional_plan_int_sum(
+    plan_node: Mapping[str, Any],
+    key: str,
+) -> int | None:
+    """Sum an optional integer EXPLAIN field across all plan nodes, or None if absent."""
+    found = False
+    total = 0
+
+    def _walk(node: Mapping[str, Any]) -> None:
+        nonlocal found, total
+        val = _opt_int(node.get(key))
+        if val is not None:
+            found = True
+            total += val
+        children = node.get("Plans")
+        if isinstance(children, list):
+            for child in children:
+                if isinstance(child, Mapping):
+                    _walk(child)
+
+    _walk(plan_node)
+    return total if found else None
 
 
 def _extract_plan_numeric(
@@ -514,6 +635,8 @@ def parse_explain_json(path: Path) -> ExplainMetrics:
     wal_bytes = int(round(_extract_plan_numeric(plan, ("WAL Bytes",))))
     top_node_type = str(plan.get("Node Type", "Unknown"))
     plan_node_types = _collect_plan_node_types(plan)
+    exact_heap_blocks = _extract_optional_plan_int_sum(plan, "Exact Heap Blocks")
+    lossy_heap_blocks = _extract_optional_plan_int_sum(plan, "Lossy Heap Blocks")
 
     return ExplainMetrics(
         execution_time_ms=execution_time_ms,
@@ -529,6 +652,8 @@ def parse_explain_json(path: Path) -> ExplainMetrics:
         wal_bytes=wal_bytes,
         top_node_type=top_node_type,
         plan_node_types=plan_node_types,
+        exact_heap_blocks=exact_heap_blocks,
+        lossy_heap_blocks=lossy_heap_blocks,
     )
 
 
@@ -874,8 +999,12 @@ class ArrowIPCSink:
 
 
 def load_run_metadata(run_dir: Path) -> RunMetadata:
-    """Load run-level metadata.json with safe defaults if fields are absent."""
+    """Load run-level metadata.json (or run_meta.json) with safe defaults if absent."""
     meta_path = run_dir / "metadata.json"
+    if not meta_path.is_file():
+        alt_meta_path = run_dir / "run_meta.json"
+        if alt_meta_path.is_file():
+            meta_path = alt_meta_path
     raw: Mapping[str, Any] = {}
     if meta_path.is_file():
         loaded: Any = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -903,6 +1032,11 @@ def load_run_metadata(run_dir: Path) -> RunMetadata:
         table_name=str(raw.get("table_name", "brakerrak_io_torture")),
         nvme_device=nvme_device,
         nvme_short=nvme_short,
+        scaling_governor=_opt_str(raw.get("scaling_governor")),
+        shared_buffers=_opt_str(raw.get("shared_buffers")),
+        huge_pages_status=_opt_str(raw.get("huge_pages_status")),
+        nvme_logical_block_size=_opt_int(raw.get("nvme_logical_block_size")),
+        prewarm_fit_shared_buffers=_opt_bool(raw.get("prewarm_fit_shared_buffers")),
     )
 
 
@@ -1017,6 +1151,17 @@ def load_showdown_passes(
             device=nvme_short or None,
         )
 
+        p_prewarm_fit = _opt_bool(pmeta.get("prewarm_fit_shared_buffers"))
+        prewarm_fit: bool | None
+        if p_prewarm_fit is not None:
+            prewarm_fit = p_prewarm_fit
+        elif cache_mode == "warm":
+            prewarm_fit = meta.prewarm_fit_shared_buffers
+        else:
+            prewarm_fit = None
+        p_lbs = _opt_int(pmeta.get("nvme_logical_block_size"))
+        nvme_lbs = p_lbs if p_lbs is not None else meta.nvme_logical_block_size
+
         rows.append(
             ShowdownPassRow(
                 schema_version=meta.schema_version,
@@ -1048,6 +1193,22 @@ def load_showdown_passes(
                 io_direct=io_direct,
                 wall_duration_ms=wall_duration_ms,
                 plan_shape_valid=plan_shape_valid,
+                pass_order_index=_opt_int(pmeta.get("pass_order_index")),
+                pre_soc_temp_c=_opt_float(pmeta.get("pre_soc_temp_c")),
+                post_soc_temp_c=_opt_float(pmeta.get("post_soc_temp_c")),
+                pre_nvme_temp_c=_opt_float(pmeta.get("pre_nvme_temp_c")),
+                post_nvme_temp_c=_opt_float(pmeta.get("post_nvme_temp_c")),
+                pre_cpu_mhz=_opt_float(pmeta.get("pre_cpu_mhz")),
+                post_cpu_mhz=_opt_float(pmeta.get("post_cpu_mhz")),
+                prewarm_fit_shared_buffers=prewarm_fit,
+                exact_heap_blocks=explain_metrics.exact_heap_blocks,
+                lossy_heap_blocks=explain_metrics.lossy_heap_blocks,
+                scaling_governor=_opt_str(pmeta.get("scaling_governor")) or meta.scaling_governor,
+                shared_buffers=_opt_str(pmeta.get("shared_buffers")) or meta.shared_buffers,
+                huge_pages_status=(
+                    _opt_str(pmeta.get("huge_pages_status")) or meta.huge_pages_status
+                ),
+                nvme_logical_block_size=nvme_lbs,
             )
         )
 
@@ -1085,8 +1246,17 @@ def _arrow_scalar_float(scalar: Any) -> float | None:
     return None
 
 
+def _arrow_p50(array: pa.Array | pa.ChunkedArray) -> float | None:
+    if len(array) == 0 or array.null_count == len(array):
+        return None
+    q_arr = pc.quantile(array, q=[0.5])
+    if len(q_arr) == 0:
+        return None
+    return _arrow_scalar_float(q_arr[0])
+
+
 def _compute_speedup_column(table: pa.Table) -> pa.Array:
-    """Compute speedup vs sync baseline per (cache_mode, workload, io_direct)."""
+    """Compute speedup vs sync p50 baseline per (cache_mode, workload, io_direct)."""
     cache_modes: list[str] = [str(v) for v in table["cache_mode"].to_pylist()]
     workloads: list[str] = [str(v) for v in table["workload"].to_pylist()]
     eics: list[int] = [int(v) for v in table["effective_io_concurrency"].to_pylist()]
@@ -1095,7 +1265,7 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
     else:
         io_directs = ["off"] * table.num_rows
 
-    # Precompute sync baseline per (cache_mode, workload, io_direct, eic) and fallbacks
+    # Precompute sync p50 baseline per (cache_mode, workload, io_direct, eic) and fallbacks
     exact_direct_baselines: dict[tuple[str, str, str, int], float] = {}
     zero_direct_baselines: dict[tuple[str, str, str], float] = {}
     group_direct_baselines: dict[tuple[str, str, str], float] = {}
@@ -1116,9 +1286,9 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
         if sync_group.num_rows == 0:
             continue
 
-        mean_val = _arrow_scalar_float(pc.mean(sync_group["execution_time_ms"]))
-        if mean_val is not None and mean_val > 0.0:
-            group_baselines[(cm, wl)] = mean_val
+        p50_val = _arrow_p50(sync_group["execution_time_ms"])
+        if p50_val is not None and p50_val > 0.0:
+            group_baselines[(cm, wl)] = p50_val
 
         sync_eics = sorted(
             {int(v) for v in sync_group["effective_io_concurrency"].to_pylist()}
@@ -1128,19 +1298,19 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
             eic_sub = sync_group.filter(
                 pc.equal(sync_group["effective_io_concurrency"], eic_scalar)
             )
-            eic_mean = _arrow_scalar_float(pc.mean(eic_sub["execution_time_ms"]))
-            if eic_mean is not None and eic_mean > 0.0:
-                exact_baselines[(cm, wl, sync_eic)] = eic_mean
+            eic_p50 = _arrow_p50(eic_sub["execution_time_ms"])
+            if eic_p50 is not None and eic_p50 > 0.0:
+                exact_baselines[(cm, wl, sync_eic)] = eic_p50
                 if sync_eic == 0:
-                    zero_baselines[(cm, wl)] = eic_mean
+                    zero_baselines[(cm, wl)] = eic_p50
 
         if "io_direct" in sync_group.column_names:
             direct_vals = sorted({str(v) for v in sync_group["io_direct"].to_pylist()})
             for d_val in direct_vals:
                 d_sub = sync_group.filter(pc.equal(sync_group["io_direct"], d_val))
-                d_mean = _arrow_scalar_float(pc.mean(d_sub["execution_time_ms"]))
-                if d_mean is not None and d_mean > 0.0:
-                    group_direct_baselines[(cm, wl, d_val)] = d_mean
+                d_p50 = _arrow_p50(d_sub["execution_time_ms"])
+                if d_p50 is not None and d_p50 > 0.0:
+                    group_direct_baselines[(cm, wl, d_val)] = d_p50
                 for sync_eic in sync_eics:
                     eic_scalar = pa.scalar(sync_eic, type=pa.int32())
                     de_sub = d_sub.filter(
@@ -1148,11 +1318,11 @@ def _compute_speedup_column(table: pa.Table) -> pa.Array:
                     )
                     if de_sub.num_rows == 0:
                         continue
-                    de_mean = _arrow_scalar_float(pc.mean(de_sub["execution_time_ms"]))
-                    if de_mean is not None and de_mean > 0.0:
-                        exact_direct_baselines[(cm, wl, d_val, sync_eic)] = de_mean
+                    de_p50 = _arrow_p50(de_sub["execution_time_ms"])
+                    if de_p50 is not None and de_p50 > 0.0:
+                        exact_direct_baselines[(cm, wl, d_val, sync_eic)] = de_p50
                         if sync_eic == 0:
-                            zero_direct_baselines[(cm, wl, d_val)] = de_mean
+                            zero_direct_baselines[(cm, wl, d_val)] = de_p50
 
     baseline_per_row: list[float | None] = []
     for cm, wl, d_val, eic in zip(cache_modes, workloads, io_directs, eics, strict=True):
@@ -1264,6 +1434,30 @@ def build_showdown_table(
         "plan_shape_valid": [r.plan_shape_valid for r in sorted_rows],
         "perf_pmu_multiplexed": [r.perf.pmu_multiplexed for r in sorted_rows],
         "perf_min_pcnt_running": [r.perf.min_pcnt_running for r in sorted_rows],
+        "pass_order_index": [r.pass_order_index for r in sorted_rows],
+        "pre_soc_temp_c": [r.pre_soc_temp_c for r in sorted_rows],
+        "post_soc_temp_c": [r.post_soc_temp_c for r in sorted_rows],
+        "pre_nvme_temp_c": [r.pre_nvme_temp_c for r in sorted_rows],
+        "post_nvme_temp_c": [r.post_nvme_temp_c for r in sorted_rows],
+        "pre_cpu_mhz": [r.pre_cpu_mhz for r in sorted_rows],
+        "post_cpu_mhz": [r.post_cpu_mhz for r in sorted_rows],
+        "prewarm_fit_shared_buffers": [r.prewarm_fit_shared_buffers for r in sorted_rows],
+        "exact_heap_blocks": [
+            r.exact_heap_blocks
+            if r.exact_heap_blocks is not None
+            else r.explain.exact_heap_blocks
+            for r in sorted_rows
+        ],
+        "lossy_heap_blocks": [
+            r.lossy_heap_blocks
+            if r.lossy_heap_blocks is not None
+            else r.explain.lossy_heap_blocks
+            for r in sorted_rows
+        ],
+        "scaling_governor": [r.scaling_governor for r in sorted_rows],
+        "shared_buffers": [r.shared_buffers for r in sorted_rows],
+        "huge_pages_status": [r.huge_pages_status for r in sorted_rows],
+        "nvme_logical_block_size": [r.nvme_logical_block_size for r in sorted_rows],
     }
 
     table = pa.Table.from_pydict(columns, schema=SHOWDOWN_SCHEMA)
@@ -1440,35 +1634,94 @@ def render_markdown_summary(
         f"(`{meta.architecture}`, {meta.cpu_harts_count} harts)",
         f"- **PostgreSQL:** `{meta.pg_server_version}` | **Database/Table:** "
         f"`{meta.db_name}.{meta.table_name}` | **NVMe:** `{meta.nvme_device}`",
-        f"- **CTD Schema:** `{meta.schema_version}` | **Provenance SHA-256:** "
-        f"`{provenance_sha256[:16]}...`",
-        "",
-        "### Per-Pass Ablation Matrix",
-        "",
-        "| Cache | Workload | io_method | EIC | Exec (ms) | Iter | Plan (ms) | I/O Read (ms) "
-        "| Shared Read Blks | NVMe Read (MiB/s) | PG I/O (MiB/s) | IPC | Ctx Sw | Plan OK "
-        "| vs sync |",
-        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
-        "| --- | ---: |",
     ]
+    if any(
+        v is not None
+        for v in (
+            meta.scaling_governor,
+            meta.shared_buffers,
+            meta.huge_pages_status,
+            meta.nvme_logical_block_size,
+        )
+    ):
+        lines.append(
+            f"- **Governor:** `{meta.scaling_governor or 'n/a'}` | "
+            f"**shared_buffers:** `{meta.shared_buffers or 'n/a'}` | "
+            f"**HugePages:** `{meta.huge_pages_status or 'n/a'}` | "
+            f"**NVMe LBS:** `{_fmt_opt_int(meta.nvme_logical_block_size)} B`"
+        )
+    lines.extend(
+        [
+            f"- **CTD Schema:** `{meta.schema_version}` | **Provenance SHA-256:** "
+            f"`{provenance_sha256[:16]}...`",
+            "",
+            "### Per-Pass Ablation Matrix",
+            "",
+            "| Cache | Workload | io_method | EIC | Exec (ms) | Iter | Plan (ms) | I/O Read (ms) "
+            "| Shared Read Blks | NVMe Read (MiB/s) | PG I/O (MiB/s) | IPC | Ctx Sw | Plan OK "
+            "| vs sync |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: "
+            "| ---: | ---: | --- | ---: |",
+        ]
+    )
 
     mux_warnings: list[str] = []
     plan_warnings: list[str] = []
+    lossy_warnings: list[str] = []
+    spill_warnings: list[str] = []
+    thermal_warnings: list[str] = []
+    droop_warnings: list[str] = []
 
     for row in table.to_pylist():
+        pass_label = (
+            f"{row['cache_mode']}/{row['workload']}/{row['io_method']}"
+            f"/eic{row['effective_io_concurrency']}/iter{row['iteration']}"
+        )
         plan_ok = bool(row.get("plan_shape_valid", True))
         if not plan_ok:
-            plan_warnings.append(
-                f"{row['cache_mode']}/{row['workload']}/{row['io_method']}"
-                f"/eic{row['effective_io_concurrency']}/iter{row['iteration']} "
-                f"(top={row['top_node_type']})"
-            )
+            plan_warnings.append(f"{pass_label} (top={row['top_node_type']})")
         if bool(row.get("perf_pmu_multiplexed", False)):
             mux_warnings.append(
-                f"{row['cache_mode']}/{row['workload']}/{row['io_method']}"
-                f"/eic{row['effective_io_concurrency']}/iter{row['iteration']} "
+                f"{pass_label} "
                 f"(min pcnt-running={_fmt_opt_float(row.get('perf_min_pcnt_running'), 1, '%')})"
             )
+        lossy_val = row.get("lossy_heap_blocks")
+        if lossy_val is not None and int(lossy_val) > 0:
+            lossy_warnings.append(
+                f"{pass_label} (lossy={int(lossy_val):,}, "
+                f"exact={_fmt_opt_int(row.get('exact_heap_blocks'))})"
+            )
+        if row.get("prewarm_fit_shared_buffers") is False:
+            spill_warnings.append(
+                f"{pass_label} (shared_buffers={row.get('shared_buffers') or 'unknown'})"
+            )
+
+        rise_parts: list[str] = []
+        pre_soc = row.get("pre_soc_temp_c")
+        post_soc = row.get("post_soc_temp_c")
+        if pre_soc is not None and post_soc is not None:
+            soc_delta = float(post_soc) - float(pre_soc)
+            if soc_delta > 10.0:
+                rise_parts.append(f"SoC +{soc_delta:.1f}°C")
+        pre_nvme = row.get("pre_nvme_temp_c")
+        post_nvme = row.get("post_nvme_temp_c")
+        if pre_nvme is not None and post_nvme is not None:
+            nvme_delta = float(post_nvme) - float(pre_nvme)
+            if nvme_delta > 10.0:
+                rise_parts.append(f"NVMe +{nvme_delta:.1f}°C")
+        if rise_parts:
+            thermal_warnings.append(f"{pass_label} ({', '.join(rise_parts)})")
+
+        pre_mhz = row.get("pre_cpu_mhz")
+        post_mhz = row.get("post_cpu_mhz")
+        if pre_mhz is not None and post_mhz is not None and float(pre_mhz) > 0.0:
+            droop_pct = ((float(pre_mhz) - float(post_mhz)) / float(pre_mhz)) * 100.0
+            if droop_pct > 5.0:
+                droop_warnings.append(
+                    f"{pass_label} ({float(pre_mhz):.1f}->{float(post_mhz):.1f} MHz, "
+                    f"-{droop_pct:.1f}%)"
+                )
+
         lines.append(
             f"| {row['cache_mode']} "
             f"| {row['workload']} "
@@ -1527,6 +1780,39 @@ def render_markdown_summary(
                 "",
                 f"> **Plan Shape Warning:** Unexpected EXPLAIN node shape on "
                 f"{len(plan_warnings)} pass(es): {', '.join(plan_warnings[:5])}",
+            ]
+        )
+    if lossy_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **Lossy Bitmap Warning:** `work_mem` spill (`lossy_heap_blocks > 0`) "
+                f"detected on {len(lossy_warnings)} pass(es): {', '.join(lossy_warnings[:5])}",
+            ]
+        )
+    if spill_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **Shared Buffers Spill Warning:** Relation exceeds `shared_buffers` "
+                f"(`prewarm_fit_shared_buffers=false`) on {len(spill_warnings)} pass(es): "
+                f"{', '.join(spill_warnings[:5])}",
+            ]
+        )
+    if thermal_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **Thermal Rise Warning:** Temperature rise `> 10.0°C` detected on "
+                f"{len(thermal_warnings)} pass(es): {', '.join(thermal_warnings[:5])}",
+            ]
+        )
+    if droop_warnings:
+        lines.extend(
+            [
+                "",
+                f"> **CPU Frequency Droop Warning:** Clock frequency droop `> 5%` detected on "
+                f"{len(droop_warnings)} pass(es): {', '.join(droop_warnings[:5])}",
             ]
         )
 

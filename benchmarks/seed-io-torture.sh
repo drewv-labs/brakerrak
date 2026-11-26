@@ -6,7 +6,7 @@
 # Usage:
 #   ./benchmarks/seed-io-torture.sh [options]
 #   sudo brakerrak bench seed [--db brakerrak] [--table brakerrak_io_torture] \
-#       [--rows 50000000] [--workers 4] [--unlogged]
+#       [--rows 50000000] [--workers 4] [--deterministic-layout] [--unlogged]
 # ==============================================================================
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
@@ -65,21 +65,26 @@ usage() {
 Usage: seed-io-torture.sh [options]
 
 Deterministically seeds the BrakerRak PostgreSQL 18 I/O torture dataset across
-parallel workers using hash-derived tuple distributions (bit-identical across
-4-hart and 8-hart RISC-V targets regardless of --workers).
+parallel workers using hash-derived tuple distributions. With --workers > 1,
+parallel workers produce logically identical rows (identical tuple values across
+4-hart and 8-hart RISC-V targets), though physical heap page interleaving depends
+on worker scheduling. Pass --deterministic-layout for single-writer ordered
+inserts yielding bit-identical physical heap locality across targets.
 
 Options:
-  --db <name>          Target PostgreSQL database (default: brakerrak; created if absent)
-  --table <name>       Target table name (default: brakerrak_io_torture)
-  --rows <N>           Total rows to generate (default: 50000000)
-  --workers <N>        Parallel seed workers (default: detected CPU harts)
-  --pg-user <user>     PostgreSQL superuser role (default: postgres)
-  --unlogged           Create an UNLOGGED table (opt-in for fast dev smoke tests)
-  --logged             Create a standard LOGGED table (default)
-  -h, --help           Show this help message and exit
+  --db <name>              Target PostgreSQL database (default: brakerrak; created if absent)
+  --table <name>           Target table name (default: brakerrak_io_torture)
+  --rows <N>               Total rows to generate (default: 50000000)
+  --workers <N>            Parallel seed workers (default: detected CPU harts)
+  --deterministic-layout   Single-writer ordered insert (forces workers=1, ORDER BY i)
+                           for bit-identical physical heap locality across 4/8-hart boards
+  --pg-user <user>         PostgreSQL superuser role (default: postgres)
+  --unlogged               Create an UNLOGGED table (opt-in for fast dev smoke tests)
+  --logged                 Create a standard LOGGED table (default)
+  -h, --help               Show this help message and exit
 
 Environment overrides:
-  DB_NAME, TABLE_NAME, TOTAL_ROWS, WORKERS, PG_USER, UNLOGGED
+  DB_NAME, TABLE_NAME, TOTAL_ROWS, WORKERS, DETERMINISTIC_LAYOUT, PG_USER, UNLOGGED
 EOF
 }
 
@@ -106,6 +111,7 @@ DB_NAME="${DB_NAME:-brakerrak}"
 TABLE_NAME="${TABLE_NAME:-brakerrak_io_torture}"
 TOTAL_ROWS="${TOTAL_ROWS:-50000000}"
 WORKERS="${WORKERS:-$(detect_cpu_harts)}"
+DETERMINISTIC_LAYOUT="${DETERMINISTIC_LAYOUT:-false}"
 PG_USER="${PG_USER:-postgres}"
 UNLOGGED="${UNLOGGED:-false}"
 
@@ -165,6 +171,14 @@ while [[ $# -gt 0 ]]; do
             brak_require_arg "--pg-user" "$PG_USER"
             shift
             ;;
+        --deterministic-layout)
+            DETERMINISTIC_LAYOUT="true"
+            shift
+            ;;
+        --no-deterministic-layout)
+            DETERMINISTIC_LAYOUT="false"
+            shift
+            ;;
         --unlogged)
             UNLOGGED="true"
             shift
@@ -188,6 +202,10 @@ validate_pos_int "WORKERS" "$WORKERS"
 case "$UNLOGGED" in
     true|false) ;;
     *) log_fatal "Invalid UNLOGGED='${UNLOGGED}': must be 'true' or 'false'" ;;
+esac
+case "$DETERMINISTIC_LAYOUT" in
+    true|false) ;;
+    *) log_fatal "Invalid DETERMINISTIC_LAYOUT='${DETERMINISTIC_LAYOUT}': must be 'true' or 'false'" ;;
 esac
 
 if ! command -v psql >/dev/null 2>&1; then
@@ -217,13 +235,27 @@ trap 'cleanup_workers; exit 130' INT
 trap 'cleanup_workers; exit 143' TERM
 
 EFFECTIVE_WORKERS="$WORKERS"
-if (( EFFECTIVE_WORKERS > TOTAL_ROWS )); then
+if [[ "$DETERMINISTIC_LAYOUT" == "true" ]]; then
+    if (( EFFECTIVE_WORKERS > 1 )); then
+        log_brak "Deterministic physical heap layout enabled (--deterministic-layout): forcing single-writer ordered insert (workers=1)."
+    fi
+    EFFECTIVE_WORKERS=1
+elif (( EFFECTIVE_WORKERS > TOTAL_ROWS )); then
     EFFECTIVE_WORKERS="$TOTAL_ROWS"
 fi
 
 DT_MODEL="$(tr -d '\0' </proc/device-tree/model 2>/dev/null || uname -m)"
 ROWS_PER_WORKER=$(( TOTAL_ROWS / EFFECTIVE_WORKERS ))
-MAINT_WORKERS=$(( EFFECTIVE_WORKERS > 1 ? EFFECTIVE_WORKERS - 1 : 1 ))
+if [[ "$DETERMINISTIC_LAYOUT" == "true" ]]; then
+    MAINT_WORKERS=0
+else
+    MAINT_WORKERS=$(( EFFECTIVE_WORKERS > 1 ? EFFECTIVE_WORKERS - 1 : 1 ))
+fi
+
+LAYOUT_MODE="parallel"
+if [[ "$DETERMINISTIC_LAYOUT" == "true" ]]; then
+    LAYOUT_MODE="deterministic"
+fi
 
 TABLE_MODE="LOGGED"
 TABLE_DDL_PREFIX=""
@@ -238,7 +270,7 @@ INDEX_NAME="${INDEX_NAME:0:63}"
 echo "======================================================================"
 echo " BrakerRak // Deterministic Seed '${DB_NAME}.${TABLE_NAME}' on $(hostname)"
 echo " Silicon : ${DT_MODEL}"
-echo " Profile : ${TOTAL_ROWS} rows | ${EFFECTIVE_WORKERS} parallel workers | ${TABLE_MODE}"
+echo " Profile : ${TOTAL_ROWS} rows | ${EFFECTIVE_WORKERS} worker(s) | ${TABLE_MODE} | layout=${LAYOUT_MODE}"
 echo "======================================================================"
 
 # 1. Create target database idempotently (never polluting the 'postgres' maintenance DB)
@@ -264,18 +296,12 @@ CREATE ${TABLE_DDL_PREFIX}TABLE \"${TABLE_NAME}\" (
 "
 log_ok "Initialized ${TABLE_MODE} table '${TABLE_NAME}'"
 
-# 3. Fan out N deterministic workers with strict PID tracking
-log_step "3. Seeding ${TOTAL_ROWS} deterministic rows across ${EFFECTIVE_WORKERS} workers"
+# 3. Seed deterministic rows (single-writer ordered insert or N parallel workers)
 START_TS="$(date +%s)"
-for (( worker=0; worker<EFFECTIVE_WORKERS; worker++ )); do
-    start_id=$(( worker * ROWS_PER_WORKER + 1 ))
-    if (( worker == EFFECTIVE_WORKERS - 1 )); then
-        end_id="$TOTAL_ROWS"
-    else
-        end_id=$(( (worker + 1) * ROWS_PER_WORKER ))
-    fi
-
+if [[ "$DETERMINISTIC_LAYOUT" == "true" ]]; then
+    log_step "3. Seeding ${TOTAL_ROWS} rows via single-writer deterministic ordered insert"
     run_psql "$DB_NAME" -q -c "
+    SET max_parallel_workers_per_gather = 0;
     INSERT INTO \"${TABLE_NAME}\" (id, sensor_code, scatter_key, reading, payload)
     SELECT
         i,
@@ -283,24 +309,48 @@ for (( worker=0; worker<EFFECTIVE_WORKERS; worker++ )); do
         ((('x' || substr(md5(i::text), 1, 8))::bit(32)::bigint & 2147483647) % 1000000)::int,
         ((('x' || substr(md5((i || ':r')::text), 1, 8))::bit(32)::bigint & 2147483647)::double precision / 21474836.47),
         repeat(md5(i::text), 5)
-    FROM generate_series(${start_id}, ${end_id}) AS s(i);
-    " &
-    PIDS+=("$!")
-done
+    FROM generate_series(1, ${TOTAL_ROWS}) AS s(i)
+    ORDER BY i;
+    "
+    INSERT_SEC=$(( $(date +%s) - START_TS ))
+    log_ok "Inserted ${TOTAL_ROWS} deterministic ordered rows in ${INSERT_SEC}s"
+else
+    log_step "3. Seeding ${TOTAL_ROWS} deterministic rows across ${EFFECTIVE_WORKERS} workers"
+    for (( worker=0; worker<EFFECTIVE_WORKERS; worker++ )); do
+        start_id=$(( worker * ROWS_PER_WORKER + 1 ))
+        if (( worker == EFFECTIVE_WORKERS - 1 )); then
+            end_id="$TOTAL_ROWS"
+        else
+            end_id=$(( (worker + 1) * ROWS_PER_WORKER ))
+        fi
 
-WORKER_FAIL=0
-for pid in "${PIDS[@]}"; do
-    if ! wait "$pid"; then
-        WORKER_FAIL=1
+        run_psql "$DB_NAME" -q -c "
+        INSERT INTO \"${TABLE_NAME}\" (id, sensor_code, scatter_key, reading, payload)
+        SELECT
+            i,
+            (i % 1000)::int,
+            ((('x' || substr(md5(i::text), 1, 8))::bit(32)::bigint & 2147483647) % 1000000)::int,
+            ((('x' || substr(md5((i || ':r')::text), 1, 8))::bit(32)::bigint & 2147483647)::double precision / 21474836.47),
+            repeat(md5(i::text), 5)
+        FROM generate_series(${start_id}, ${end_id}) AS s(i);
+        " &
+        PIDS+=("$!")
+    done
+
+    WORKER_FAIL=0
+    for pid in "${PIDS[@]}"; do
+        if ! wait "$pid"; then
+            WORKER_FAIL=1
+        fi
+    done
+    PIDS=()
+    if [[ "$WORKER_FAIL" -ne 0 ]]; then
+        log_fatal "One or more parallel seed workers exited with an error."
     fi
-done
-PIDS=()
-if [[ "$WORKER_FAIL" -ne 0 ]]; then
-    log_fatal "One or more parallel seed workers exited with an error."
-fi
 
-INSERT_SEC=$(( $(date +%s) - START_TS ))
-log_ok "Inserted ${TOTAL_ROWS} deterministic rows across ${EFFECTIVE_WORKERS} workers in ${INSERT_SEC}s"
+    INSERT_SEC=$(( $(date +%s) - START_TS ))
+    log_ok "Inserted ${TOTAL_ROWS} deterministic rows across ${EFFECTIVE_WORKERS} workers in ${INSERT_SEC}s"
+fi
 
 # 4. Build B-Tree scatter index using parallel maintenance workers
 log_step "4. Building B-Tree index '${INDEX_NAME}' (${MAINT_WORKERS} maintenance workers)"
@@ -319,16 +369,23 @@ log_ok "VACUUM (FREEZE, ANALYZE) and CHECKPOINT complete"
 
 # 6. Verify final heap and index footprint
 log_step "6. Verifying table footprint"
-run_psql "$DB_NAME" -v node_host="$(hostname)" -c "
+run_psql "$DB_NAME" \
+    -v node_host="$(hostname)" \
+    -v db_name="$DB_NAME" \
+    -v table_name="$TABLE_NAME" \
+    -v table_mode="$TABLE_MODE" \
+    -v layout_mode="$LAYOUT_MODE" \
+    -v workers="$EFFECTIVE_WORKERS" <<'SQL'
 SELECT
     :'node_host' AS node,
-    '${DB_NAME}' AS db_name,
-    '${TABLE_NAME}' AS table_name,
-    '${TABLE_MODE}' AS table_mode,
-    ${EFFECTIVE_WORKERS} AS workers,
+    :'db_name' AS db_name,
+    :'table_name' AS table_name,
+    :'table_mode' AS table_mode,
+    :'layout_mode' AS layout_mode,
+    :workers AS workers,
     count(*) AS row_count,
-    pg_size_pretty(pg_relation_size('\"${TABLE_NAME}\"')) AS heap_size,
-    pg_size_pretty(pg_indexes_size('\"${TABLE_NAME}\"')) AS index_size,
-    pg_size_pretty(pg_total_relation_size('\"${TABLE_NAME}\"')) AS total_size
-FROM \"${TABLE_NAME}\";
-"
+    pg_size_pretty(pg_relation_size(format('%I', :'table_name')::regclass)) AS heap_size,
+    pg_size_pretty(pg_indexes_size(format('%I', :'table_name')::regclass)) AS index_size,
+    pg_size_pretty(pg_total_relation_size(format('%I', :'table_name')::regclass)) AS total_size
+FROM :"table_name";
+SQL

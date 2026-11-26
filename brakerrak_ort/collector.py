@@ -41,8 +41,10 @@ from brakerrak_ort.probes import (
     sample_quiescent_metrics,
 )
 from brakerrak_ort.profiles import (
+    ACCELERATOR_PERSONAS,
     ROLE_STEM_MAP,
     SocProfile,
+    get_accelerator_link_floor,
     normalize_role,
     resolve_profile,
 )
@@ -397,29 +399,43 @@ def _build_accelerator_link_assertion(
         }
 
     parts: list[str] = []
+    floor_labels: list[str] = []
     overall: AssertionStatus = "PASS"
     for acc in pcie_accelerators:
-        acc_speed = acc["pcie_link_speed"]
-        acc_width = acc["pcie_link_width"]
-        if acc_speed:
-            acc_gt_s = parse_gt_per_sec(acc_speed)
-            if acc_gt_s != 0.0 and acc_gt_s < profile.min_gt_s:
-                overall = "WARN"
-            parts.append(
-                f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] "
-                f"({acc_speed} | x{acc_width or '?'})"
-            )
-        else:
-            parts.append(
-                f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] (detected)"
-            )
+        acc_speed = (acc.get("pcie_link_speed") or "").strip()
+        acc_width = (acc.get("pcie_link_width") or "").strip()
+        eff_min_gt_s, eff_min_width = get_accelerator_link_floor(acc["vendor_id"], profile)
+        floor_labels.append(f">= {eff_min_gt_s:.1f} GT/s PCIe | >= x{eff_min_width}")
+
+        acc_gt_s = parse_gt_per_sec(acc_speed or None)
+        acc_width_val = parse_pcie_width(acc_width or None)
+        if (
+            not acc_speed
+            or not acc_width
+            or acc_gt_s <= 0.0
+            or acc_width_val <= 0
+            or acc_gt_s < eff_min_gt_s
+            or acc_width_val < eff_min_width
+        ):
+            overall = "WARN"
+
+        speed_disp = acc_speed if acc_speed else "unknown speed"
+        width_disp = (
+            f"x{acc_width_val}"
+            if acc_width_val > 0
+            else (f"x{acc_width}" if acc_width.isdigit() else "x?")
+        )
+        parts.append(
+            f"{acc['vendor_name']} [{acc['vendor_id']}:{acc['device_id']}] "
+            f"({speed_disp} | {width_disp})"
+        )
 
     return {
         "id": assertion_id,
         "description": (
             "PCIe Accelerator Seated (NPU/GPU occupying M.2/PCIe slot; NVMe optional)"
         ),
-        "expected": "PCIe accelerator present (e.g., 1e60:* / 1e52:*)",
+        "expected": "; ".join(dict.fromkeys(floor_labels)),
         "actual": "; ".join(parts),
         "status": overall,
     }
@@ -453,22 +469,28 @@ def evaluate_assertions(
     wireless_coprocessor: WirelessCoprocessorInfo | Mapping[str, Any] | None = None,
     block_devices: Sequence[Mapping[str, Any]] = (),
     c6_sdio_disabled: bool = False,
+    xfs_supported: bool = True,
 ) -> list[AssertionResult]:
     """Evaluate hardware, bus, network, thermal, and stage-aware Day-1 ORT assertions."""
     active_env = os.environ if env is None else env
     role_lower = node_role.strip().lower()
-    is_accel_persona = role_lower.startswith(("vision", "babbage"))
+    normalized_role = normalize_role(role_lower) or role_lower
+    is_accel_persona = normalized_role in ACCELERATOR_PERSONAS
     pg_explicit = _is_explicit_flag("ENABLE_POSTGRES", node_env, active_env)
     mqtt_explicit = _is_explicit_flag("ENABLE_MQTT_BROKER", node_env, active_env)
     nfs_explicit = _is_explicit_flag("ENABLE_NFS_SERVER", node_env, active_env)
 
     if profile.has_mmu:
-        enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, role_lower, active_env)
-        enable_mqtt = resolve_feature_flag("ENABLE_MQTT_BROKER", node_env, role_lower, active_env)
-        enable_nfs = resolve_feature_flag("ENABLE_NFS_SERVER", node_env, role_lower, active_env)
+        enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, normalized_role, active_env)
+        enable_mqtt = resolve_feature_flag(
+            "ENABLE_MQTT_BROKER", node_env, normalized_role, active_env
+        )
+        enable_nfs = resolve_feature_flag(
+            "ENABLE_NFS_SERVER", node_env, normalized_role, active_env
+        )
     else:
         enable_pg = (pg_explicit is True) or (
-            pg_explicit is None and role_lower in ("databroker", "databench")
+            pg_explicit is None and normalized_role in ("databroker", "databench")
         )
         enable_mqtt = mqtt_explicit is True
         enable_nfs = nfs_explicit is True
@@ -591,24 +613,21 @@ def evaluate_assertions(
                 }
             )
     elif nvme_present:
-        actual_gt_s = parse_gt_per_sec(
-            str(nvme_info["pcie_link_speed"])
-            if nvme_info.get("pcie_link_speed") is not None
-            else None
-        )
-        actual_width = parse_pcie_width(
-            str(nvme_info["pcie_link_width"])
-            if nvme_info.get("pcie_link_width") is not None
-            else None
-        )
         link_speed_raw = nvme_info.get("pcie_link_speed")
         link_width_raw = nvme_info.get("pcie_link_width")
+        actual_gt_s = parse_gt_per_sec(
+            str(link_speed_raw) if link_speed_raw is not None else None
+        )
+        actual_width = parse_pcie_width(
+            str(link_width_raw) if link_width_raw is not None else None
+        )
+        is_generic = profile.slug == "generic-riscv64"
         if link_speed_raw is None:
-            pcie_status: AssertionStatus = (
-                "PASS" if profile.slug == "generic-riscv64" else "WARN"
-            )
+            pcie_status: AssertionStatus = "PASS" if is_generic else "WARN"
+        elif link_width_raw is None and not is_generic:
+            pcie_status = "WARN"
         elif actual_gt_s >= profile.min_gt_s and (
-            actual_width == 0 or actual_width >= profile.min_width
+            actual_width >= profile.min_width or (is_generic and actual_width == 0)
         ):
             pcie_status = "PASS"
         else:
@@ -618,7 +637,10 @@ def evaluate_assertions(
                 "id": "ORT-03_PCIE_NVME_LINK",
                 "description": profile.pcie_desc,
                 "expected": f">= {profile.min_gt_s:.1f} GT/s PCIe | >= x{profile.min_width}",
-                "actual": f"{link_speed_raw} | x{link_width_raw}",
+                "actual": (
+                    f"{link_speed_raw if link_speed_raw is not None else 'unknown'} | "
+                    f"x{link_width_raw if link_width_raw is not None else '?'}"
+                ),
                 "status": pcie_status,
             }
         )
@@ -630,7 +652,7 @@ def evaluate_assertions(
                     profile,
                 )
             )
-    elif is_accel_persona and not enable_pg:
+    elif is_accel_persona and not enable_pg and not enable_nfs:
         ort_03_checks.append(
             _build_accelerator_link_assertion(
                 "ORT-03_PCIE_ACCELERATOR_LINK",
@@ -733,15 +755,32 @@ def evaluate_assertions(
                     }
                 )
 
-            if (nvme_present or enable_pg) and nvme_mount_info is not None:
+            skip_accel_data_mount = (
+                is_accel_persona and not nvme_present and not enable_pg and not enable_nfs
+            )
+            if (
+                (nvme_present or enable_pg or enable_nfs)
+                and not skip_accel_data_mount
+                and nvme_mount_info is not None
+            ):
+                allow_ext4 = profile.slug == "starfive-jh7110" or not xfs_supported
+                allowed_fstypes: tuple[str, ...] = ("xfs", "ext4") if allow_ext4 else ("xfs",)
                 xfs_mounted = bool(nvme_mount_info.get("mounted"))
-                xfs_fstype = nvme_mount_info.get("fstype")
-                xfs_ok = xfs_mounted and xfs_fstype == "xfs"
+                raw_fstype = nvme_mount_info.get("fstype")
+                xfs_fstype = (
+                    raw_fstype.strip().lower()
+                    if isinstance(raw_fstype, str) and raw_fstype.strip()
+                    else None
+                )
+                xfs_ok = xfs_mounted and xfs_fstype in allowed_fstypes
+                desc_fs = "XFS/ext4" if allow_ext4 else "XFS"
                 checks.append(
                     {
                         "id": "ORT-D1_NVME_XFS_MOUNT",
-                        "description": f"Primary NVMe Data Volume ({mount_point}) Mounted as XFS",
-                        "expected": "mounted (xfs)",
+                        "description": (
+                            f"Primary NVMe Data Volume ({mount_point}) Mounted as {desc_fs}"
+                        ),
+                        "expected": f"mounted ({' | '.join(allowed_fstypes)})",
                         "actual": (
                             f"mounted ({xfs_fstype or 'unknown'})"
                             if xfs_mounted
@@ -878,15 +917,7 @@ def evaluate_assertions(
                 )
 
         if enable_mqtt:
-            raw_req_mqtt = (
-                active_env.get("REQUIRE_MQTT_BROKER")
-                if active_env.get("REQUIRE_MQTT_BROKER") is not None
-                else node_env.get("REQUIRE_MQTT_BROKER")
-            )
-            if raw_req_mqtt is not None and raw_req_mqtt.strip() != "":
-                mqtt_required = raw_req_mqtt.strip().lower() in ("1", "true", "yes", "on")
-            else:
-                mqtt_required = role_lower == "databroker"
+            mqtt_required = _is_explicit_flag("REQUIRE_MQTT_BROKER", node_env, active_env) is True
 
             raw_mqtt = broker_services_state.get("mosquitto_mqtt")
             mqtt_map = raw_mqtt if isinstance(raw_mqtt, Mapping) else {}
@@ -1380,6 +1411,16 @@ def collect_snapshot(
 
     total_ram_kb = probe.get_total_ram_kb()
     soc_peak_c = resolve_soc_peak_temp(quiescent["thermal_zones_celsius"])
+    proc_filesystems = probe.read_text("/proc/filesystems")
+    xfs_supported = (
+        True
+        if not proc_filesystems
+        else any(
+            line.split()[-1] == "xfs"
+            for line in proc_filesystems.splitlines()
+            if line.strip()
+        )
+    )
     ort_checks = evaluate_assertions(
         profile=profile,
         stage=stage,
@@ -1407,6 +1448,7 @@ def collect_snapshot(
         wireless_coprocessor=wireless_coprocessor_info,
         block_devices=block_devices,
         c6_sdio_disabled=c6_disabled,
+        xfs_supported=xfs_supported,
     )
     overall_status = compute_overall_status(ort_checks)
 
@@ -1567,7 +1609,8 @@ def write_json_atomic(
 
 def build_snapshot_stem(node_role: str, stage: str, now_utc: datetime.datetime) -> str:
     """Construct persona-aligned snapshot filename stem across all SoCs."""
-    stem_prefix = ROLE_STEM_MAP.get(node_role.strip().lower(), "brakerrak")
+    normalized_role = normalize_role(node_role) or node_role.strip().lower()
+    stem_prefix = ROLE_STEM_MAP.get(normalized_role, "brakerrak")
     safe_stage = re.sub(r"[^a-zA-Z0-9_-]", "-", stage)
     epoch_sec = int(now_utc.timestamp())
     iso_compact = now_utc.strftime("%Y%m%dT%H%M%SZ")

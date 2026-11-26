@@ -14,3 +14,8 @@
 | **BrakerBench-VF2 (sfctemp)** | 37.71°C to 34.00°C | 47.76°C / 51.28°C | 44.00°C / 44.38°C | 41.33°C / 41.83°C |
 | **Vision-Node (sfctemp)** | 34.17°C to 30.00°C | 43.40°C / 46.58°C | 40.55°C / 40.90°C | 38.00°C / 38.00°C |
 | **Edge-Router (soc)** | 36.00°C (Passive) | N/A | N/A | N/A |
+
+## Methodology Caveats
+
+- **Sequential Sweep Thermal Carryover (`pwm_50_pct`):** The `0%`, `50%`, and `100%` PWM soak stages were executed sequentially without waiting for sensors to return to `quiescent_idle_min_c` between runs. Consequently, `pwm_50_pct` starts from an elevated thermal baseline (`idle_c`: `44.97°C` vs `42.92°C` at `0%` / `37.00°C` quiescent on `BrakerBox-P550 pvt`; `32.85°C` carried into `50%` and `100%` on `BrakerBox-P550 nvme`; `38.06°C` vs `37.71°C` on `BrakerBench-VF2`; `34.75°C` vs `34.17°C` on `Vision-Node`), understating steady-state cooling delta relative to cold-start `0%` sweeps.
+- **Schema Scope (`ctd.thermal.v1`):** The signed [`artifacts/ctd-thermal-soak-baseline.json`](../artifacts/ctd-thermal-soak-baseline.json) capture records aggregate `idle_c`, `mean_c`, `peak_c`, and `rise_over_ambient_c` scalars only; it omits per-sample clock/frequency telemetry (`cpufreq` / thermal throttle indicators) and distribution percentiles (`p50` / `p95` / `p99` / `stddev`). The JSON artifact is preserved unmodified to retain its SHA-256 provenance digest.

@@ -30,7 +30,7 @@ Because an RTOS/ESP-IDF `riscv32` target cannot run CPython 3.12 or local Linux 
 | **Wireless Co-Processor** | Onboard `ESP32-C6` over SDIO (`esp-hosted`) | Wi-Fi 6 (`802.11ax`) + BLE 5.3 (`wlan0`), toggleable via `c6-sdio` quirk |
 | **Wired Network** | `IP101GRI` 100M RMII Ethernet PHY (`eth0`) | Deterministic wired fallback when `c6-sdio` quirk is disabled |
 | **Debug & Host Proxy** | Native USB-Serial-JTAG (`303a:1001`) + USB 2.0 OTG HS | `/dev/ttyACM0` (Linux) or `/dev/cu.usbmodem*` (macOS) for `esptool` & ORT proxy |
-| **Rack Placement** | 2U Vented Rack Shelf (`SHLF`) | Co-located alongside `DevBench-RV2`, `BrakerBench-VF2`, and `VisionBench-VF2` |
+| **Rack Placement** | Open Benchtop or Vented 1U/2U Rack Shelf | Host-proxied over USB-Serial-JTAG to an adjacent workstation or `BrakerRak` Linux host |
 
 ---
 

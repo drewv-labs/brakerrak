@@ -31,8 +31,8 @@ The BrakerBox-P550 also offers support for `custom RAID storage tiers`, `Mosquit
 | **Boot / Root OS** | 128GB Soldered eMMC (`mmcblk0`) | Ubuntu 24.04 LTS (`multi-user.target` headless strip) |
 | **Tier 0 (Hot NVMe)** | 2TB `WD_BLACK SN850X` (`nvme0n1`) + `be quiet! MC1` Heatsink | PCIe Gen3 x4 (`8.0 GT/s`), formatted to native `4096B` (`4Kn`) LBA |
 | **PCIe Riser Assembly** | StarTech `PEX4M2E1` + Folded Twin-Axial PCIe x4 Ribbon Riser | Anchored to chassis floor via ATX standoff + elastomer isolation bumpers |
-| **Tier 1 (Warm Vault)** | `WarmVault` (`Slot-C`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 12TB WD Red Plus CMR (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/warm_vault`) |
-| **Tier 2 (Cold Archive)** | `ColdVault` (`Slot-D`) — SilverStone 4-Bay USB 3.2 Gen 1 | 4x 6TB WD Blue (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/cold_vault`) |
+| **Tier 1 (Warm Vault)** | `WarmVault` — SilverStone 4-Bay USB 3.2 Gen 1 JBOD (External Bay 1) | 4x 12TB WD Red Plus CMR (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/warm_vault`) |
+| **Tier 2 (Cold Archive)** | `ColdVault` — SilverStone 4-Bay USB 3.2 Gen 1 JBOD (External Bay 2) | 4x 6TB WD Blue (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`, `/mnt/cold_vault`) |
 | **Chassis & Power** | SilverStone `SST-RM100` (1U) + PicoPSU / Internal 12V Brick | 3x 40mm chassis fans controlled via Noctua NA-FC1 |
 
 ### USB Root Hub Topology Note
@@ -51,8 +51,8 @@ Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sec
 
 ### C. PostgreSQL 18 Drop-In Configuration (`99-rvdk-sifive-p550.conf`)
 * **Async I/O Engine:** `io_method = io_uring` (auto-verified against `liburing` linkage and `kernel.io_uring_disabled = 0`)
-* **Memory Allocation (32GB LPDDR5):** `shared_buffers = 8GB`, `effective_cache_size = 24GB`, `work_mem = 64MB`, `maintenance_work_mem = 2GB`, `huge_pages = try`
-* **RVA20 4-Hart OoO Execution:** `jit = off` (avoids LLVM JIT compilation overhead on scalar RVA20), `max_worker_processes = 4`, `max_parallel_workers = 4`, `max_parallel_workers_per_gather = 2`
+* **Memory Allocation (32GB LPDDR5):** `shared_buffers = 8GB` (pinned via `vm.nr_hugepages = 4352` — `~4,352 × 2MB` Sv39 HugePages in `90-rvdk-pg18-hugepages.conf`, covering `8GB` shared buffers plus PostgreSQL metadata and `io_uring` ring overhead), `effective_cache_size = 24GB`, `work_mem = 64MB`, `maintenance_work_mem = 2GB`, `huge_pages = try`
+* **RVA20 4-Hart OoO Execution:** `jit = off` (avoids LLVM JIT compilation overhead on scalar RVA20), `max_worker_processes = 8`, `max_parallel_workers = 4`, `max_parallel_workers_per_gather = 2`
 * **WAL & Checkpoints:** `wal_compression = zstd`, `wal_buffers = 64MB`, `min_wal_size = 2GB`, `max_wal_size = 16GB`, `checkpoint_completion_target = 0.9`
 
 ---
@@ -65,8 +65,10 @@ Factory `WD_BLACK SN850X` drives ship in emulated `512e` (`512`-byte logical sec
 * **Sustained IPC (`1.038`):** Retired **`4.54 trillion` instructions** across **`4.38 trillion` cycles** in `2,961.55s` (`49m 21.5s`).
 * **Branch Predictor Accuracy (`95.72%`):** `659.07 billion` branches executed with only `28.24 billion` mispredictions (`4.28%` miss rate).
 
-### B. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Preliminary Baseline)
-Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN850X` (`PCIe Gen3 x4`, `shared_buffers = 8GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
+### B. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Exploratory Single-Pass Baseline)
+> **Methodology Note:** The table below reports **exploratory single-pass baseline measurements** (`N=1`) captured prior to multi-iteration statistical aggregation. Formal quantile characterization (`min` / `p50` / `p95` / `p99` across repeated cold-cache passes) is pending multi-iteration `brakerrak bench showdown --iterations 5 --analyze` runs processed by `benchmarks/analyze_showdown.py`.
+
+Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN850X` (`PCIe Gen3 x4`, `shared_buffers = 8GB` in `~4,352 × 2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
 
 | Workload & Metric | `sync` | `worker` | `io_uring` | `io_uring` + `O_DIRECT` |
 | :--- | :--- | :--- | :--- | :--- |

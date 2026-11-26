@@ -16,7 +16,7 @@ DREW-V Labs presents this `brakerbench-vf2` build as a 1U rack-shelf RISC-V rela
 
 By switching to `io_uring`, PostgreSQL eliminates traditional synchronous blocking reads during large data scans and maintenance tasks. It establishes a shared ring buffer directly between user space and the Linux kernel, minimizing context switching and system call overhead—critical on Dual-Issue In-Order `SiFive U74` harts where syscall traps and `io worker` IPC stalls cannot be hidden behind out-of-order speculative execution.
 
-When provisioned with `--role databroker` (`BrakerBox-VF2`), this target also offers full support for `custom RAID storage tiers` (`mdadm` XFS or native kernel `Btrfs RAID 10`), `Mosquitto MQTT` brokering, & `NFSv4` hosting to cover standalone edge data brokering needs.
+When provisioned with `--role databroker` (`BrakerBox-VF2`), this target also offers full support for `custom RAID storage tiers` (native kernel `Btrfs RAID 10`), `Mosquitto MQTT` brokering, & `NFSv4` hosting to cover standalone edge data brokering needs.
 
 ---
 
@@ -30,7 +30,7 @@ When provisioned with `--role databroker` (`BrakerBox-VF2`), this target also of
 | **System Memory** | 8GB LPDDR4-2800 (4GB variant supported) | 32-bit bus, soldered on PCB (see §3.C memory profiles) |
 | **Boot / Root OS** | 16MB QSPI NOR (`SPL` + `U-Boot`) + microSD / eMMC | Debian Headless (`riscv64`, `multi-user.target` headless strip) |
 | **Tier 0 (Hot NVMe)** | 2TB `WD_BLACK SN750` (`nvme0n1`) | Underside M.2 M-Key (`2280`), PCIe Gen2 x1 (`5.0 GT/s`), native `4096B` (`4Kn`) LBA |
-| **Optional RAID Tiers** | Configurable via `RAID_ARRAYS_JSON` (`--with-raid`) | External USB 3.0 4-Bay JBOD (`mdadm` RAID 10 + XFS or native `Btrfs RAID 10`) |
+| **Optional RAID Tiers** | Configurable via `RAID_ARRAYS_JSON` (`--with-raid`) | External USB 3.0 4-Bay JBOD (native kernel `Btrfs RAID 10`, `compress=zstd:3,nofail`) |
 | **Thermal Armor** | `youyeetoo` Passive Finned Aluminum Enclosure | Under-PCB shelf cutouts for direct airflow across underside M.2 NVMe |
 | **Chassis & Cooling** | 1U Vented Honeycomb Shelf (`Slot-A`) + USB-C PD | 5x 40mm front-intake PWM fans controlled via Noctua `NA-FC1` |
 
@@ -64,23 +64,19 @@ Factory `WD_BLACK` NVMe drives ship in emulated `512e` (`512`-byte logical secto
 ### A. Zero-Cache PostgreSQL 18.6 Source Compilation (`perf stat`)
 * **Target Silicon:** StarFive JH7110 (`4x SiFive U74` 2-Wide In-Order harts @ `1.5 GHz`, `8GB LPDDR4`)
 * **Compiler Flags:** `-O3 -pipe -march=rv64gc_zba_zbb -mcpu=sifive-u74 -mtune=sifive-u74`
-* **Sustained IPC (`TBD`):** Retired **`TBD`** instructions across **`TBD`** cycles in `TBD` (`TBD`).
-* **Branch Predictor Accuracy (`TBD`):** `TBD` branches executed with `TBD` mispredictions (`TBD` miss rate).
+* **Telemetry Status:** *Pending bare-metal `perf stat` capture on `StarFive JH7110` (`8GB LPDDR4`); sustained IPC, retired instructions/cycles, elapsed compile time, and branch predictor miss rate will be published alongside `brakerrak bench showdown --iterations 5` runs.*
 
-### B. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Preliminary Baseline)
-Evaluated on a 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN750` (`PCIe Gen2 x1`, 8 GB VF2 profile: `shared_buffers = 2GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`):
+### B. PostgreSQL 18.6 `io_uring` I/O Torture Suite (Pending Capture)
+> **Pending Bare-Metal Capture:** Multi-iteration JH7110 showdown metrics (`sync`, `worker`, `io_uring`, and `io_uring` + `O_DIRECT` across Seq Scan Wall Time, Seq Scan Backend I/O Wait, Bitmap Scan Wall Time, Bitmap Scan Context Switches, and Bitmap Scan L1d Cache Misses) are pending capture via `brakerrak bench showdown --iterations 5`.
 
-| Workload & Metric | `sync` | `worker` | `io_uring` | `io_uring` + `O_DIRECT` |
-| :--- | :--- | :--- | :--- | :--- |
-| **Seq Scan Wall Time** | — | — | — | — |
-| **Seq Scan Backend I/O Wait** | — | — | — | — |
-| **Bitmap Scan Wall Time** | — | — | — | — |
-| **Bitmap Scan Context Switches** | — | — | — | — |
-| **Bitmap Scan L1d Cache Misses** | — | — | — | — |
+Target configuration: 50-million-row (`11 GB`, `1,351,353` pages) table on a `4Kn`-formatted `WD_BLACK SN750` (`PCIe Gen2 x1`, 8 GB VF2 profile: `shared_buffers = 2GB` in `2MB Sv39` HugePages) after cold-cache drop (`drop_caches = 3`).
 
-To evaluate the `io_uring` + `O_DIRECT` column during a showdown run, pass `--with-direct-io`:
 ~~~bash
-sudo brakerrak bench showdown --with-direct-io
+# Capture 5-iteration cold-cache showdown quantiles (min / p50 / p95 / p99)
+sudo brakerrak bench showdown --iterations 5 --analyze
+
+# Include the io_uring + O_DIRECT ablation column
+sudo brakerrak bench showdown --iterations 5 --with-direct-io --analyze
 ~~~
 `--with-direct-io` sets `debug_io_direct = 'data'` via `ALTER SYSTEM`, restarts PostgreSQL (verifying `pending_restart = 'f'`), and cleanly restores the baseline GUC on teardown.
 

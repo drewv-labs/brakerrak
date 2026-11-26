@@ -54,7 +54,7 @@ done
 
 if [[ $EUID -ne 0 && "$_HAS_STAGE_DIR" != "true" ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-        _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_BIN,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TS_AUTHKEY,RVDK_INSTALL_SHA256,BRAKERRAK_INSTALL_SHA256,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
+        _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,BRAKERRAK_LEGACY_RVDK_COMPAT,BOARD_SLUG,RVDK_BIN,RVDK_ENGINE_DIR,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TS_AUTHKEY,RVDK_INSTALL_SHA256,BRAKERRAK_INSTALL_SHA256,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
         exec sudo --preserve-env="$_sudo_preserve_env" bash "${BASH_SOURCE[0]}" "$@"
     else
         log_fatal "Run as root or via 'sudo brakerrak verify'."
@@ -66,10 +66,15 @@ brak_resolve_node_env --migrate
 
 SNAP_DIR="${REAL_HOME}/.brakerrak/snapshots"
 CLI_TARGET="${BRAKERRAK_TARGET:-}"
+CLI_ROLE=""
 CLI_MEDIA=""
 CLI_STAGE_DIR=""
 CLI_MOUNT_POINT=""
+CLI_NVME_DEV=""
 CLI_ENABLE_PG=""
+CLI_ENABLE_NFS=""
+CLI_ENABLE_MQTT=""
+CLI_WITH_RAID=""
 CLI_TELEMETRY_JSON=""
 CLI_SERIAL_PORT=""
 PASS1_ARGS=()
@@ -93,6 +98,23 @@ while [[ $# -gt 0 ]]; do
             PASS1_ARGS+=("--target" "$_tval")
             PASS2_ARGS+=("--target" "$_tval")
             ORT_ARGS+=("--target" "$_tval")
+            shift
+            ;;
+        --role)
+            brak_require_arg "$1" "${2:-}"
+            CLI_ROLE="$(brak_normalize_role "$2")"
+            [[ -z "$CLI_ROLE" ]] && CLI_ROLE="$(tr '[:upper:]' '[:lower:]' <<< "$2")"
+            PASS1_ARGS+=("--role" "$2")
+            PASS2_ARGS+=("--role" "$2")
+            shift 2
+            ;;
+        --role=*)
+            _rval="${1#*=}"
+            brak_require_arg "--role" "$_rval"
+            CLI_ROLE="$(brak_normalize_role "$_rval")"
+            [[ -z "$CLI_ROLE" ]] && CLI_ROLE="$(tr '[:upper:]' '[:lower:]' <<< "$_rval")"
+            PASS1_ARGS+=("--role" "$_rval")
+            PASS2_ARGS+=("--role" "$_rval")
             shift
             ;;
         --media)
@@ -153,6 +175,20 @@ while [[ $# -gt 0 ]]; do
             ORT_ARGS+=("--serial-port" "$_sp")
             shift
             ;;
+        --nvme-dev)
+            brak_require_arg "$1" "${2:-}"
+            CLI_NVME_DEV="$2"
+            PASS1_ARGS+=("--nvme-dev" "$2")
+            PASS2_ARGS+=("--nvme-dev" "$2")
+            shift 2
+            ;;
+        --nvme-dev=*)
+            CLI_NVME_DEV="${1#*=}"
+            brak_require_arg "--nvme-dev" "$CLI_NVME_DEV"
+            PASS1_ARGS+=("--nvme-dev" "$CLI_NVME_DEV")
+            PASS2_ARGS+=("--nvme-dev" "$CLI_NVME_DEV")
+            shift
+            ;;
         --mount-point)
             brak_require_arg "$1" "${2:-}"
             CLI_MOUNT_POINT="$2"
@@ -167,14 +203,50 @@ while [[ $# -gt 0 ]]; do
             PASS2_ARGS+=("--mount-point" "$CLI_MOUNT_POINT")
             shift
             ;;
-        --with-pg)
+        --with-pg|--with-postgres)
             CLI_ENABLE_PG="true"
             PASS1_ARGS+=("$1")
             PASS2_ARGS+=("$1")
             shift
             ;;
-        --no-pg)
+        --no-pg|--no-postgres)
             CLI_ENABLE_PG="false"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --with-nfs)
+            CLI_ENABLE_NFS="true"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --no-nfs)
+            CLI_ENABLE_NFS="false"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --with-mqtt)
+            CLI_ENABLE_MQTT="true"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --no-mqtt)
+            CLI_ENABLE_MQTT="false"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --with-raid)
+            CLI_WITH_RAID="true"
+            PASS1_ARGS+=("$1")
+            PASS2_ARGS+=("$1")
+            shift
+            ;;
+        --no-raid)
+            CLI_WITH_RAID="false"
             PASS1_ARGS+=("$1")
             PASS2_ARGS+=("$1")
             shift
@@ -211,24 +283,109 @@ if [[ -n "$CLI_STAGE_DIR" ]]; then
     fi
 fi
 
+_verify_is_accel_persona() {
+    local role="${1:-}"
+    if declare -F brak_normalize_role >/dev/null 2>&1; then
+        local norm=""
+        norm="$(brak_normalize_role "$role")"
+        [[ -n "$norm" ]] && role="$norm"
+    else
+        role="$(tr '[:upper:]' '[:lower:]' <<< "$role")"
+    fi
+    case "$role" in
+        visionbox|visionbench|babbagebox|babbagebench) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+_verify_is_accel_nvme_skip() {
+    _verify_is_accel_persona "${NODE_ROLE:-}" || return 1
+    [[ "${ENABLE_POSTGRES:-true}" != "true" && "${ENABLE_NFS_SERVER:-false}" != "true" && ! -b "${NVME_DEV:-/dev/nvme0n1}" ]]
+}
+
+_verify_kernel_has_xfs() {
+    local proc_fs="${PROC_FILESYSTEMS_PATH:-/proc/filesystems}"
+    [[ -r "$proc_fs" ]] || return 0
+    grep -qE '(^|[[:space:]])xfs([[:space:]]|$)' "$proc_fs"
+}
+
+_verify_allows_ext4_data_fs() {
+    [[ "${TARGET_BOARD:-}" == "starfive-jh7110" ]] && return 0
+    ! _verify_kernel_has_xfs
+}
+
 _verify_refresh_node_vars() {
     MOUNT_POINT="/mnt/nvme_pgdata"
+    NVME_DEV="/dev/nvme0n1"
     ENABLE_POSTGRES="true"
+    ENABLE_NFS_SERVER="false"
+    ENABLE_MQTT_BROKER="false"
+    WITH_RAID="false"
     STORAGE_MEDIA="nvme"
     TARGET_ARCH="riscv64"
-    NODE_ROLE=""
+    NODE_ROLE="${CLI_ROLE:-}"
     TARGET_BOARD=""
+    if [[ -n "$NODE_ROLE" ]]; then
+        local _cli_norm=""
+        _cli_norm="$(brak_normalize_role "$NODE_ROLE")"
+        if [[ -n "$_cli_norm" ]]; then
+            NODE_ROLE="$_cli_norm"
+        else
+            NODE_ROLE="$(tr '[:upper:]' '[:lower:]' <<< "$NODE_ROLE")"
+        fi
+        case "$NODE_ROLE" in
+            databroker)
+                ENABLE_POSTGRES="true"
+                ENABLE_MQTT_BROKER="true"
+                ENABLE_NFS_SERVER="true"
+                ;;
+            databench)
+                ENABLE_POSTGRES="true"
+                ;;
+            devbench)
+                ENABLE_POSTGRES="true"
+                ENABLE_MQTT_BROKER="true"
+                ;;
+            babbagebox|babbagebench|visionbox|visionbench|snitchbench|lilsnitch)
+                ENABLE_POSTGRES="false"
+                ;;
+        esac
+    fi
     if brak_resolve_silicon "${CLI_TARGET:-}" >/dev/null 2>&1; then
         :
     fi
     if [[ -r "$NODE_ENV" ]]; then
-        brak_load_kv_env "$NODE_ENV" MOUNT_POINT ENABLE_POSTGRES STORAGE_MEDIA TARGET_ARCH NODE_ROLE || log_fatal "Failed to parse node config: ${NODE_ENV}"
+        brak_load_kv_env "$NODE_ENV" MOUNT_POINT NVME_DEV ENABLE_POSTGRES ENABLE_NFS_SERVER ENABLE_MQTT_BROKER WITH_RAID STORAGE_MEDIA TARGET_ARCH NODE_ROLE || log_fatal "Failed to parse node config: ${NODE_ENV}"
+    fi
+    if [[ -n "$CLI_ROLE" ]]; then
+        NODE_ROLE="$CLI_ROLE"
+    fi
+    if [[ -n "${NODE_ROLE:-}" ]]; then
+        local _norm_role=""
+        _norm_role="$(brak_normalize_role "$NODE_ROLE")"
+        if [[ -n "$_norm_role" ]]; then
+            NODE_ROLE="$_norm_role"
+        else
+            NODE_ROLE="$(tr '[:upper:]' '[:lower:]' <<< "$NODE_ROLE")"
+        fi
     fi
     if [[ -n "$CLI_MOUNT_POINT" ]]; then
         MOUNT_POINT="$CLI_MOUNT_POINT"
     fi
+    if [[ -n "$CLI_NVME_DEV" ]]; then
+        NVME_DEV="$CLI_NVME_DEV"
+    fi
     if [[ -n "$CLI_ENABLE_PG" ]]; then
         ENABLE_POSTGRES="$CLI_ENABLE_PG"
+    fi
+    if [[ -n "$CLI_ENABLE_NFS" ]]; then
+        ENABLE_NFS_SERVER="$CLI_ENABLE_NFS"
+    fi
+    if [[ -n "$CLI_ENABLE_MQTT" ]]; then
+        ENABLE_MQTT_BROKER="$CLI_ENABLE_MQTT"
+    fi
+    if [[ -n "$CLI_WITH_RAID" ]]; then
+        WITH_RAID="$CLI_WITH_RAID"
     fi
     if [[ -n "$CLI_MEDIA" ]]; then
         STORAGE_MEDIA="$CLI_MEDIA"
@@ -237,6 +394,9 @@ _verify_refresh_node_vars() {
         TARGET_ARCH="riscv32"
         STORAGE_MEDIA="sd"
         ENABLE_POSTGRES="false"
+        ENABLE_MQTT_BROKER="false"
+        ENABLE_NFS_SERVER="false"
+        WITH_RAID="false"
     fi
     IS_SD_TARGET="false"
     if [[ "$STORAGE_MEDIA" == "sd" || "$TARGET_ARCH" == "riscv32" || "${TARGET_BOARD:-}" == "espressif-esp32p4" || "$NODE_ROLE" == "snitchbench" || "$NODE_ROLE" == "lilsnitch" || -n "$CLI_STAGE_DIR" ]]; then
@@ -262,7 +422,7 @@ _verify_cleanup() {
 }
 brak_register_exit_hook _verify_cleanup
 
-_verify_get_xfs_uuid() {
+_verify_get_data_fs_uuid() {
     local mp="$1"
     local fstype="" src="" uuid=""
     if command -v findmnt >/dev/null 2>&1; then
@@ -270,8 +430,14 @@ _verify_get_xfs_uuid() {
         src="$(findmnt -n -o SOURCE "$mp" 2>/dev/null | head -n1 || true)"
         uuid="$(findmnt -n -o UUID "$mp" 2>/dev/null | head -n1 || true)"
     fi
-    if [[ -n "$fstype" && "$fstype" != "xfs" ]]; then
-        log_fatal "Convergence assertion FAILED: expected XFS on ${mp}, found '${fstype}'."
+    if [[ -n "$fstype" ]]; then
+        if _verify_allows_ext4_data_fs; then
+            if [[ "$fstype" != "xfs" && "$fstype" != "ext4" ]]; then
+                log_fatal "Convergence assertion FAILED: expected xfs or ext4 on ${mp}, found '${fstype}'."
+            fi
+        elif [[ "$fstype" != "xfs" ]]; then
+            log_fatal "Convergence assertion FAILED: expected XFS on ${mp}, found '${fstype}'."
+        fi
     fi
     if [[ -z "$uuid" && -n "$src" ]] && command -v blkid >/dev/null 2>&1; then
         uuid="$(blkid -s UUID -o value "$src" 2>/dev/null | head -n1 || true)"
@@ -474,11 +640,12 @@ bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"}
 
 _verify_refresh_node_vars
 
-PASS1_XFS_UUID=""
+PASS1_DATA_FS_UUID=""
 PASS1_CONFIG_DIGEST=""
 PASS1_SD_MOUNT_INFO=""
+ACCEL_NVME_SKIP="false"
 if [[ "$IS_SD_TARGET" == "true" ]]; then
-    log_skip "SD media target (${TARGET_BOARD:-espressif-esp32p4}, media=${STORAGE_MEDIA}); skipped XFS/NVMe UUID assertion"
+    log_skip "SD media target (${TARGET_BOARD:-espressif-esp32p4}, media=${STORAGE_MEDIA}); skipped NVMe data filesystem UUID assertion"
     PASS1_CONFIG_DIGEST="$(_verify_staged_config_digest)"
     if [[ -z "$PASS1_CONFIG_DIGEST" ]]; then
         log_fatal "Stage 1 assertion FAILED: unable to resolve staged config digest for ${NODE_ENV}."
@@ -486,12 +653,15 @@ if [[ "$IS_SD_TARGET" == "true" ]]; then
     if [[ -z "$CLI_STAGE_DIR" ]] && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
         PASS1_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
     fi
+elif _verify_is_accel_nvme_skip; then
+    ACCEL_NVME_SKIP="true"
+    log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped NVMe data filesystem UUID assertion"
 else
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        PASS1_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+        PASS1_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
     fi
-    if [[ -z "$PASS1_XFS_UUID" ]]; then
-        log_fatal "Stage 1 assertion FAILED: unable to resolve XFS filesystem UUID on ${MOUNT_POINT}."
+    if [[ -z "$PASS1_DATA_FS_UUID" ]]; then
+        log_fatal "Stage 1 assertion FAILED: unable to resolve data filesystem UUID on ${MOUNT_POINT}."
     fi
 fi
 
@@ -502,6 +672,147 @@ if [[ "$IS_SD_TARGET" != "true" && "$ENABLE_POSTGRES" == "true" ]]; then
         log_fatal "Stage 1 assertion FAILED: unable to resolve PostgreSQL system_identifier."
     fi
 fi
+
+DESTRUCTIVE_RE='nvme[[:space:]]+format|mkfs\.[a-z0-9]+|pg_createcluster|(^|[^[:alnum:]_])initdb([^[:alnum:]_]|$)'
+
+_verify_strip_ansi_stream() {
+    sed -E $'s/\x1b\\[[0-9;?]*[[:alpha:]]//g; s/\r//g' "$1"
+}
+
+_verify_filter_non_skip_lines() {
+    _verify_strip_ansi_stream "$1" | grep -vE '^[[:space:]]*\[SKIP\]([[:space:]:]|$)' || true
+}
+
+_verify_check_destructive_pass2_log() {
+    local log_file="$1"
+    local destructive_hits=""
+    destructive_hits="$(_verify_filter_non_skip_lines "$log_file" | grep -E -i -n "$DESTRUCTIVE_RE" || true)"
+    if [[ -n "$destructive_hits" ]]; then
+        log_warn "Destructive storage or cluster initialization command(s) detected during Pass 2:"
+        printf '%s\n' "$destructive_hits" >&2
+        log_fatal "Stage 2 idempotency assertion FAILED: Pass 2 must not execute nvme format, mkfs.*, pg_createcluster, or initdb."
+    fi
+}
+
+_verify_assert_stage_skip_coverage() {
+    local log_file="$1"
+    local is_sd="${2:-${IS_SD_TARGET:-false}}"
+    local enable_mqtt="${3:-${ENABLE_MQTT_BROKER:-false}}"
+    local enable_nfs="${4:-${ENABLE_NFS_SERVER:-false}}"
+    local with_raid="${5:-${WITH_RAID:-false}}"
+
+    local awk_report=""
+    awk_report="$(_verify_strip_ansi_stream "$log_file" | awk '
+        BEGIN { stage = ""; total = 0 }
+        /^=== \[[0-9:]+\] [0-9]+[A-Za-z]?\./ {
+            line = $0
+            sub(/^=== \[[0-9:]+\] /, "", line)
+            sub(/\..*$/, "", line)
+            stage = line
+            seen[stage] = 1
+            if (!(stage in skips)) skips[stage] = 0
+            next
+        }
+        /^[[:space:]]*\[SKIP\]([[:space:]:]|$)/ {
+            total++
+            if (stage != "") {
+                skips[stage]++
+            }
+        }
+        END {
+            printf "TOTAL=%d\n", total
+            for (s in seen) {
+                printf "STAGE %s %d\n", s, skips[s] + 0
+            }
+        }
+    ')"
+
+    local total_skips=0
+    local -a seen_stages=()
+    local -a seen_counts=()
+    local line st cnt
+    while IFS= read -r line; do
+        case "$line" in
+            TOTAL=*)
+                total_skips="${line#TOTAL=}"
+                ;;
+            STAGE\ *)
+                read -r _ st cnt <<< "$line"
+                seen_stages+=("$st")
+                seen_counts+=("$cnt")
+                ;;
+        esac
+    done <<< "$awk_report"
+
+    local -a req_headers=("1" "2" "3" "4" "5A" "5B")
+    local -a req_skips=()
+    if [[ "$is_sd" != "true" ]]; then
+        req_skips+=("1")
+    fi
+    req_skips+=("2" "3" "4")
+    if [[ "$is_sd" == "true" || "$enable_mqtt" != "true" ]]; then
+        req_skips+=("5A")
+    fi
+    if [[ "$is_sd" == "true" || "$enable_nfs" != "true" ]]; then
+        req_skips+=("5B")
+    fi
+
+    local -a missing_headers=()
+    local -a uncovered_skips=()
+    local req_st found idx
+    for req_st in "${req_headers[@]}"; do
+        found="false"
+        for idx in "${!seen_stages[@]}"; do
+            if [[ "${seen_stages[$idx]}" == "$req_st" ]]; then
+                found="true"
+                break
+            fi
+        done
+        if [[ "$found" != "true" ]]; then
+            missing_headers+=("$req_st")
+        fi
+    done
+
+    for req_st in "${req_skips[@]}"; do
+        cnt=0
+        for idx in "${!seen_stages[@]}"; do
+            if [[ "${seen_stages[$idx]}" == "$req_st" ]]; then
+                cnt="${seen_counts[$idx]}"
+                break
+            fi
+        done
+        if (( cnt == 0 )); then
+            uncovered_skips+=("$req_st")
+        fi
+    done
+
+    if [[ ! "$total_skips" =~ ^[0-9]+$ ]] || (( total_skips == 0 )); then
+        log_fatal "Stage 2 idempotency assertion FAILED: expected structured [SKIP] convergence markers in Pass 2 output, found 0 (WITH_RAID=${with_raid})."
+    fi
+    if (( ${#missing_headers[@]} > 0 )); then
+        log_fatal "Stage 2 idempotency assertion FAILED: missing Pass 2 stage header(s) (${missing_headers[*]}); total [SKIP]=${total_skips} (WITH_RAID=${with_raid})."
+    fi
+    if (( ${#uncovered_skips[@]} > 0 )); then
+        log_fatal "Stage 2 idempotency assertion FAILED: missing expected stage-level [SKIP] coverage for stage(s) (${uncovered_skips[*]}); total [SKIP]=${total_skips} (WITH_RAID=${with_raid})."
+    fi
+
+    local -a summary_parts=()
+    for req_st in "${req_headers[@]}"; do
+        cnt=0
+        for idx in "${!seen_stages[@]}"; do
+            if [[ "${seen_stages[$idx]}" == "$req_st" ]]; then
+                cnt="${seen_counts[$idx]}"
+                break
+            fi
+        done
+        summary_parts+=("${req_st}:${cnt}")
+    done
+    local old_ifs="$IFS"
+    IFS=","
+    STAGE_SKIP_SUMMARY="stages=${summary_parts[*]}"
+    IFS="$old_ifs"
+    SKIP_MARKER_COUNT="$total_skips"
+}
 
 echo ""
 echo ">>> [STAGE 2] Executing Idempotency Validation Pass 2 (Expecting Converged [SKIP] States)..."
@@ -517,17 +828,10 @@ if (( PASS2_RC != 0 )); then
     log_fatal "Stage 2 (Pass 2) forge failed with exit code ${PASS2_RC}."
 fi
 
-DESTRUCTIVE_RE='nvme[[:space:]]+format|mkfs\.[a-z0-9]+|pg_createcluster|(^|[^[:alnum:]_])initdb([^[:alnum:]_]|$)'
-if grep -E -i -n "$DESTRUCTIVE_RE" "$PASS2_LOG" >/dev/null 2>&1; then
-    log_warn "Destructive storage or cluster initialization command(s) detected during Pass 2:"
-    grep -E -i -n "$DESTRUCTIVE_RE" "$PASS2_LOG" >&2 || true
-    log_fatal "Stage 2 idempotency assertion FAILED: Pass 2 must not execute nvme format, mkfs.*, pg_createcluster, or initdb."
-fi
-
-SKIP_MARKER_COUNT="$(sed -E $'s/\x1b\\[[0-9;]*[[:alpha:]]//g' "$PASS2_LOG" | grep -cE '(^|[[:space:]])\[SKIP\]([[:space:]]|$)' || true)"
-if [[ ! "$SKIP_MARKER_COUNT" =~ ^[0-9]+$ ]] || (( SKIP_MARKER_COUNT == 0 )); then
-    log_fatal "Stage 2 idempotency assertion FAILED: expected structured [SKIP] convergence markers in Pass 2 output, found 0."
-fi
+_verify_check_destructive_pass2_log "$PASS2_LOG"
+SKIP_MARKER_COUNT=0
+STAGE_SKIP_SUMMARY=""
+_verify_assert_stage_skip_coverage "$PASS2_LOG" "$IS_SD_TARGET" "$ENABLE_MQTT_BROKER" "$ENABLE_NFS_SERVER" "$WITH_RAID"
 
 if [[ "$IS_SD_TARGET" == "true" ]]; then
     PASS2_CONFIG_DIGEST="$(_verify_staged_config_digest)"
@@ -540,14 +844,17 @@ if [[ "$IS_SD_TARGET" == "true" ]]; then
             log_fatal "Stage 2 idempotency assertion FAILED: SD mountpoint changed on ${MOUNT_POINT} (Pass 1='${PASS1_SD_MOUNT_INFO}', Pass 2='${PASS2_SD_MOUNT_INFO:-missing}')."
         fi
     fi
-    log_ok "Stage 2 idempotency assertion passed (SD/riscv32): ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged staged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
+    log_ok "Stage 2 idempotency assertion passed (SD/riscv32): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged staged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
+elif [[ "$ACCEL_NVME_SKIP" == "true" ]]; then
+    log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped Pass-2 NVMe data filesystem UUID comparison."
+    log_ok "Stage 2 idempotency assertion passed (accelerator-only, no NVMe): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY})."
 else
-    PASS2_XFS_UUID=""
+    PASS2_DATA_FS_UUID=""
     if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        PASS2_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+        PASS2_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
     fi
-    if [[ -z "$PASS2_XFS_UUID" || "$PASS2_XFS_UUID" != "$PASS1_XFS_UUID" ]]; then
-        log_fatal "Stage 2 idempotency assertion FAILED: XFS UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_XFS_UUID}', Pass 2='${PASS2_XFS_UUID:-missing}')."
+    if [[ -z "$PASS2_DATA_FS_UUID" || "$PASS2_DATA_FS_UUID" != "$PASS1_DATA_FS_UUID" ]]; then
+        log_fatal "Stage 2 idempotency assertion FAILED: data filesystem UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_DATA_FS_UUID}', Pass 2='${PASS2_DATA_FS_UUID:-missing}')."
     fi
 
     if [[ "$ENABLE_POSTGRES" == "true" ]]; then
@@ -555,10 +862,10 @@ else
         if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
             log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
         fi
-        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
     else
         log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
-        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID})."
+        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID})."
     fi
 fi
 
