@@ -4,8 +4,9 @@
 # Path: brakerrak/scripts/verify-convergence.sh
 #
 # Usage:
-#   sudo brakerrak verify [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench] [--hostname <name>] [--force-rebuild-pg] [--no-apt-update] [--noprogbar]
+#   sudo brakerrak verify [--role databroker|databench|babbagebox|babbagebench|visionbox|visionbench|devbench|snitchbench|lilsnitch] [--hostname <name>] [--force-rebuild-pg] [--no-apt-update] [--noprogbar]
 #   sudo ./scripts/verify-convergence.sh [--out-dir ~/.brakerrak/snapshots] [--noprogbar]
+#   brakerrak verify --target p4 --role devbench --tune iot --stage-dir /Volumes/RVDK_P4_SD
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -21,10 +22,14 @@ usage() {
 Usage: sudo brakerrak verify [options] [forge-options...]
 
 Options:
-  --target <slug>        Override silicon target for ORT snapshots and forge passes
-  --mount-point <path>   Override NVMe mountpoint (forwarded to forge passes)
-  --out-dir <dir>        Directory for Day-0 & Day-1 ORT snapshots (default: ~/.brakerrak/snapshots)
-  -h, --help             Show this help message and exit
+  --target <slug>          Override silicon target for ORT snapshots and forge passes
+  --media <nvme|sd>        Override target storage media (default: nvme on riscv64, sd on riscv32)
+  --stage-dir <dir>        Host-assisted SD staging root (validates staged config digest idempotency)
+  --mount-point <path>     Override NVMe/SD mountpoint (forwarded to forge passes)
+  --out-dir <dir>          Directory for Day-0 & Day-1 ORT snapshots (default: ~/.brakerrak/snapshots)
+  --telemetry-json <path>  Host-proxied telemetry JSON forwarded to ORT Stage 0 / Stage 3
+  --serial-port <dev>      USB-Serial-JTAG device forwarded to ORT Stage 0 / Stage 3
+  -h, --help               Show this help message and exit
 
 All other flags are forwarded to forge.sh. Destructive/rebuild flags
 (--force-wipe-nvme, --force-wipe-raid, --force-rebuild-pg, --force-build,
@@ -40,9 +45,16 @@ for _arg in "$@"; do
     fi
 done
 
-if [[ $EUID -ne 0 ]]; then
+_HAS_STAGE_DIR="false"
+for _arg in "$@"; do
+    case "$_arg" in
+        --stage-dir|--stage-dir=*) _HAS_STAGE_DIR="true"; break ;;
+    esac
+done
+
+if [[ $EUID -ne 0 && "$_HAS_STAGE_DIR" != "true" ]]; then
     if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-        _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TS_AUTHKEY,RVDK_INSTALL_SHA256,BRAKERRAK_INSTALL_SHA256,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
+        _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_BIN,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TS_AUTHKEY,RVDK_INSTALL_SHA256,BRAKERRAK_INSTALL_SHA256,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
         exec sudo --preserve-env="$_sudo_preserve_env" bash "${BASH_SOURCE[0]}" "$@"
     else
         log_fatal "Run as root or via 'sudo brakerrak verify'."
@@ -53,8 +65,13 @@ brak_resolve_user
 brak_resolve_node_env --migrate
 
 SNAP_DIR="${REAL_HOME}/.brakerrak/snapshots"
+CLI_TARGET="${BRAKERRAK_TARGET:-}"
+CLI_MEDIA=""
+CLI_STAGE_DIR=""
 CLI_MOUNT_POINT=""
 CLI_ENABLE_PG=""
+CLI_TELEMETRY_JSON=""
+CLI_SERIAL_PORT=""
 PASS1_ARGS=()
 PASS2_ARGS=()
 ORT_ARGS=()
@@ -63,6 +80,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --target)
             brak_require_arg "$1" "${2:-}"
+            CLI_TARGET="$2"
             PASS1_ARGS+=("--target" "$2")
             PASS2_ARGS+=("--target" "$2")
             ORT_ARGS+=("--target" "$2")
@@ -71,9 +89,68 @@ while [[ $# -gt 0 ]]; do
         --target=*)
             _tval="${1#*=}"
             brak_require_arg "--target" "$_tval"
+            CLI_TARGET="$_tval"
             PASS1_ARGS+=("--target" "$_tval")
             PASS2_ARGS+=("--target" "$_tval")
             ORT_ARGS+=("--target" "$_tval")
+            shift
+            ;;
+        --media)
+            brak_require_arg "$1" "${2:-}"
+            CLI_MEDIA="$(tr '[:upper:]' '[:lower:]' <<< "$2")"
+            PASS1_ARGS+=("--media" "$CLI_MEDIA")
+            PASS2_ARGS+=("--media" "$CLI_MEDIA")
+            shift 2
+            ;;
+        --media=*)
+            _mval="${1#*=}"
+            brak_require_arg "--media" "$_mval"
+            CLI_MEDIA="$(tr '[:upper:]' '[:lower:]' <<< "$_mval")"
+            PASS1_ARGS+=("--media" "$CLI_MEDIA")
+            PASS2_ARGS+=("--media" "$CLI_MEDIA")
+            shift
+            ;;
+        --stage-dir)
+            brak_require_arg "$1" "${2:-}"
+            CLI_STAGE_DIR="${2%/}"
+            [[ -n "$CLI_STAGE_DIR" ]] || log_fatal "Refusing '/' as --stage-dir."
+            PASS1_ARGS+=("--stage-dir" "$CLI_STAGE_DIR")
+            PASS2_ARGS+=("--stage-dir" "$CLI_STAGE_DIR")
+            shift 2
+            ;;
+        --stage-dir=*)
+            _sval="${1#*=}"
+            brak_require_arg "--stage-dir" "$_sval"
+            CLI_STAGE_DIR="${_sval%/}"
+            [[ -n "$CLI_STAGE_DIR" ]] || log_fatal "Refusing '/' as --stage-dir."
+            PASS1_ARGS+=("--stage-dir" "$CLI_STAGE_DIR")
+            PASS2_ARGS+=("--stage-dir" "$CLI_STAGE_DIR")
+            shift
+            ;;
+        --telemetry-json)
+            brak_require_arg "$1" "${2:-}"
+            CLI_TELEMETRY_JSON="$2"
+            ORT_ARGS+=("--telemetry-json" "$2")
+            shift 2
+            ;;
+        --telemetry-json=*)
+            _tj="${1#*=}"
+            brak_require_arg "--telemetry-json" "$_tj"
+            CLI_TELEMETRY_JSON="$_tj"
+            ORT_ARGS+=("--telemetry-json" "$_tj")
+            shift
+            ;;
+        --serial-port)
+            brak_require_arg "$1" "${2:-}"
+            CLI_SERIAL_PORT="$2"
+            ORT_ARGS+=("--serial-port" "$2")
+            shift 2
+            ;;
+        --serial-port=*)
+            _sp="${1#*=}"
+            brak_require_arg "--serial-port" "$_sp"
+            CLI_SERIAL_PORT="$_sp"
+            ORT_ARGS+=("--serial-port" "$_sp")
             shift
             ;;
         --mount-point)
@@ -125,11 +202,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "$CLI_STAGE_DIR" ]]; then
+    NODE_ENV="${CLI_STAGE_DIR}/config/node.env"
+    export BRAKERRAK_NODE_ENV="$NODE_ENV"
+    if [[ -z "$CLI_TELEMETRY_JSON" && -r "${CLI_STAGE_DIR}/telemetry/ort.json" ]]; then
+        CLI_TELEMETRY_JSON="${CLI_STAGE_DIR}/telemetry/ort.json"
+        ORT_ARGS+=("--telemetry-json" "$CLI_TELEMETRY_JSON")
+    fi
+fi
+
 _verify_refresh_node_vars() {
     MOUNT_POINT="/mnt/nvme_pgdata"
     ENABLE_POSTGRES="true"
+    STORAGE_MEDIA="nvme"
+    TARGET_ARCH="riscv64"
+    NODE_ROLE=""
+    TARGET_BOARD=""
+    if brak_resolve_silicon "${CLI_TARGET:-}" >/dev/null 2>&1; then
+        :
+    fi
     if [[ -r "$NODE_ENV" ]]; then
-        brak_load_kv_env "$NODE_ENV" MOUNT_POINT ENABLE_POSTGRES || log_fatal "Failed to parse node config: ${NODE_ENV}"
+        brak_load_kv_env "$NODE_ENV" MOUNT_POINT ENABLE_POSTGRES STORAGE_MEDIA TARGET_ARCH NODE_ROLE || log_fatal "Failed to parse node config: ${NODE_ENV}"
     fi
     if [[ -n "$CLI_MOUNT_POINT" ]]; then
         MOUNT_POINT="$CLI_MOUNT_POINT"
@@ -137,11 +230,28 @@ _verify_refresh_node_vars() {
     if [[ -n "$CLI_ENABLE_PG" ]]; then
         ENABLE_POSTGRES="$CLI_ENABLE_PG"
     fi
+    if [[ -n "$CLI_MEDIA" ]]; then
+        STORAGE_MEDIA="$CLI_MEDIA"
+    fi
+    if [[ "${TARGET_BOARD:-}" == "espressif-esp32p4" ]]; then
+        TARGET_ARCH="riscv32"
+        STORAGE_MEDIA="sd"
+        ENABLE_POSTGRES="false"
+    fi
+    IS_SD_TARGET="false"
+    if [[ "$STORAGE_MEDIA" == "sd" || "$TARGET_ARCH" == "riscv32" || "${TARGET_BOARD:-}" == "espressif-esp32p4" || "$NODE_ROLE" == "snitchbench" || "$NODE_ROLE" == "lilsnitch" || -n "$CLI_STAGE_DIR" ]]; then
+        IS_SD_TARGET="true"
+    fi
 }
 
 _verify_refresh_node_vars
 
-install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$SNAP_DIR"
+if [[ $EUID -eq 0 ]]; then
+    install -d -m 0750 -o "$REAL_USER" -g "$REAL_GRP" "$SNAP_DIR"
+else
+    mkdir -p "$SNAP_DIR"
+    chmod 0750 "$SNAP_DIR" 2>/dev/null || true
+fi
 
 RUNTIME_DIR="$(brak_runtime_dir)"
 export BRAKERRAK_RUNTIME_DIR="$RUNTIME_DIR"
@@ -257,38 +367,136 @@ _verify_assert_ort_status() {
     log_ok "ORT assertion passed for '${stage}': overall_status=${status} ($(basename "$latest_snap"))"
 }
 
+_verify_get_sd_mount_info() {
+    local mp="$1"
+    if command -v findmnt >/dev/null 2>&1; then
+        findmnt -n -o SOURCE,FSTYPE,UUID "$mp" 2>/dev/null | head -n1 || true
+    fi
+}
+
+_verify_staged_config_digest() {
+    local hash_input=""
+    local cfg_dir=""
+    if [[ -n "$CLI_STAGE_DIR" && -d "${CLI_STAGE_DIR}/config" ]]; then
+        cfg_dir="${CLI_STAGE_DIR}/config"
+    fi
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$NODE_ENV" "$cfg_dir" <<'PY'
+import hashlib, pathlib, sys
+node_env = pathlib.Path(sys.argv[1])
+cfg_dir = pathlib.Path(sys.argv[2]) if sys.argv[2] else None
+h = hashlib.sha256()
+files = []
+if cfg_dir and cfg_dir.is_dir():
+    files = sorted(p for p in cfg_dir.rglob("*") if p.is_file())
+elif node_env.is_file():
+    files = [node_env]
+for p in files:
+    rel = p.relative_to(cfg_dir) if cfg_dir else p.name
+    h.update(str(rel).encode("utf-8"))
+    h.update(b"\0")
+    h.update(p.read_bytes())
+    h.update(b"\0")
+print(h.hexdigest() if files else "")
+PY
+        return 0
+    fi
+    if [[ -n "$cfg_dir" ]]; then
+        local f
+        while IFS= read -r f; do
+            [[ -f "$f" ]] || continue
+            hash_input+="${f}:"
+            if command -v sha256sum >/dev/null 2>&1; then
+                hash_input+="$(sha256sum "$f" | awk '{print $1}')"$'\n'
+            elif command -v shasum >/dev/null 2>&1; then
+                hash_input+="$(shasum -a 256 "$f" | awk '{print $1}')"$'\n'
+            fi
+        done < <(find "$cfg_dir" -type f | LC_ALL=C sort)
+    elif [[ -f "$NODE_ENV" ]]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$NODE_ENV" | awk '{print $1}'
+            return 0
+        elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$NODE_ENV" | awk '{print $1}'
+            return 0
+        fi
+    fi
+    if [[ -n "$hash_input" ]]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            printf '%s' "$hash_input" | sha256sum | awk '{print $1}'
+        elif command -v shasum >/dev/null 2>&1; then
+            printf '%s' "$hash_input" | shasum -a 256 | awk '{print $1}'
+        fi
+    fi
+}
+
+_verify_should_skip_host_ort() {
+    if [[ "$IS_SD_TARGET" == "true" && -z "$CLI_TELEMETRY_JSON" && -z "$CLI_SERIAL_PORT" ]]; then
+        if [[ "$(uname -m)" != riscv32* ]]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+_verify_run_ort_stage() {
+    local stage="$1"
+    local -a cmd_args=(${ORT_ARGS[@]+"${ORT_ARGS[@]}"} --stage "$stage" --out-dir "$SNAP_DIR")
+    if [[ -n "$CLI_STAGE_DIR" && -r "$NODE_ENV" ]]; then
+        cmd_args+=(--config "$NODE_ENV")
+    fi
+    set +e
+    bash "${SCRIPT_DIR}/ort-snapshot.sh" "${cmd_args[@]}"
+    local rc=$?
+    set -e
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${REAL_USER}:${REAL_GRP}" "$SNAP_DIR"
+    fi
+    if (( rc != 0 )); then
+        log_fatal "ORT stage '${stage}' failed with exit code ${rc}."
+    fi
+    _verify_assert_ort_status "$stage" "$SNAP_DIR"
+}
+
 echo ">>> [STAGE 0] Checking Day-0 Pre-Forge Clean-Room ORT Snapshot..."
-if mountpoint -q "$MOUNT_POINT" 2>/dev/null && compgen -G "${SNAP_DIR}/*day0-pre-forge*.json" >/dev/null 2>&1; then
+if _verify_should_skip_host_ort; then
+    log_skip "Stage 0 (day0-pre-forge): host $(uname -m) staging SD target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
+elif [[ "$IS_SD_TARGET" != "true" ]] && mountpoint -q "$MOUNT_POINT" 2>/dev/null && compgen -G "${SNAP_DIR}/*day0-pre-forge*.json" >/dev/null 2>&1; then
     log_skip "Resuming interrupted build; preserving existing Clean-Room Day-0 snapshot in ${SNAP_DIR}"
     _verify_assert_ort_status "day0-pre-forge" "$SNAP_DIR"
 else
-    set +e
-    bash "${SCRIPT_DIR}/ort-snapshot.sh" ${ORT_ARGS[@]+"${ORT_ARGS[@]}"} --stage day0-pre-forge --out-dir "$SNAP_DIR"
-    STAGE0_RC=$?
-    set -e
-    chown -R "${REAL_USER}:${REAL_GRP}" "$SNAP_DIR"
-    if (( STAGE0_RC != 0 )); then
-        log_fatal "Stage 0 (day0-pre-forge) ORT snapshot failed with exit code ${STAGE0_RC}."
-    fi
-    _verify_assert_ort_status "day0-pre-forge" "$SNAP_DIR"
+    _verify_run_ort_stage "day0-pre-forge"
 fi
 
 echo ""
-echo ">>> [STAGE 1] Executing Convergence Pass 1 (RVDK OS/BSP + 4Kn NVMe + PG 18.6 + Services)..."
+echo ">>> [STAGE 1] Executing Convergence Pass 1..."
 bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"}
 
 _verify_refresh_node_vars
 
 PASS1_XFS_UUID=""
-if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-    PASS1_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
-fi
-if [[ -z "$PASS1_XFS_UUID" ]]; then
-    log_fatal "Stage 1 assertion FAILED: unable to resolve XFS filesystem UUID on ${MOUNT_POINT}."
+PASS1_CONFIG_DIGEST=""
+PASS1_SD_MOUNT_INFO=""
+if [[ "$IS_SD_TARGET" == "true" ]]; then
+    log_skip "SD media target (${TARGET_BOARD:-espressif-esp32p4}, media=${STORAGE_MEDIA}); skipped XFS/NVMe UUID assertion"
+    PASS1_CONFIG_DIGEST="$(_verify_staged_config_digest)"
+    if [[ -z "$PASS1_CONFIG_DIGEST" ]]; then
+        log_fatal "Stage 1 assertion FAILED: unable to resolve staged config digest for ${NODE_ENV}."
+    fi
+    if [[ -z "$CLI_STAGE_DIR" ]] && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        PASS1_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
+    fi
+else
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        PASS1_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+    fi
+    if [[ -z "$PASS1_XFS_UUID" ]]; then
+        log_fatal "Stage 1 assertion FAILED: unable to resolve XFS filesystem UUID on ${MOUNT_POINT}."
+    fi
 fi
 
 PASS1_PG_SYSID=""
-if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+if [[ "$IS_SD_TARGET" != "true" && "$ENABLE_POSTGRES" == "true" ]]; then
     PASS1_PG_SYSID="$(_verify_get_pg_sysid)"
     if [[ -z "$PASS1_PG_SYSID" ]]; then
         log_fatal "Stage 1 assertion FAILED: unable to resolve PostgreSQL system_identifier."
@@ -321,36 +529,46 @@ if [[ ! "$SKIP_MARKER_COUNT" =~ ^[0-9]+$ ]] || (( SKIP_MARKER_COUNT == 0 )); the
     log_fatal "Stage 2 idempotency assertion FAILED: expected structured [SKIP] convergence markers in Pass 2 output, found 0."
 fi
 
-PASS2_XFS_UUID=""
-if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-    PASS2_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
-fi
-if [[ -z "$PASS2_XFS_UUID" || "$PASS2_XFS_UUID" != "$PASS1_XFS_UUID" ]]; then
-    log_fatal "Stage 2 idempotency assertion FAILED: XFS UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_XFS_UUID}', Pass 2='${PASS2_XFS_UUID:-missing}')."
-fi
-
-if [[ "$ENABLE_POSTGRES" == "true" ]]; then
-    PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
-    if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
-        log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+if [[ "$IS_SD_TARGET" == "true" ]]; then
+    PASS2_CONFIG_DIGEST="$(_verify_staged_config_digest)"
+    if [[ -z "$PASS2_CONFIG_DIGEST" || "$PASS2_CONFIG_DIGEST" != "$PASS1_CONFIG_DIGEST" ]]; then
+        log_fatal "Stage 2 idempotency assertion FAILED: staged config digest changed (Pass 1='${PASS1_CONFIG_DIGEST}', Pass 2='${PASS2_CONFIG_DIGEST:-missing}')."
     fi
-    log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+    if [[ -n "$PASS1_SD_MOUNT_INFO" ]]; then
+        PASS2_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
+        if [[ "$PASS2_SD_MOUNT_INFO" != "$PASS1_SD_MOUNT_INFO" ]]; then
+            log_fatal "Stage 2 idempotency assertion FAILED: SD mountpoint changed on ${MOUNT_POINT} (Pass 1='${PASS1_SD_MOUNT_INFO}', Pass 2='${PASS2_SD_MOUNT_INFO:-missing}')."
+        fi
+    fi
+    log_ok "Stage 2 idempotency assertion passed (SD/riscv32): ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged staged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
 else
-    log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
-    log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID})."
+    PASS2_XFS_UUID=""
+    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+        PASS2_XFS_UUID="$(_verify_get_xfs_uuid "$MOUNT_POINT")"
+    fi
+    if [[ -z "$PASS2_XFS_UUID" || "$PASS2_XFS_UUID" != "$PASS1_XFS_UUID" ]]; then
+        log_fatal "Stage 2 idempotency assertion FAILED: XFS UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_XFS_UUID}', Pass 2='${PASS2_XFS_UUID:-missing}')."
+    fi
+
+    if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+        PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
+        if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
+            log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+        fi
+        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+    else
+        log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
+        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s), unchanged XFS UUID (${PASS2_XFS_UUID})."
+    fi
 fi
 
 echo ""
 echo ">>> [STAGE 3] Capturing Day-1 Post-Forge CTD Provenance Snapshot..."
-set +e
-bash "${SCRIPT_DIR}/ort-snapshot.sh" ${ORT_ARGS[@]+"${ORT_ARGS[@]}"} --stage day1-post-forge --out-dir "$SNAP_DIR"
-STAGE3_RC=$?
-set -e
-chown -R "${REAL_USER}:${REAL_GRP}" "$SNAP_DIR"
-if (( STAGE3_RC != 0 )); then
-    log_fatal "Stage 3 (day1-post-forge) ORT snapshot failed with exit code ${STAGE3_RC}."
+if _verify_should_skip_host_ort; then
+    log_skip "Stage 3 (day1-post-forge): host $(uname -m) staging SD target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
+else
+    _verify_run_ort_stage "day1-post-forge"
 fi
-_verify_assert_ort_status "day1-post-forge" "$SNAP_DIR"
 
 echo ""
 echo ">>> [PASS] Full BrakerRak Convergence & Idempotency Lifecycle Verified!"

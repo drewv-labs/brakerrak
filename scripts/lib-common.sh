@@ -15,7 +15,7 @@
 #   • Non-executing key-value .env loader supporting multiline values (brak_load_kv_env)
 #   • Safe, expansion-free node.env serializer (brak_write_node_env)
 #   • Unified Device-Tree & --target silicon resolver (brak_resolve_silicon)
-#   • Canonical role & RVDK tune profile mappers (brak_normalize_role, brak_role_to_rvdk_tune)
+#   • Canonical role & RVDK tune profile mappers (brak_normalize_role, brak_role_to_rvdk_tune, brak_normalize_tune)
 # ==============================================================================
 
 if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" == "1" ]]; then
@@ -33,6 +33,8 @@ export BRAKERRAK_SYSTEM_NODE_ENV="/etc/brakerrak/node.env"
 BRAKERRAK_NODE_ENV_KEYS=(
     NODE_ROLE
     TARGET_HOSTNAME
+    TARGET_ARCH
+    STORAGE_MEDIA
     ADMIN_USER
     LAB_SUBNET
     RVDK_TUNE_PROFILE
@@ -657,10 +659,12 @@ brak_write_node_env() {
     {
         printf '# ==============================================================================\n'
         printf '# DREW-V Labs // BrakerRak Node Configuration (%s)\n' "$target_path"
-        printf '# Role Personas: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench\n'
+        printf '# Role Personas: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench | snitchbench | lilsnitch\n'
         printf '# ==============================================================================\n'
         _brak_emit_dq_kv "NODE_ROLE" "${NODE_ROLE:-databroker}"
         _brak_emit_dq_kv "TARGET_HOSTNAME" "${TARGET_HOSTNAME:-}"
+        _brak_emit_dq_kv "TARGET_ARCH" "${TARGET_ARCH:-riscv64}"
+        _brak_emit_dq_kv "STORAGE_MEDIA" "${STORAGE_MEDIA:-nvme}"
         _brak_emit_dq_kv "ADMIN_USER" "${ADMIN_USER:-}"
         _brak_emit_dq_kv "LAB_SUBNET" "${LAB_SUBNET-}"
         _brak_emit_dq_kv "RVDK_TUNE_PROFILE" "${RVDK_TUNE_PROFILE:-data}"
@@ -701,17 +705,32 @@ brak_normalize_role() {
         visionbox|visbox|vx|npuprod)                                  printf 'visionbox\n' ;;
         visionbench|visbnch|vh|npubench|visionferret|vferret|mlbench) printf 'visionbench\n' ;;
         devbench|devbnch|dev)                                         printf 'devbench\n' ;;
+        snitchbench|snitchbnch|sb)                                    printf 'snitchbench\n' ;;
+        lilsnitch|lsp4|snitch)                                        printf 'lilsnitch\n' ;;
         *)                                                            printf '\n' ;;
     esac
 }
 
-# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ai`)
+# Map BrakerRak NODE_ROLE -> agnostic RVDK `--tune` target (`data` | `ai` | `iot`)
 brak_role_to_rvdk_tune() {
     local canon
     canon="$(brak_normalize_role "${1:-databroker}")"
     case "$canon" in
+        snitchbench|lilsnitch)                                 printf 'iot\n' ;;
         babbagebox|babbagebench|visionbox|visionbench|devbench) printf 'ai\n' ;;
         *)                                                      printf 'data\n' ;;
+    esac
+}
+
+# Normalize `--tune` token/alias -> canonical RVDK tune (`data` | `ai` | `iot`), or empty if invalid
+brak_normalize_tune() {
+    local raw
+    raw="$(tr '[:upper:]' '[:lower:]' <<< "${1:-}")"
+    case "$raw" in
+        iot|edge-iot|sensor|mcu) printf 'iot\n' ;;
+        ai|ml|edge-ai|edge-ml)   printf 'ai\n' ;;
+        data)                    printf 'data\n' ;;
+        *)                       printf '\n' ;;
     esac
 }
 
@@ -719,7 +738,7 @@ brak_role_to_rvdk_tune() {
 # silicon resolution using vendor-qualified patterns (no bare K3/K1/M1 globs).
 #
 # Usage: brak_resolve_silicon [requested_target] [dt_model_override]
-# Exports: TARGET_BOARD, TARGET_TAG, DT_MODEL, FACTORY_USER
+# Exports: TARGET_BOARD, TARGET_TAG, DT_MODEL, FACTORY_USER, TARGET_ARCH, STORAGE_MEDIA
 # Returns: 0 on successful resolution, 1 if unrecognized.
 brak_resolve_silicon() {
     local requested=""
@@ -801,12 +820,16 @@ brak_resolve_silicon() {
                 board="ultrarisc-dp1000"; tag="titan" ;;
             *"tenstorrent"*"atlantis"*|*"atlantis"*|*"ascalon"*)
                 board="tenstorrent-atlantis"; tag="atlantis" ;;
+            *"esp32-p4-wifi6"*|*"waveshare esp32-p4"*|*"esp32-p4"*|*"esp32p4"*)
+                board="espressif-esp32p4"; tag="p4" ;;
             *)
                 TARGET_BOARD=""
                 TARGET_TAG=""
                 DT_MODEL="$dt_model"
                 FACTORY_USER=""
-                export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER
+                TARGET_ARCH=""
+                STORAGE_MEDIA=""
+                export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER TARGET_ARCH STORAGE_MEDIA
                 return 1
                 ;;
         esac
@@ -850,6 +873,8 @@ brak_resolve_silicon() {
                 board="ultrarisc-dp1000"; [[ -z "$tag" ]] && tag="titan" ;;
             tenstorrent-atlantis|tenstorrent/atlantis|atlantis|ascalon)
                 board="tenstorrent-atlantis"; [[ -z "$tag" ]] && tag="atlantis" ;;
+            espressif-esp32p4|espressif/esp32p4|waveshare-esp32-p4-wifi6|waveshare/esp32-p4-wifi6|waveshare-esp32-p4|waveshare/esp32-p4|waveshare-p4|waveshare/p4|esp32-p4-wifi6|esp32-p4-wifi6-dev-kit|esp32-p4|esp32p4|p4)
+                board="espressif-esp32p4"; tag="p4" ;;
             generic-riscv64|generic|riscv64)
                 board="generic-riscv64"; [[ -z "$tag" ]] && tag="node" ;;
             *)
@@ -858,7 +883,9 @@ brak_resolve_silicon() {
                     TARGET_TAG=""
                     DT_MODEL="$dt_model"
                     FACTORY_USER=""
-                    export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER
+                    TARGET_ARCH=""
+                    STORAGE_MEDIA=""
+                    export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER TARGET_ARCH STORAGE_MEDIA
                     return 1
                 fi
                 board="$board_lc"
@@ -873,11 +900,22 @@ brak_resolve_silicon() {
         esac
     fi
 
+    local target_arch="riscv64"
+    local storage_media="nvme"
+    case "$board" in
+        espressif-esp32p4)
+            target_arch="riscv32"
+            storage_media="sd"
+            ;;
+    esac
+
     TARGET_BOARD="$board"
     TARGET_TAG="${tag:-node}"
     DT_MODEL="$dt_model"
     FACTORY_USER="$factory_user"
-    export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER
+    TARGET_ARCH="$target_arch"
+    STORAGE_MEDIA="$storage_media"
+    export TARGET_BOARD TARGET_TAG DT_MODEL FACTORY_USER TARGET_ARCH STORAGE_MEDIA
     return 0
 }
 

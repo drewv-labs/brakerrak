@@ -42,7 +42,7 @@ Powered by 120 Tensix RISC-V compute tiles (600 RV32 baby harts driving 120 AI c
 
 ### 1. Role Personas (`roles/` & `/etc/brakerrak/node.env`)
 
-Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, Edge NPU inference, isolated microarchitectural benchmarking, or hybrid development via `brakerrak --role <persona> --deeptune`:
+Flip any supported RISC-V node statelessly between production data brokering, discrete GPU/Blackhole AI compute, Edge NPU inference, ESP32-P4 edge sensor telemetry, isolated microarchitectural benchmarking, or hybrid development via `brakerrak --role <persona> --tune <data|ai|iot>`:
 
 | Role (--role) | RVDK DeepTune | PostgreSQL 18.6 (io_uring) | Mosquitto MQTT (:1883) | NFSv4 Vault Server (ganesha / kernel) | Desc |
 | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -52,7 +52,9 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 | **babbagebench** | --tune ai | Disabled by Default (--with-pg opt-in; pure GPU/Blackhole isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated GPU / Blackhole Bench |
 | **visionbox** | --tune ai | Disabled by Default (--with-pg opt-in; full Edge NPU memory headroom) | Disabled | Disabled | Prod Edge NPU Inference Node |
 | **visionbench** | --tune ai | Disabled by Default (--with-pg opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated Edge NPU Bench |
-| **devbench** | --tune ai | Active (Hybrid GPU/NPU + Data Bench) | Enabled (:1883 + Unix Socket) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
+| **devbench** | --tune ai / --tune iot | Active on riscv64 (Clamped false on riscv32/sd) | Enabled on riscv64 (Clamped false on riscv32/sd) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
+| **snitchbench** | --tune iot | Disabled (riscv32/sd target) | Disabled | Disabled | Dev Isolated Edge Sensor Bench (SnitchBench-P4) |
+| **lilsnitch** | --tune iot | Disabled (riscv32/sd target) | Disabled | Disabled | Prod Per-Unit Edge Sensor Kit (LilSnitch-P4) |
 
 
 ### 2. Silicon Targets (`soc-drawer/`)
@@ -63,6 +65,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 | StarFive JH7110 / JH7110S (VF2 / VF2 Lite / Mars / OPi RV) | 4x SiFive U74 (2-Wide InO @ 1.25–1.5GHz) | RVA20 (-O3 -march=rv64gc_zba_zbb -mcpu=sifive-u74) | **Active / Verified** |
 | SpacemiT K1/M1 (OPi RV2 / OPi R2S / Jupiter / BPI-F3 / CM6) | 8x SpacemiT X60 (2-Wide InO @ 1.6–1.8GHz) | RVA22 + 256-bit RVV 1.0 | **Active / Bring-Up** |
 | UltraRISC UR-DP1000 (Milk-V Titan) | 8x UR-CP100 (4-Wide OoO @ 2.0GHz + PCIe Gen4 x16) | RVA22 + H-Ext 1.0 | **Active / Bring-Up** |
+| Espressif ESP32-P4 (Waveshare ESP32-P4-WIFI6-DEV-KIT) | 2x HP RV32 Harts @ 360–400MHz + LP Hart (nommu, SDMMC + ESP32-C6 Wi-Fi 6) | RV32IMAFC + Zicsr/Zifencei + PIE SIMD (-mabi=ilp32f) | **Active / Bring-Up** ([devbench-p4](./docs/builds/devbench-p4.md)) |
 | SpacemiT K3 (Milk-V Jupiter 2 / Firefly AIBOX-K3) | 8x SpacemiT X100 (4-Wide OoO @ 2.4GHz + 60 TOPS) | RVA23 + 1024-bit RVV 1.0 | Planned |
 | SiFive Freedom U740 (HiFive Unmatched Rev B) | 4x SiFive U74 (2-Wide InO @ 1.2GHz + PCIe Gen3 x8) | RVA20 (RV64GC) | Planned |
 | Tenstorrent Atlantis | 8x Tenstorrent Ascalon-X (Wide OoO + PCIe Gen5) | RVA23 + 256-bit RVV 1.0 | Planned |
@@ -159,7 +162,12 @@ brakerrak --role visionbench --deeptune
 brakerrak --role databench --deeptune
 brakerrak --role databroker --with-tailscale --ts-ssh
 
-# Apply or inspect role-aware RVDK DeepTune (`databroker`/`databench` -> data, `babbage*`/`vision*`/`devbench` -> ai)
+# Stage ESP32-P4 (riscv32 / SD) convergence & DeepTune onto mounted FAT32 SD media (RVDK_P4_SD)
+brakerrak --role devbench --target p4 --tune iot --stage-dir /Volumes/RVDK_P4_SD
+brakerrak --role devbench --target p4 --tune ai --stage-dir /Volumes/RVDK_P4_SD
+brakerrak --role snitchbench --target p4 --deeptune --stage-dir /Volumes/RVDK_P4_SD
+
+# Apply or inspect role-aware RVDK DeepTune (`databroker`/`databench` -> data, `babbage*`/`vision*`/`devbench` -> ai, `snitchbench`/`lilsnitch` -> iot)
 brakerrak deeptune
 brakerrak deeptune status
 
@@ -171,6 +179,8 @@ brakerrak storage autotune
 
 # Capture a read-only Operational Readiness Test (ORT) & SHA-256 CTD snapshot in ~/.brakerrak/snapshots/
 brakerrak ort --stage day1-post-forge
+brakerrak ort --target espressif-esp32p4 --serial-port /dev/ttyACM0 --stage day1-post-forge
+brakerrak ort --target p4 --telemetry-json /Volumes/RVDK_P4_SD/telemetry/ort.json --stage day0-pre-forge
 
 # Execute the full 5-stage Day-0 -> Day-1 convergence & idempotency verification harness
 brakerrak verify --use-pkg-cache

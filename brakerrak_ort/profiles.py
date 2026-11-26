@@ -21,6 +21,11 @@ class SocProfile:
     min_width: int
     thermal_ceiling_c: float
     usb_desc: str = "Rear USB 3.0 Ports Negotiated at 5000M SuperSpeed"
+    arch: str = "riscv64"
+    has_mmu: bool = True
+    has_pcie: bool = True
+    storage_bus: str = "nvme"
+    supported_tunes: tuple[str, ...] = ("data", "ai", "iot")
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,28 @@ SOC_PROFILES: dict[str, SocProfile] = {
         min_width=4,
         thermal_ceiling_c=60.0,
     ),
+    "espressif-esp32p4": SocProfile(
+        slug="espressif-esp32p4",
+        expected_harts=2,
+        cpu_desc=(
+            "2x Espressif ESP32-P4 HP Harts Online "
+            "(rv32imafc_zicsr_zifencei + PIE AI SIMD @ 400MHz)"
+        ),
+        ram_check_id="ORT-02_PSRAM_CAPACITY",
+        ram_floor_kb=28_000,
+        ram_variants_gb=(),
+        ram_desc="32MB On-Package PSRAM Detected (>= 28,000 kB usable)",
+        pcie_desc="Primary MicroSD Media Present on 4-Bit SDMMC Bus (No PCIe/NVMe on ESP32-P4)",
+        min_gt_s=0.0,
+        min_width=0,
+        thermal_ceiling_c=65.0,
+        usb_desc="USB 2.0 OTG / USB-Serial-JTAG Debug Bridge Active",
+        arch="riscv32",
+        has_mmu=False,
+        has_pcie=False,
+        storage_bus="sdmmc",
+        supported_tunes=("ai", "iot"),
+    ),
     "generic-riscv64": SocProfile(
         slug="generic-riscv64",
         expected_harts=None,
@@ -228,6 +255,20 @@ SOC_ALIASES: dict[str, str] = {
     "tenstorrent/atlantis": "tenstorrent-atlantis",
     "atlantis": "tenstorrent-atlantis",
     "ascalon": "tenstorrent-atlantis",
+    # espressif-esp32p4
+    "espressif-esp32p4": "espressif-esp32p4",
+    "espressif/esp32p4": "espressif-esp32p4",
+    "waveshare-esp32-p4-wifi6": "espressif-esp32p4",
+    "waveshare/esp32-p4-wifi6": "espressif-esp32p4",
+    "waveshare-esp32-p4": "espressif-esp32p4",
+    "waveshare/esp32-p4": "espressif-esp32p4",
+    "waveshare-p4": "espressif-esp32p4",
+    "waveshare/p4": "espressif-esp32p4",
+    "esp32-p4-wifi6": "espressif-esp32p4",
+    "esp32-p4-wifi6-dev-kit": "espressif-esp32p4",
+    "esp32-p4": "espressif-esp32p4",
+    "esp32p4": "espressif-esp32p4",
+    "p4": "espressif-esp32p4",
     # generic-riscv64
     "generic-riscv64": "generic-riscv64",
     "generic": "generic-riscv64",
@@ -277,9 +318,63 @@ ROLE_DEFAULTS: dict[str, RoleDefaults] = {
         enable_mqtt_broker=True,
         enable_nfs_server=False,
     ),
+    "snitchbench": RoleDefaults(
+        stem="snitchbench",
+        enable_postgres=False,
+        enable_mqtt_broker=False,
+        enable_nfs_server=False,
+    ),
+    "lilsnitch": RoleDefaults(
+        stem="lilsnitch",
+        enable_postgres=False,
+        enable_mqtt_broker=False,
+        enable_nfs_server=False,
+    ),
 }
 
 ROLE_STEM_MAP: dict[str, str] = {role: defaults.stem for role, defaults in ROLE_DEFAULTS.items()}
+
+ROLE_ALIASES: dict[str, str] = {
+    "prod": "databroker",
+    "broker": "databroker",
+    "databroker": "databroker",
+    "brakerbox": "databroker",
+    "brakbox": "databroker",
+    "brx": "databroker",
+    "bench": "databench",
+    "databench": "databench",
+    "brakerbench": "databench",
+    "brakbnch": "databench",
+    "brh": "databench",
+    "babbagebox": "babbagebox",
+    "babbox": "babbagebox",
+    "bab": "babbagebox",
+    "gpuprod": "babbagebox",
+    "babbagebench": "babbagebench",
+    "babbnch": "babbagebench",
+    "bah": "babbagebench",
+    "gpubench": "babbagebench",
+    "visionbox": "visionbox",
+    "visbox": "visionbox",
+    "vx": "visionbox",
+    "npuprod": "visionbox",
+    "visionbench": "visionbench",
+    "visbnch": "visionbench",
+    "vh": "visionbench",
+    "npubench": "visionbench",
+    "visionferret": "visionbench",
+    "vferret": "visionbench",
+    "mlbench": "visionbench",
+    "devbench": "devbench",
+    "devbnch": "devbench",
+    "dev": "devbench",
+    "snitchbench": "snitchbench",
+    "snitchbnch": "snitchbench",
+    "sb": "snitchbench",
+    "lilsnitch": "lilsnitch",
+    "lsp4": "lilsnitch",
+    "snitch": "lilsnitch",
+}
 
 # Dedicated AI/NPU PCI vendor IDs always treated as PCIe accelerators.
 DEDICATED_ACCELERATOR_VENDORS: dict[str, str] = {
@@ -298,7 +393,7 @@ ACCELERATOR_PCI_CLASSES: frozenset[str] = frozenset({"0300", "0302", "0380", "0b
 
 
 def normalize_soc_slug(raw_slug: str | None) -> str:
-    """Normalize a SoC or board alias to one of the 8 canonical SoC slugs."""
+    """Normalize a SoC or board alias to one of the 9 canonical SoC slugs."""
     if not raw_slug:
         return "generic-riscv64"
     cleaned = raw_slug.strip().lower()
@@ -393,6 +488,8 @@ def detect_soc_from_dt_model(dt_model: str | None) -> str | None:
         return "ultrarisc-dp1000"
     if any(tok in lower for tok in ("atlantis", "ascalon")):
         return "tenstorrent-atlantis"
+    if any(tok in lower for tok in ("esp32-p4-wifi6", "waveshare esp32-p4", "esp32-p4", "esp32p4")):
+        return "espressif-esp32p4"
     return None
 
 
@@ -414,6 +511,18 @@ def resolve_profile(identifier: str | None = None, *, dt_model: str | None = Non
 def get_soc_profile(soc_slug: str) -> SocProfile:
     """Return the declarative SocProfile for a canonical or aliased SoC slug."""
     return SOC_PROFILES[normalize_soc_slug(soc_slug)]
+
+
+def normalize_role(raw_role: str | None) -> str | None:
+    """Normalize a BrakerRak role or alias to a canonical role slug, or None if unrecognized."""
+    if not raw_role:
+        return None
+    cleaned = raw_role.strip().lower()
+    if cleaned in ROLE_ALIASES:
+        return ROLE_ALIASES[cleaned]
+    if cleaned in ROLE_DEFAULTS:
+        return cleaned
+    return None
 
 
 def get_role_defaults(node_role: str) -> RoleDefaults:

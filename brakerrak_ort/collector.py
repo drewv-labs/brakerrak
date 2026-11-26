@@ -19,10 +19,12 @@ from brakerrak_ort.env import (
     get_raid_arrays_config,
     load_kv_file,
     load_node_env,
+    parse_kv_content,
     resolve_feature_flag,
     resolve_real_user,
 )
 from brakerrak_ort.probes import (
+    HostProxiedTelemetryProbe,
     LocalSystemProbe,
     detect_pcie_accelerators,
     detect_primary_nic,
@@ -41,6 +43,7 @@ from brakerrak_ort.probes import (
 from brakerrak_ort.profiles import (
     ROLE_STEM_MAP,
     SocProfile,
+    normalize_role,
     resolve_profile,
 )
 from brakerrak_ort.redact import build_public_snapshot, sign_snapshot
@@ -52,9 +55,11 @@ from brakerrak_ort.types import (
     BtrfsDeviceStatsInfo,
     MountInfo,
     PrimaryNicStatus,
+    SdStorageInfo,
     SnapshotOutputs,
     SystemProbe,
     UserIdentity,
+    WirelessCoprocessorInfo,
 )
 
 C_CYAN = "\033[1;36m"
@@ -65,9 +70,260 @@ C_RESET = "\033[0m"
 
 _BUS_ERROR_RE = re.compile(
     r"(pcieport.*error|AER:.*error|AER:.*Corrected|AER:.*Uncorrected|"
-    r"nvme.*error|I/O error|usb.*reset|under-voltage)",
+    r"nvme.*error|sdmmc.*error|mmcblk.*error|sdio.*error|I/O error|usb.*reset|under-voltage)",
     re.IGNORECASE,
 )
+_MIN_SDMMC_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
+_ALLOWED_SD_FSTYPES: frozenset[str] = frozenset({"vfat", "fat32", "ext4", "littlefs"})
+_WIRELESS_IFACE_PREFIXES: tuple[str, ...] = ("wlan", "esp", "wlp")
+
+
+def _is_wireless_iface(name: str) -> bool:
+    return name.strip().lower().startswith(_WIRELESS_IFACE_PREFIXES)
+
+
+def _is_explicit_flag(
+    key: str,
+    node_env: Mapping[str, str],
+    active_env: Mapping[str, str],
+) -> bool | None:
+    raw = active_env.get(key)
+    if raw is None or raw.strip() == "":
+        raw = node_env.get(key)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _extract_sd_info_from_blocks(
+    block_devices: Sequence[Mapping[str, Any]],
+) -> SdStorageInfo | None:
+    for bd in block_devices:
+        name = str(bd.get("name") or "").strip()
+        path = str(bd.get("path") or "").strip()
+        tran = str(bd.get("tran") or "").strip().lower()
+        is_sd = (
+            name.startswith("mmcblk")
+            or path.startswith("/dev/mmcblk")
+            or tran in ("sd", "sdmmc", "mmc")
+        )
+        if not is_sd:
+            continue
+
+        device = path or (f"/dev/{name}" if name else None)
+        bus = tran if tran and tran not in ("sd", "mmc") else "sdmmc"
+        raw_size = bd.get("size")
+        size_bytes = int(raw_size) if isinstance(raw_size, int) else (
+            int(raw_size) if isinstance(raw_size, str) and raw_size.isdigit() else 0
+        )
+
+        mountpoint = str(bd["mountpoint"]).strip() if bd.get("mountpoint") else None
+        fstype = str(bd["fstype"]).strip() if bd.get("fstype") else None
+        label = str(bd["label"]).strip() if bd.get("label") else None
+
+        children = bd.get("children")
+        if isinstance(children, list):
+            for child in children:
+                if not isinstance(child, Mapping):
+                    continue
+                ch_mp = str(child["mountpoint"]).strip() if child.get("mountpoint") else None
+                ch_fs = str(child["fstype"]).strip() if child.get("fstype") else None
+                ch_lbl = str(child["label"]).strip() if child.get("label") else None
+                if not mountpoint and ch_mp:
+                    mountpoint = ch_mp
+                    fstype = ch_fs or fstype
+                    label = ch_lbl or label
+                    break
+                if not fstype and ch_fs:
+                    fstype = ch_fs
+                if not label and ch_lbl:
+                    label = ch_lbl
+
+        return SdStorageInfo(
+            device=device,
+            bus=bus,
+            mountpoint=mountpoint,
+            fstype=fstype,
+            size_bytes=size_bytes,
+            mounted=bool(mountpoint),
+            label=label,
+        )
+    return None
+
+
+def _collect_sd_storage(
+    block_devices: Sequence[Mapping[str, Any]],
+    probe: SystemProbe,
+) -> SdStorageInfo:
+    info = _extract_sd_info_from_blocks(block_devices)
+    device = info["device"] if info else None
+    bus = info["bus"] if info else "sdmmc"
+    mountpoint = info["mountpoint"] if info else None
+    fstype = info["fstype"] if info else None
+    size_bytes = info["size_bytes"] if info else 0
+    mounted = info["mounted"] if info else False
+    label = info["label"] if info else None
+
+    if device is None:
+        mmc_sysfs = probe.glob_paths("/sys/block/mmcblk*")
+        if mmc_sysfs:
+            short_name = os.path.basename(mmc_sysfs[0])
+            device = f"/dev/{short_name}"
+
+    if device and size_bytes == 0:
+        short_name = os.path.basename(device)
+        raw_sectors = probe.read_text(f"/sys/block/{short_name}/size")
+        if raw_sectors and raw_sectors.isdigit():
+            size_bytes = int(raw_sectors) * 512
+
+    if device and not mountpoint:
+        mounts_raw = probe.read_text("/proc/mounts") or ""
+        for line in mounts_raw.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0].startswith(device):
+                mountpoint = parts[1]
+                fstype = fstype or parts[2]
+                mounted = True
+                break
+
+    if mountpoint and not mounted:
+        minfo = inspect_mount_fstype(mountpoint, probe)
+        mounted = minfo["mounted"]
+        fstype = fstype or minfo["fstype"]
+
+    return SdStorageInfo(
+        device=device,
+        bus=bus,
+        mountpoint=mountpoint,
+        fstype=fstype,
+        size_bytes=size_bytes,
+        mounted=mounted,
+        label=label,
+    )
+
+
+def _load_c6_sdio_env(
+    probe: SystemProbe,
+    active_env: Mapping[str, str],
+    config_path: str | None = None,
+) -> dict[str, str]:
+    """Load C6 SDIO quirk env from /etc/rvdk/c6-sdio.env and optional sibling config_dir file."""
+    merged: dict[str, str] = {}
+    etc_raw = probe.read_text("/etc/rvdk/c6-sdio.env")
+    if etc_raw:
+        merged.update(parse_kv_content(etc_raw))
+
+    eff_cfg = config_path or (active_env.get("BRAKERRAK_NODE_ENV") or "").strip() or None
+    if eff_cfg:
+        sibling_path = str(Path(eff_cfg).parent / "c6-sdio.env")
+        sib_raw = probe.read_text(sibling_path)
+        if sib_raw:
+            merged.update(parse_kv_content(sib_raw))
+        else:
+            merged.update(load_kv_file(sibling_path))
+    return merged
+
+
+def _collect_wireless_coprocessor(
+    net_ifaces: Sequence[Mapping[str, Any]],
+    probe: SystemProbe,
+    node_env: Mapping[str, str],
+    active_env: Mapping[str, str],
+    config_path: str | None = None,
+) -> tuple[WirelessCoprocessorInfo, bool]:
+    c6_env = _load_c6_sdio_env(probe, active_env, config_path=config_path)
+
+    disabled_override = (
+        _is_explicit_flag("RVDK_C6_SDIO_DISABLED", node_env, active_env) is True
+        or _is_explicit_flag("C6_SDIO_DISABLED", node_env, active_env) is True
+    )
+    enabled_override = _is_explicit_flag("RVDK_C6_SDIO_ENABLED", node_env, active_env)
+    if enabled_override is None:
+        enabled_override = _is_explicit_flag("C6_SDIO_ENABLED", node_env, active_env)
+
+    c6_file_enabled = (
+        c6_env.get("RVDK_C6_SDIO_ENABLED")
+        or c6_env.get("C6_SDIO_ENABLED")
+        or c6_env.get("ENABLE_C6_SDIO")
+        or ""
+    ).strip().lower()
+    c6_file_disabled = (
+        c6_env.get("RVDK_C6_SDIO_DISABLED")
+        or c6_env.get("C6_SDIO_DISABLED")
+        or ""
+    ).strip().lower()
+    c6_disabled = (
+        disabled_override
+        or enabled_override is False
+        or c6_file_disabled in ("1", "true", "yes", "on")
+        or c6_file_enabled in ("0", "false", "no", "off", "disabled")
+    )
+
+    raw_slave = (
+        c6_env.get("RVDK_C6_SDIO_SLAVE_TARGET")
+        or c6_env.get("C6_CHIP")
+        or ""
+    ).strip()
+    if raw_slave.lower() == "esp32c6":
+        chip = "esp32-c6"
+    elif raw_slave and raw_slave.lower() != "none":
+        chip = raw_slave
+    else:
+        chip = "esp32-c6"
+
+    transport = (
+        c6_env.get("RVDK_C6_SDIO_TRANSPORT")
+        or c6_env.get("C6_TRANSPORT")
+        or ("disabled" if c6_disabled else "sdio")
+    ).strip()
+
+    wireless_iface: Mapping[str, Any] | None = None
+    for iface in net_ifaces:
+        ifname = str(iface.get("ifname") or "").strip()
+        if not ifname:
+            continue
+        if _is_wireless_iface(ifname) or probe.path_exists(f"/sys/class/net/{ifname}/wireless"):
+            wireless_iface = iface
+            break
+
+    sdio_devs = probe.glob_paths("/sys/bus/sdio/devices/*")
+
+    if not c6_disabled and wireless_iface is not None:
+        w_name = str(wireless_iface.get("ifname") or "")
+        w_state = str(wireless_iface.get("operstate") or "DOWN").upper()
+        return (
+            WirelessCoprocessorInfo(
+                chip=chip,
+                transport=transport,
+                interface=w_name,
+                operstate=w_state,
+                present=True,
+            ),
+            False,
+        )
+
+    if not c6_disabled and sdio_devs:
+        return (
+            WirelessCoprocessorInfo(
+                chip=chip,
+                transport=transport,
+                interface=None,
+                operstate="UNKNOWN",
+                present=True,
+            ),
+            False,
+        )
+
+    return (
+        WirelessCoprocessorInfo(
+            chip=chip,
+            transport=transport,
+            interface=None,
+            operstate="DISABLED" if c6_disabled else "ABSENT",
+            present=False,
+        ),
+        c6_disabled,
+    )
 
 
 def is_day1_stage(stage: str) -> bool:
@@ -193,14 +449,29 @@ def evaluate_assertions(
     raid_mount_checks: Sequence[tuple[str, str, MountInfo, BtrfsDeviceStatsInfo]] = (),
     with_raid: bool = False,
     mount_point: str = "/mnt/nvme_pgdata",
+    sd_storage: SdStorageInfo | Mapping[str, Any] | None = None,
+    wireless_coprocessor: WirelessCoprocessorInfo | Mapping[str, Any] | None = None,
+    block_devices: Sequence[Mapping[str, Any]] = (),
+    c6_sdio_disabled: bool = False,
 ) -> list[AssertionResult]:
     """Evaluate hardware, bus, network, thermal, and stage-aware Day-1 ORT assertions."""
     active_env = os.environ if env is None else env
     role_lower = node_role.strip().lower()
     is_accel_persona = role_lower.startswith(("vision", "babbage"))
-    enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, role_lower, active_env)
-    enable_mqtt = resolve_feature_flag("ENABLE_MQTT_BROKER", node_env, role_lower, active_env)
-    enable_nfs = resolve_feature_flag("ENABLE_NFS_SERVER", node_env, role_lower, active_env)
+    pg_explicit = _is_explicit_flag("ENABLE_POSTGRES", node_env, active_env)
+    mqtt_explicit = _is_explicit_flag("ENABLE_MQTT_BROKER", node_env, active_env)
+    nfs_explicit = _is_explicit_flag("ENABLE_NFS_SERVER", node_env, active_env)
+
+    if profile.has_mmu:
+        enable_pg = resolve_feature_flag("ENABLE_POSTGRES", node_env, role_lower, active_env)
+        enable_mqtt = resolve_feature_flag("ENABLE_MQTT_BROKER", node_env, role_lower, active_env)
+        enable_nfs = resolve_feature_flag("ENABLE_NFS_SERVER", node_env, role_lower, active_env)
+    else:
+        enable_pg = (pg_explicit is True) or (
+            pg_explicit is None and role_lower in ("databroker", "databench")
+        )
+        enable_mqtt = mqtt_explicit is True
+        enable_nfs = nfs_explicit is True
 
     # ORT-01: CPU Harts
     hart_count = len(harts)
@@ -214,9 +485,112 @@ def evaluate_assertions(
     # ORT-02: System Memory
     ram_status: AssertionStatus = "PASS" if total_ram_kb >= profile.ram_floor_kb else "FAIL"
 
-    # ORT-03 & ORT-03B: Decoupled Primary PCIe NVMe and Accelerator Slots
+    # Resolve SDMMC inventory if needed
+    eff_sd: SdStorageInfo
+    block_sd = _extract_sd_info_from_blocks(block_devices)
+    if sd_storage is not None:
+        eff_sd = SdStorageInfo(
+            device=sd_storage.get("device") or (block_sd["device"] if block_sd else None),
+            bus=str(sd_storage.get("bus") or (block_sd["bus"] if block_sd else "sdmmc")),
+            mountpoint=(
+                sd_storage.get("mountpoint")
+                or (block_sd["mountpoint"] if block_sd else None)
+            ),
+            fstype=sd_storage.get("fstype") or (block_sd["fstype"] if block_sd else None),
+            size_bytes=int(
+                sd_storage.get("size_bytes") or (block_sd["size_bytes"] if block_sd else 0)
+            ),
+            mounted=bool(sd_storage.get("mounted")) or bool(block_sd and block_sd["mounted"]),
+            label=sd_storage.get("label") or (block_sd["label"] if block_sd else None),
+        )
+    elif block_sd is not None:
+        eff_sd = block_sd
+    else:
+        eff_sd = SdStorageInfo(
+            device=None,
+            bus="sdmmc",
+            mountpoint=None,
+            fstype=None,
+            size_bytes=0,
+            mounted=False,
+            label=None,
+        )
+
+    # ORT-03 & ORT-03B: Primary Storage (PCIe NVMe/Accel vs SDMMC/Wireless Coprocessor)
     ort_03_checks: list[AssertionResult] = []
-    if nvme_present:
+    if not profile.has_pcie:
+        sd_dev = eff_sd["device"]
+        sd_size = eff_sd["size_bytes"]
+        sd_ok = bool(sd_dev) and sd_size >= _MIN_SDMMC_BYTES
+        sd_actual = (
+            f"{sd_dev} ({sd_size / (1024**3):.2f} GiB)"
+            if sd_dev and sd_size > 0
+            else (f"{sd_dev} (0 B)" if sd_dev else "missing")
+        )
+        ort_03_checks.append(
+            {
+                "id": "ORT-03_SDMMC_STORAGE",
+                "description": profile.pcie_desc,
+                "expected": "SDMMC media >= 4 GiB (mmcblk*)",
+                "actual": sd_actual,
+                "status": "PASS" if sd_ok else "FAIL",
+            }
+        )
+
+        if profile.slug == "espressif-esp32p4":
+            c6_disabled_eff = (
+                c6_sdio_disabled
+                or bool(
+                    wireless_coprocessor
+                    and wireless_coprocessor.get("disabled_by_quirk")
+                )
+                or (_is_explicit_flag("RVDK_C6_SDIO_DISABLED", node_env, active_env) is True)
+                or (_is_explicit_flag("C6_SDIO_DISABLED", node_env, active_env) is True)
+                or (_is_explicit_flag("RVDK_C6_SDIO_ENABLED", node_env, active_env) is False)
+                or (_is_explicit_flag("C6_SDIO_ENABLED", node_env, active_env) is False)
+            )
+            c6_present = (
+                bool(wireless_coprocessor and wireless_coprocessor.get("present"))
+                and not c6_disabled_eff
+            )
+            wired_nic = not _is_wireless_iface(primary_nic.name)
+            wired_up = wired_nic and primary_nic.operstate == "UP"
+            wired_healthy = wired_nic and primary_nic.healthy
+
+            if c6_disabled_eff:
+                c6_status: AssertionStatus = "WARN" if wired_up else "FAIL"
+                c6_actual = (
+                    f"C6 SDIO disabled by quirk; RMII {primary_nic.name} UP"
+                    if wired_up
+                    else "C6 SDIO disabled by quirk and RMII Ethernet DOWN"
+                )
+            elif c6_present:
+                assert wireless_coprocessor is not None
+                c6_chip = str(wireless_coprocessor.get("chip") or "esp32-c6")
+                c6_trans = str(wireless_coprocessor.get("transport") or "sdio")
+                c6_iface = str(wireless_coprocessor.get("interface") or "sdio")
+                c6_state = str(wireless_coprocessor.get("operstate") or "UP")
+                c6_status = "PASS"
+                c6_actual = f"{c6_chip} via {c6_trans} ({c6_iface}, {c6_state})"
+            elif wired_healthy:
+                c6_status = "PASS"
+                c6_actual = f"RMII Ethernet {primary_nic.name} healthy (no C6 SDIO detected)"
+            else:
+                c6_status = "FAIL"
+                c6_actual = "missing (no ESP32-C6 SDIO co-processor or healthy RMII NIC)"
+
+            ort_03_checks.append(
+                {
+                    "id": "ORT-03B_ESP32_C6_SDIO",
+                    "description": (
+                        "Onboard ESP32-C6 Wi-Fi 6 SDIO Co-Processor or RMII Ethernet Readiness"
+                    ),
+                    "expected": "ESP32-C6 SDIO present or RMII wired NIC healthy",
+                    "actual": c6_actual,
+                    "status": c6_status,
+                }
+            )
+    elif nvme_present:
         actual_gt_s = parse_gt_per_sec(
             str(nvme_info["pcie_link_speed"])
             if nvme_info.get("pcie_link_speed") is not None
@@ -292,6 +666,12 @@ def evaluate_assertions(
     else:
         nic_actual = "DOWN"
 
+    bus_health_desc = (
+        "Zero PCIe AER, NVMe I/O, or USB Bus Reset Errors in dmesg"
+        if profile.has_pcie
+        else "Zero SDMMC I/O, SDIO, or USB Bus Reset Errors in dmesg"
+    )
+
     checks: list[AssertionResult] = [
         {
             "id": "ORT-01_CPU_HARTS",
@@ -331,7 +711,7 @@ def evaluate_assertions(
         },
         {
             "id": f"ORT-{next_idx + 2:02d}_KERNEL_BUS_HEALTH",
-            "description": "Zero PCIe AER, NVMe I/O, or USB Bus Reset Errors in dmesg",
+            "description": bus_health_desc,
             "expected": 0,
             "actual": len(bus_errors),
             "status": "PASS" if len(bus_errors) == 0 else "WARN",
@@ -340,35 +720,68 @@ def evaluate_assertions(
 
     # Stage-Aware Day-1 / Converged Assertions
     if is_day1_stage(stage):
-        if nvme_present:
-            logical_bs = str(nvme_info.get("logical_block_size_bytes") or "unknown")
-            checks.append(
-                {
-                    "id": "ORT-D1_NVME_4KN",
-                    "description": "Primary NVMe Formatted to 4Kn Logical Sector Alignment",
-                    "expected": "4096",
-                    "actual": logical_bs,
-                    "status": "PASS" if logical_bs == "4096" else "FAIL",
-                }
-            )
+        if profile.has_pcie:
+            if nvme_present:
+                logical_bs = str(nvme_info.get("logical_block_size_bytes") or "unknown")
+                checks.append(
+                    {
+                        "id": "ORT-D1_NVME_4KN",
+                        "description": "Primary NVMe Formatted to 4Kn Logical Sector Alignment",
+                        "expected": "4096",
+                        "actual": logical_bs,
+                        "status": "PASS" if logical_bs == "4096" else "FAIL",
+                    }
+                )
 
-        if (nvme_present or enable_pg) and nvme_mount_info is not None:
-            xfs_mounted = bool(nvme_mount_info.get("mounted"))
-            xfs_fstype = nvme_mount_info.get("fstype")
-            xfs_ok = xfs_mounted and xfs_fstype == "xfs"
+            if (nvme_present or enable_pg) and nvme_mount_info is not None:
+                xfs_mounted = bool(nvme_mount_info.get("mounted"))
+                xfs_fstype = nvme_mount_info.get("fstype")
+                xfs_ok = xfs_mounted and xfs_fstype == "xfs"
+                checks.append(
+                    {
+                        "id": "ORT-D1_NVME_XFS_MOUNT",
+                        "description": f"Primary NVMe Data Volume ({mount_point}) Mounted as XFS",
+                        "expected": "mounted (xfs)",
+                        "actual": (
+                            f"mounted ({xfs_fstype or 'unknown'})"
+                            if xfs_mounted
+                            else "unmounted"
+                        ),
+                        "status": "PASS" if xfs_ok else "FAIL",
+                    }
+                )
+        elif profile.storage_bus == "sdmmc":
+            sd_mounted = bool(eff_sd["mounted"])
+            sd_fstype_raw = eff_sd["fstype"]
+            sd_fstype = sd_fstype_raw.strip().lower() if sd_fstype_raw else None
+            sd_mount_ok = sd_mounted and sd_fstype in _ALLOWED_SD_FSTYPES
+            sd_mp = eff_sd["mountpoint"] or "/sdcard"
             checks.append(
                 {
-                    "id": "ORT-D1_NVME_XFS_MOUNT",
-                    "description": f"Primary NVMe Data Volume ({mount_point}) Mounted as XFS",
-                    "expected": "mounted (xfs)",
-                    "actual": (
-                        f"mounted ({xfs_fstype or 'unknown'})" if xfs_mounted else "unmounted"
+                    "id": "ORT-D1_SD_MOUNT",
+                    "description": (
+                        f"Primary SDMMC Volume ({sd_mp}) Mounted (vfat/fat32/ext4/littlefs)"
                     ),
-                    "status": "PASS" if xfs_ok else "FAIL",
+                    "expected": "mounted (vfat | fat32 | ext4 | littlefs)",
+                    "actual": (
+                        f"mounted ({sd_fstype or 'unknown'})" if sd_mounted else "unmounted"
+                    ),
+                    "status": "PASS" if sd_mount_ok else "FAIL",
                 }
             )
 
-        if enable_pg:
+        if not profile.has_mmu:
+            if enable_pg:
+                checks.append(
+                    {
+                        "id": "ORT-D1_POSTGRES_ACTIVE",
+                        "description": "PostgreSQL 18 Systemd Service Active",
+                        "expected": "disabled (unsupported on nommu riscv32)",
+                        "actual": "ENABLE_POSTGRES=true (unsupported on nommu riscv32)",
+                        "status": "FAIL",
+                    }
+                )
+        elif enable_pg:
             pg_active = bool(postgres_state.get("systemd_service_active"))
             checks.append(
                 {
@@ -590,10 +1003,17 @@ def collect_snapshot(
     interval_sec: float = 0.5,
     now_utc: datetime.datetime | None = None,
     env: Mapping[str, str] | None = None,
+    role_override: str | None = None,
+    config_path: str | None = None,
 ) -> tuple[dict[str, Any], PrimaryNicStatus, str, str]:
     """Collect a full, signed CTD hardware baseline snapshot using the supplied SystemProbe."""
     active_env = os.environ if env is None else env
-    resolved_kit = dict(kit_env) if kit_env is not None else load_kv_file(SYSTEM_KIT_ENV_PATH)
+    is_proxied = isinstance(probe, HostProxiedTelemetryProbe)
+    resolved_kit = (
+        dict(kit_env)
+        if kit_env is not None
+        else ({} if is_proxied else load_kv_file(SYSTEM_KIT_ENV_PATH))
+    )
     resolved_node_env = dict(node_env) if node_env is not None else {}
 
     dt_model = (probe.read_text("/proc/device-tree/model") or "").rstrip("\x00")
@@ -605,9 +1025,15 @@ def collect_snapshot(
     profile = resolve_profile(requested_soc, dt_model=dt_model)
     soc_slug = profile.slug
 
-    node_role = (
-        active_env.get("NODE_ROLE") or resolved_node_env.get("NODE_ROLE") or "devbench"
-    ).strip().lower()
+    proxied_role = probe.node_role if isinstance(probe, HostProxiedTelemetryProbe) else None
+    raw_role = (
+        role_override
+        or active_env.get("NODE_ROLE")
+        or resolved_node_env.get("NODE_ROLE")
+        or proxied_role
+        or "devbench"
+    )
+    node_role = normalize_role(raw_role) or raw_role.strip().lower()
     with_raid = (
         (active_env.get("WITH_RAID") or resolved_node_env.get("WITH_RAID") or "false")
         .strip()
@@ -645,8 +1071,8 @@ def collect_snapshot(
     nvme_dev = resolved_node_env.get("NVME_DEV", "/dev/nvme0n1")
     nvme_short = os.path.basename(nvme_dev)
     nvme_ctrl = re.sub(r"n[0-9]+$", "", nvme_short)
-    nvme_present = probe.path_exists(f"/sys/block/{nvme_short}")
-    raw_size_sectors = probe.read_text(f"/sys/block/{nvme_short}/size")
+    nvme_present = profile.has_pcie and probe.path_exists(f"/sys/block/{nvme_short}")
+    raw_size_sectors = probe.read_text(f"/sys/block/{nvme_short}/size") if nvme_present else None
     size_bytes = (
         int(raw_size_sectors) * 512
         if (nvme_present and raw_size_sectors and raw_size_sectors.isdigit())
@@ -654,22 +1080,44 @@ def collect_snapshot(
     )
     nvme_info: dict[str, Any] = {
         "device": nvme_dev if nvme_present else None,
-        "model": probe.read_text(f"/sys/block/{nvme_short}/device/model"),
-        "serial": probe.read_text(f"/sys/block/{nvme_short}/device/serial"),
-        "firmware_rev": probe.read_text(f"/sys/block/{nvme_short}/device/firmware_rev"),
-        "pcie_link_speed": probe.read_text(
-            f"/sys/class/nvme/{nvme_ctrl}/device/current_link_speed"
+        "model": probe.read_text(f"/sys/block/{nvme_short}/device/model") if nvme_present else None,
+        "serial": (
+            probe.read_text(f"/sys/block/{nvme_short}/device/serial") if nvme_present else None
         ),
-        "pcie_link_width": probe.read_text(
-            f"/sys/class/nvme/{nvme_ctrl}/device/current_link_width"
+        "firmware_rev": (
+            probe.read_text(f"/sys/block/{nvme_short}/device/firmware_rev")
+            if nvme_present
+            else None
         ),
-        "max_link_speed": probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_speed"),
-        "max_link_width": probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_width"),
-        "logical_block_size_bytes": probe.read_text(
-            f"/sys/block/{nvme_short}/queue/logical_block_size"
+        "pcie_link_speed": (
+            probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/current_link_speed")
+            if nvme_present
+            else None
         ),
-        "physical_block_size_bytes": probe.read_text(
-            f"/sys/block/{nvme_short}/queue/physical_block_size"
+        "pcie_link_width": (
+            probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/current_link_width")
+            if nvme_present
+            else None
+        ),
+        "max_link_speed": (
+            probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_speed")
+            if nvme_present
+            else None
+        ),
+        "max_link_width": (
+            probe.read_text(f"/sys/class/nvme/{nvme_ctrl}/device/max_link_width")
+            if nvme_present
+            else None
+        ),
+        "logical_block_size_bytes": (
+            probe.read_text(f"/sys/block/{nvme_short}/queue/logical_block_size")
+            if nvme_present
+            else None
+        ),
+        "physical_block_size_bytes": (
+            probe.read_text(f"/sys/block/{nvme_short}/queue/physical_block_size")
+            if nvme_present
+            else None
         ),
         "size_bytes": size_bytes,
     }
@@ -842,7 +1290,11 @@ def collect_snapshot(
             if _BUS_ERROR_RE.search(line):
                 bus_errors.append(line)
 
-    human_users, system_users_count, total_groups_count = _collect_local_users()
+    human_users: list[dict[str, Any]]
+    if is_proxied:
+        human_users, system_users_count, total_groups_count = [], 0, 0
+    else:
+        human_users, system_users_count, total_groups_count = _collect_local_users()
 
     ps_res = probe.run_cmd(
         ["ps", "-eo", "pid,ppid,user,stat,pcpu,pmem,rss,comm,args", "--sort=-rss"]
@@ -906,9 +1358,25 @@ def collect_snapshot(
     }
 
     accelerator_runtime = (
-        inspect_accelerator_runtime(pcie_accelerators, probe) if day1_mode else {}
+        inspect_accelerator_runtime(pcie_accelerators, probe)
+        if (day1_mode and profile.has_pcie)
+        else {}
     )
-    nvme_mount_info = inspect_mount_fstype(mount_point, probe) if day1_mode else None
+    nvme_mount_info = (
+        inspect_mount_fstype(mount_point, probe) if (day1_mode and profile.has_pcie) else None
+    )
+    sd_storage_info: SdStorageInfo | None = None
+    wireless_coprocessor_info: WirelessCoprocessorInfo | None = None
+    c6_disabled = False
+    if profile.storage_bus == "sdmmc" or not profile.has_pcie:
+        sd_storage_info = _collect_sd_storage(block_devices, probe)
+        wireless_coprocessor_info, c6_disabled = _collect_wireless_coprocessor(
+            net_ifaces,
+            probe,
+            resolved_node_env,
+            active_env,
+            config_path=config_path,
+        )
 
     total_ram_kb = probe.get_total_ram_kb()
     soc_peak_c = resolve_soc_peak_temp(quiescent["thermal_zones_celsius"])
@@ -935,6 +1403,10 @@ def collect_snapshot(
         raid_mount_checks=raid_mount_checks,
         with_raid=with_raid,
         mount_point=mount_point,
+        sd_storage=sd_storage_info,
+        wireless_coprocessor=wireless_coprocessor_info,
+        block_devices=block_devices,
+        c6_sdio_disabled=c6_disabled,
     )
     overall_status = compute_overall_status(ort_checks)
 
@@ -948,6 +1420,44 @@ def collect_snapshot(
     storage_mounts: dict[str, Any] = {}
     if nvme_mount_info is not None:
         storage_mounts[mount_point] = nvme_mount_info
+    if day1_mode and sd_storage_info is not None and sd_storage_info["mountpoint"]:
+        sd_mp = sd_storage_info["mountpoint"]
+        storage_mounts[sd_mp] = MountInfo(
+            mountpoint=sd_mp,
+            mounted=sd_storage_info["mounted"],
+            fstype=sd_storage_info["fstype"],
+        )
+
+    raw_arch = probe.get_architecture()
+    architecture = (
+        profile.arch
+        if (profile.arch == "riscv32" and (not raw_arch or raw_arch == "riscv64"))
+        else (raw_arch or profile.arch)
+    )
+    raw_mmu = harts[0].get("mmu") if harts else None
+    mmu_type = raw_mmu if raw_mmu is not None else ("none" if not profile.has_mmu else None)
+
+    hardware_inventory: dict[str, Any] = {
+        "device_tree_model": dt_model,
+        "architecture": architecture,
+        "cpu_harts_count": len(harts),
+        "isa_string": harts[0].get("isa") if harts else None,
+        "mmu_type": mmu_type,
+        "cpu_harts": harts,
+        "cache_hierarchy": caches,
+        "nvme_primary": nvme_info,
+        "pcie_accelerators": pcie_accelerators,
+        "accelerator_runtime": accelerator_runtime,
+        "usb_raid_arrays": usb_raid_arrays,
+        "storage_mounts": storage_mounts,
+        "usb_topology_tree": lsusb_tree.splitlines(),
+        "pci_devices": pci_lines,
+        "block_devices": block_devices,
+    }
+    if profile.storage_bus == "sdmmc" and sd_storage_info is not None:
+        hardware_inventory["sd_storage"] = sd_storage_info
+        if wireless_coprocessor_info is not None:
+            hardware_inventory["wireless_coprocessor"] = wireless_coprocessor_info
 
     hostname = probe.get_hostname()
     snapshot_payload: dict[str, Any] = {
@@ -966,23 +1476,7 @@ def collect_snapshot(
             "assertions": ort_checks,
         },
         "quiescent_profile": quiescent,
-        "hardware_inventory": {
-            "device_tree_model": dt_model,
-            "architecture": probe.get_architecture(),
-            "cpu_harts_count": len(harts),
-            "isa_string": harts[0].get("isa") if harts else None,
-            "mmu_type": harts[0].get("mmu") if harts else None,
-            "cpu_harts": harts,
-            "cache_hierarchy": caches,
-            "nvme_primary": nvme_info,
-            "pcie_accelerators": pcie_accelerators,
-            "accelerator_runtime": accelerator_runtime,
-            "usb_raid_arrays": usb_raid_arrays,
-            "storage_mounts": storage_mounts,
-            "usb_topology_tree": lsusb_tree.splitlines(),
-            "pci_devices": pci_lines,
-            "block_devices": block_devices,
-        },
+        "hardware_inventory": hardware_inventory,
         "os_and_kernel_state": {
             "uname": probe.get_uname(),
             "os_release": probe.read_text("/etc/os-release"),
@@ -1232,6 +1726,7 @@ def run_ort_collection(
     probe: SystemProbe | None = None,
     now_utc: datetime.datetime | None = None,
     env: Mapping[str, str] | None = None,
+    role_override: str | None = None,
 ) -> SnapshotOutputs:
     """Execute ORT collection, redaction, signing, and atomic snapshot persistence."""
     active_env = os.environ if env is None else env
@@ -1239,9 +1734,16 @@ def run_ort_collection(
     resolved_out_dir = (
         Path(out_dir) if out_dir is not None else Path(owner.home) / ".brakerrak" / "snapshots"
     )
-    node_env = load_node_env(config_path, real_home=owner.home, env=active_env)
-    kit_env = load_kv_file(SYSTEM_KIT_ENV_PATH)
     active_probe: SystemProbe = LocalSystemProbe() if probe is None else probe
+    is_proxied = isinstance(active_probe, HostProxiedTelemetryProbe)
+    eff_config_path = config_path or (active_env.get("BRAKERRAK_NODE_ENV") or "").strip() or None
+    has_explicit_node_env = eff_config_path is not None
+    node_env = (
+        load_node_env(eff_config_path, real_home=owner.home, env=active_env)
+        if (not is_proxied or has_explicit_node_env)
+        else {}
+    )
+    kit_env = {} if is_proxied else load_kv_file(SYSTEM_KIT_ENV_PATH)
     ts = now_utc or datetime.datetime.now(datetime.UTC)
 
     payload, primary_nic, soc_slug, node_role = collect_snapshot(
@@ -1254,6 +1756,8 @@ def run_ort_collection(
         interval_sec=interval_sec,
         now_utc=ts,
         env=active_env,
+        role_override=role_override,
+        config_path=eff_config_path,
     )
     base_stem = build_snapshot_stem(node_role, stage, ts)
     outputs = write_snapshot_pair(

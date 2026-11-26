@@ -442,8 +442,10 @@ _reset_clean_fstab() {
 
 # Quarantined legacy RVDK cleanup used only when `rvdk reset` is unavailable.
 _reset_legacy_rvdk_compat() {
-    apt-get -o DPkg::Lock::Timeout=120 purge -y "postgresql-18*" "postgresql-client-18*" "postgresql-common*" 2>/dev/null || true
-    apt-get -o DPkg::Lock::Timeout=120 autoremove -y --purge >/dev/null 2>&1 || true
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get -o DPkg::Lock::Timeout=120 purge -y "postgresql-18*" "postgresql-client-18*" "postgresql-common*" 2>/dev/null || true
+        apt-get -o DPkg::Lock::Timeout=120 autoremove -y --purge >/dev/null 2>&1 || true
+    fi
     rm -rf /etc/postgresql /etc/postgresql-common /var/lib/postgresql /var/log/postgresql
     rm -rf /var/lib/rvdk/pgdg-riscv64 /opt/drewv-pgdg-riscv64
 
@@ -515,6 +517,9 @@ _reset_main() {
     brak_resolve_node_env
     USER_NODE_ENV="$NODE_ENV"
 
+    TARGET_ARCH="riscv64"
+    STORAGE_MEDIA="nvme"
+    NODE_ROLE="databroker"
     NVME_DEV="/dev/nvme0n1"
     MOUNT_POINT="/mnt/nvme_pgdata"
     NFS_MOUNT_POINT="/mnt/nfs_vault"
@@ -600,7 +605,19 @@ _reset_main() {
         log_fatal "Destructive Day-0 rollback requires --confirm-destroy flag."
     fi
 
-    if [[ -b "$NVME_DEV" ]] && _reset_device_is_protected "$NVME_DEV"; then
+    local _is_sd_target="false"
+    local _dt_lc=""
+    _dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "$DT_MODEL")"
+    if [[ "${STORAGE_MEDIA:-nvme}" == "sd" || "${TARGET_ARCH:-riscv64}" == "riscv32" || "${NODE_ROLE:-}" == "snitchbench" || "${NODE_ROLE:-}" == "lilsnitch" ]] \
+       || [[ "$_dt_lc" == *"esp32-p4"* || "$_dt_lc" == *"esp32p4"* ]]; then
+        _is_sd_target="true"
+    elif brak_resolve_silicon "${BRAKERRAK_TARGET:-}" "$DT_MODEL" >/dev/null 2>&1; then
+        if [[ "${TARGET_BOARD:-}" == "espressif-esp32p4" || "${STORAGE_MEDIA:-nvme}" == "sd" || "${TARGET_ARCH:-riscv64}" == "riscv32" ]]; then
+            _is_sd_target="true"
+        fi
+    fi
+
+    if [[ "$_is_sd_target" != "true" && -b "$NVME_DEV" ]] && _reset_device_is_protected "$NVME_DEV"; then
         log_fatal "Safety Interlock: ${NVME_DEV} backs an active OS filesystem (/, /boot, /boot/efi), root LVM/mapper volume, or active swap! Aborting."
     fi
 
@@ -645,10 +662,14 @@ _reset_main() {
     PGDG_BACKUP_DIR="${RUNTIME_DIR}/pgdg-deb-backup"
 
     echo "=== 1. Stopping DataBroker Services & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
-    systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
-    systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
-    systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service mosquitto.service 2>/dev/null || true
-    pkill -9 -u postgres 2>/dev/null || true
+    if [[ "$_is_sd_target" == "true" ]]; then
+        log_skip "SD/riscv32 target; skipped DataBroker service teardown"
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
+        systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
+        systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service mosquitto.service 2>/dev/null || true
+        pkill -9 -u postgres 2>/dev/null || true
+    fi
 
     RVDK_PG_DEBS="/var/lib/rvdk/pgdg-riscv64/debs"
     if [[ "$KEEP_CACHE" == "true" ]]; then
@@ -793,11 +814,14 @@ _reset_main() {
     fi
 
     echo "=== 3. Tearing Down LVM (${VG_NAME}) & Resetting ${NVME_DEV} to Factory 512e (512B) ==="
-    if [[ -b "$NVME_DEV" ]]; then
+    if [[ "$_is_sd_target" == "true" ]]; then
+        CUR_LBA="n/a (sd)"
+        log_skip "SD media target (STORAGE_MEDIA=${STORAGE_MEDIA}, TARGET_ARCH=${TARGET_ARCH}); skipping LVM (${VG_NAME}) and NVMe 512e teardown"
+    elif [[ -b "$NVME_DEV" ]]; then
         local cand_vg pv_list pv_line pv_trimmed pv_count p
         for cand_vg in "$VG_NAME" "vg_rvdk"; do
             [[ -z "$cand_vg" ]] && continue
-            if vgs "$cand_vg" >/dev/null 2>&1; then
+            if command -v vgs >/dev/null 2>&1 && vgs "$cand_vg" >/dev/null 2>&1; then
                 if ! pv_list="$(pvs --noheadings -o pv_name -S "vg_name=${cand_vg}" 2>/dev/null)"; then
                     log_fatal "Safety Interlock: unable to enumerate PVs for VG '${cand_vg}'. Aborting vgremove."
                 fi
@@ -827,21 +851,25 @@ _reset_main() {
         pvremove -ff -y "${NVME_DEV}"* 2>/dev/null || true
         for p in "${NVME_DEV}"p*; do [[ -b "$p" ]] && wipefs -af "$p" >/dev/null 2>&1 || true; done
         wipefs -af "$NVME_DEV" >/dev/null 2>&1 || true
-        udevadm settle
+        udevadm settle 2>/dev/null || true
         sleep 1
 
-        LBA_512_INDEX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:9/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
-        if [[ -n "$LBA_512_INDEX" ]]; then
-            nvme format "$NVME_DEV" -l "$LBA_512_INDEX" -s 1 --force 2>/dev/null || nvme format "$NVME_DEV" -l "$LBA_512_INDEX" --force
-            partprobe "$NVME_DEV" 2>/dev/null || true
-            udevadm settle
-            sleep 2
+        if command -v nvme >/dev/null 2>&1; then
+            LBA_512_INDEX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:9/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
+            if [[ -n "$LBA_512_INDEX" ]]; then
+                nvme format "$NVME_DEV" -l "$LBA_512_INDEX" -s 1 --force 2>/dev/null || nvme format "$NVME_DEV" -l "$LBA_512_INDEX" --force
+                partprobe "$NVME_DEV" 2>/dev/null || true
+                udevadm settle 2>/dev/null || true
+                sleep 2
+            fi
+        else
+            log_skip "nvme-cli not installed; skipping 512e LBA format on ${NVME_DEV}"
         fi
         CUR_LBA="$(cat "/sys/block/${NVME_SHORT}/queue/logical_block_size" 2>/dev/null || echo "unknown")"
         log_ok "${NVME_DEV} logical sector size reset to: ${CUR_LBA}B"
     else
         CUR_LBA="none"
-        log_skip "Block device ${NVME_DEV} not present"
+        log_skip "Block device ${NVME_DEV} not present; skipping LVM and NVMe 512e teardown"
     fi
 
     echo "=== 4. Purging PostgreSQL 18, RVDK/BrakerRak Drop-Ins & Mount Directories ==="
@@ -874,25 +902,35 @@ _reset_main() {
     else
         rm -rf "$PGDG_BACKUP_DIR"
     fi
-    apt-get -o DPkg::Lock::Timeout=120 update -q || true
+    if [[ "$_is_sd_target" != "true" ]] && command -v apt-get >/dev/null 2>&1; then
+        apt-get -o DPkg::Lock::Timeout=120 update -q || true
+    fi
 
     echo "=== 5. Reverting /etc/fstab, HugePages/DeepTune Sysctls & Hostname ==="
     _reset_clean_fstab /etc/fstab
 
     rm -f /etc/sysctl.d/90-brakerbox-broker.conf \
           /etc/udev/rules.d/99-brakerrak-usb-raid.rules
-    systemctl daemon-reload
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
 
     sysctl -w vm.nr_hugepages=0 >/dev/null 2>&1 || true
-    udevadm control --reload-rules && udevadm trigger
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload-rules 2>/dev/null && udevadm trigger 2>/dev/null || true
+    fi
 
-    if command -v hostnamectl >/dev/null 2>&1; then
+    if [[ "$_is_sd_target" == "true" ]]; then
+        log_skip "SD/riscv32 target; skipped host hostname mutation"
+    elif command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "$RESET_HOSTNAME"
     else
         echo "$RESET_HOSTNAME" > /etc/hostname
         hostname "$RESET_HOSTNAME"
     fi
-    sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${RESET_HOSTNAME}/g" /etc/hosts 2>/dev/null || true
+    if [[ "$_is_sd_target" != "true" && -f /etc/hosts ]]; then
+        sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${RESET_HOSTNAME}/g" /etc/hosts 2>/dev/null || true
+    fi
 
     if [[ "$PURGE_CONFIG" == "true" ]]; then
         if [[ -f "$USER_NODE_ENV" ]]; then
@@ -907,8 +945,12 @@ _reset_main() {
         log_skip "Preserved ${USER_NODE_ENV} (pass --purge-config to delete)"
     fi
 
+    local lba_disp="$CUR_LBA"
+    if [[ "$lba_disp" =~ ^[0-9]+$ ]]; then
+        lba_disp="${lba_disp}B"
+    fi
     echo ""
-    echo "=== [OK] Option A Day-0 Rollback Complete (Hostname: $(hostname), NVMe LBA: ${CUR_LBA}B) ==="
+    echo "=== [OK] Option A Day-0 Rollback Complete (Hostname: $(hostname), NVMe LBA: ${lba_disp}) ==="
 }
 
 if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then

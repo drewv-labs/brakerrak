@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import fnmatch
 import glob
 import json
 import os
 import platform
 import re
+import select
 import socket
 import statistics
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from brakerrak_ort.profiles import (
@@ -250,7 +254,7 @@ def detect_primary_nic(
     kit_nic = (kit_env.get("RVDK_PRIMARY_NIC") or "").strip()
     if kit_nic:
         candidates.append(kit_nic)
-    candidates.extend(["end0", "eth0", "enp1s0", "enp2s0", "wan"])
+    candidates.extend(["end0", "eth0", "enp1s0", "enp2s0", "wan", "wlan0", "esp0"])
 
     iface_by_name: dict[str, Mapping[str, Any]] = {}
     for iface in net_ifaces:
@@ -856,3 +860,681 @@ def inspect_btrfs_device_stats(mount_path: str, probe: SystemProbe) -> BtrfsDevi
         nonzero_errors=nonzero_errors,
         error=None,
     )
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str) and value.strip().lstrip("-").isdigit():
+        return int(value.strip())
+    return default
+
+
+def _coerce_float(value: Any, default: float) -> float:
+    if isinstance(value, bool) or value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _normalize_iface_entry(raw_iface: Mapping[str, Any]) -> dict[str, Any]:
+    ifname = str(raw_iface.get("ifname") or raw_iface.get("name") or "").strip()
+    raw_addr_info = raw_iface.get("addr_info")
+    addr_info: list[dict[str, Any]] = []
+    if isinstance(raw_addr_info, list):
+        addr_info = [dict(item) for item in raw_addr_info if isinstance(item, Mapping)]
+    else:
+        ipv4 = raw_iface.get("ipv4") or raw_iface.get("ip")
+        if isinstance(ipv4, str) and ipv4.strip():
+            addr_info.append({"family": "inet", "local": ipv4.strip(), "scope": "global"})
+    default_state = "UP" if addr_info else "DOWN"
+    operstate = str(raw_iface.get("operstate") or default_state).strip().upper()
+    entry: dict[str, Any] = {
+        "ifname": ifname,
+        "operstate": operstate,
+        "addr_info": addr_info,
+    }
+    if isinstance(raw_iface.get("altnames"), list):
+        entry["altnames"] = [str(a) for a in raw_iface["altnames"]]
+    return entry
+
+
+class HostProxiedTelemetryProbe:
+    """SystemProbe adapter synthesizing virtual OS nodes from ESP32-P4 telemetry JSON."""
+
+    is_host_proxied: bool = True
+
+    def __init__(self, telemetry: Mapping[str, Any]) -> None:
+        self._telemetry: dict[str, Any] = dict(telemetry)
+        self._files: dict[str, str] = {}
+        self._existing_paths: set[str] = set()
+        self._mounts: set[str] = set()
+        self._mount_fstypes: dict[str, str] = {}
+        self._commands: dict[tuple[str, ...], CommandResult] = {}
+
+        cpu_raw = telemetry.get("cpu")
+        cpu_map: Mapping[str, Any] = cpu_raw if isinstance(cpu_raw, Mapping) else {}
+        mem_raw = telemetry.get("memory")
+        mem_map: Mapping[str, Any] = mem_raw if isinstance(mem_raw, Mapping) else {}
+        net_raw = telemetry.get("network")
+        net_map: Mapping[str, Any] = net_raw if isinstance(net_raw, Mapping) else {}
+        thermal_raw = telemetry.get("thermal")
+        thermal_map: Mapping[str, Any] = thermal_raw if isinstance(thermal_raw, Mapping) else {}
+
+        dt_model = str(
+            telemetry.get("dt_model")
+            or telemetry.get("device_tree_model")
+            or telemetry.get("board_model")
+            or telemetry.get("model")
+            or "Waveshare ESP32-P4-WIFI6-DEV-KIT (ESP32-P4NRW32X)"
+        )
+        self._hostname = str(
+            telemetry.get("hostname")
+            or telemetry.get("node_id")
+            or telemetry.get("id")
+            or "esp32p4-node"
+        )
+        self._fqdn = str(telemetry.get("fqdn") or f"{self._hostname}.local")
+        self._arch = str(telemetry.get("arch") or telemetry.get("architecture") or "riscv32")
+        os_id = str(telemetry.get("os") or telemetry.get("os_id") or "esp-idf")
+        self._kernel_release = str(
+            telemetry.get("kernel_release")
+            or telemetry.get("firmware_version")
+            or f"{os_id}-{self._arch}"
+        )
+        os_release = str(telemetry.get("os_release") or f'PRETTY_NAME="{os_id} ({self._arch})"\n')
+        raw_role = telemetry.get("node_role") or telemetry.get("role")
+        self.node_role: str | None = (
+            str(raw_role).strip().lower()
+            if isinstance(raw_role, str) and raw_role.strip()
+            else None
+        )
+
+        # CPU topology & frequency
+        isa_str = str(
+            telemetry.get("isa") or cpu_map.get("isa") or "rv32imafc_zicsr_zifencei"
+        )
+        raw_mmu = (
+            telemetry["mmu"]
+            if "mmu" in telemetry and telemetry["mmu"] is not None
+            else (
+                telemetry["mmu_type"]
+                if "mmu_type" in telemetry and telemetry["mmu_type"] is not None
+                else cpu_map.get("mmu", "none")
+            )
+        )
+        mmu_str = str(raw_mmu) if raw_mmu is not None else "none"
+        raw_harts = (
+            telemetry["harts"]
+            if "harts" in telemetry
+            else (telemetry["cpu_harts"] if "cpu_harts" in telemetry else cpu_map.get("harts"))
+        )
+        cpu_stanzas: list[str] = []
+        if isinstance(raw_harts, Sequence) and not isinstance(raw_harts, (str, bytes)):
+            hart_dicts = [h for h in raw_harts if isinstance(h, Mapping)]
+            hart_count = len(hart_dicts)
+            for idx, h_item in enumerate(hart_dicts):
+                h_proc = h_item.get("processor", idx)
+                h_id = h_item.get("hart", idx)
+                h_isa = str(h_item.get("isa") or isa_str)
+                h_mmu = str(h_item.get("mmu") if h_item.get("mmu") is not None else mmu_str)
+                cpu_stanzas.append(
+                    "\n".join(
+                        [
+                            f"processor\t: {h_proc}",
+                            f"hart\t\t: {h_id}",
+                            f"isa\t\t: {h_isa}",
+                            f"mmu\t\t: {h_mmu}",
+                        ]
+                    )
+                )
+        else:
+            hart_count = max(0, _coerce_int(raw_harts, 2))
+            for idx in range(hart_count):
+                cpu_stanzas.append(
+                    "\n".join(
+                        [
+                            f"processor\t: {idx}",
+                            f"hart\t\t: {idx}",
+                            f"isa\t\t: {isa_str}",
+                            f"mmu\t\t: {mmu_str}",
+                        ]
+                    )
+                )
+        if cpu_stanzas:
+            cpu_stanzas.append(f"Hardware\t: {dt_model}")
+        cpuinfo_text = ("\n\n".join(cpu_stanzas) + "\n") if cpu_stanzas else ""
+
+        freq_mhz = _coerce_float(
+            telemetry.get("cpu_freq_mhz")
+            if telemetry.get("cpu_freq_mhz") is not None
+            else (
+                telemetry.get("freq_mhz")
+                if telemetry.get("freq_mhz") is not None
+                else cpu_map.get("freq_mhz")
+            ),
+            400.0,
+        )
+        if freq_mhz > 0:
+            freq_khz = str(int(round(freq_mhz * 1000.0)))
+            for idx in range(hart_count):
+                self._files[f"/sys/devices/system/cpu/cpu{idx}/cpufreq/scaling_cur_freq"] = freq_khz
+
+        # PSRAM / memory capacity
+        ram_kb: int | None = None
+        for candidate in (
+            telemetry.get("total_ram_kb"),
+            telemetry.get("psram_kb"),
+            telemetry.get("mem_total_kb"),
+            mem_map.get("psram_kb"),
+            mem_map.get("total_ram_kb"),
+            mem_map.get("total_kb"),
+        ):
+            if candidate is not None:
+                ram_kb = _coerce_int(candidate, 0)
+                break
+        if ram_kb is None:
+            for mb_candidate in (telemetry.get("psram_mb"), mem_map.get("psram_mb")):
+                if mb_candidate is not None:
+                    ram_kb = _coerce_int(mb_candidate, 0) * 1024
+                    break
+        if ram_kb is None:
+            for byte_candidate in (telemetry.get("psram_bytes"), mem_map.get("psram_bytes")):
+                if byte_candidate is not None:
+                    ram_kb = _coerce_int(byte_candidate, 0) // 1024
+                    break
+        if ram_kb is None:
+            ram_kb = 32_768
+        self._total_ram_kb = max(0, ram_kb)
+
+        avail_candidate = (
+            telemetry.get("mem_available_kb")
+            if telemetry.get("mem_available_kb") is not None
+            else mem_map.get("available_kb")
+        )
+        default_avail = (
+            max(0, self._total_ram_kb - 1024) if self._total_ram_kb > 1024 else self._total_ram_kb
+        )
+        avail_kb = (
+            _coerce_int(avail_candidate, self._total_ram_kb)
+            if avail_candidate is not None
+            else default_avail
+        )
+
+        # Thermal sensor
+        temp_candidate = None
+        for cand in (
+            telemetry.get("thermal_c"),
+            telemetry.get("temp_c"),
+            telemetry.get("soc_temp_c"),
+            thermal_map.get("soc_c"),
+        ):
+            if cand is not None:
+                temp_candidate = cand
+                break
+        if temp_candidate is not None:
+            temp_c = _coerce_float(temp_candidate, 0.0)
+            self._existing_paths.add("/sys/class/thermal/thermal_zone0")
+            self._files["/sys/class/thermal/thermal_zone0/type"] = "esp32p4-tsens"
+            self._files["/sys/class/thermal/thermal_zone0/temp"] = str(int(round(temp_c * 1000.0)))
+
+        # SDMMC storage & /proc/mounts
+        mount_lines: list[str] = []
+        block_devices: list[dict[str, Any]] = []
+        raw_blocks = telemetry.get("block_devices")
+        sd_raw = (
+            telemetry.get("sd_storage")
+            or telemetry.get("sdmmc")
+            or telemetry.get("sd")
+        )
+        if isinstance(sd_raw, Mapping):
+            sd_size_bytes = 0
+            if sd_raw.get("size_bytes") is not None:
+                sd_size_bytes = _coerce_int(sd_raw.get("size_bytes"), 0)
+            elif sd_raw.get("size_gib") is not None:
+                sd_size_bytes = int(round(_coerce_float(sd_raw.get("size_gib"), 0.0) * (1024**3)))
+            elif sd_raw.get("size_mib") is not None:
+                sd_size_bytes = int(round(_coerce_float(sd_raw.get("size_mib"), 0.0) * (1024**2)))
+
+            explicit_present = sd_raw.get("present")
+            sd_present = (
+                bool(explicit_present)
+                if explicit_present is not None
+                else bool(sd_raw.get("device") or sd_size_bytes > 0)
+            )
+            if sd_present:
+                sd_dev = str(sd_raw.get("device") or "/dev/mmcblk0")
+                sd_name = os.path.basename(sd_dev)
+                sd_bus = str(sd_raw.get("bus") or "sdmmc")
+                sd_mp = str(sd_raw["mountpoint"]) if sd_raw.get("mountpoint") else None
+                sd_fs = str(sd_raw["fstype"]) if sd_raw.get("fstype") else None
+                sd_mounted = (
+                    bool(sd_raw["mounted"])
+                    if sd_raw.get("mounted") is not None
+                    else bool(sd_mp)
+                )
+                sd_label = str(sd_raw["label"]) if sd_raw.get("label") else None
+
+                self._existing_paths.add(f"/sys/block/{sd_name}")
+                self._files[f"/sys/block/{sd_name}/size"] = str(sd_size_bytes // 512)
+
+                part_name = f"{sd_name}p1" if not sd_name[-1].isdigit() else f"{sd_name}p1"
+                part_path = f"/dev/{part_name}"
+                child_entry: dict[str, Any] = {
+                    "name": part_name,
+                    "path": part_path,
+                    "size": sd_size_bytes,
+                    "type": "part",
+                    "fstype": sd_fs,
+                    "label": sd_label,
+                    "mountpoint": sd_mp if sd_mounted else None,
+                }
+                disk_entry: dict[str, Any] = {
+                    "name": sd_name,
+                    "path": sd_dev,
+                    "size": sd_size_bytes,
+                    "type": "disk",
+                    "tran": sd_bus,
+                    "rota": False,
+                    "fstype": None,
+                    "label": sd_label,
+                    "mountpoint": None,
+                    "children": [child_entry],
+                }
+                block_devices.append(disk_entry)
+                if sd_mounted and sd_mp:
+                    eff_fs = sd_fs or "vfat"
+                    mount_lines.append(f"{part_path} {sd_mp} {eff_fs} rw,relatime 0 0")
+                    self._mounts.add(sd_mp)
+                    self._mount_fstypes[sd_mp.rstrip("/") or "/"] = eff_fs
+        elif isinstance(raw_blocks, list):
+            block_devices = [dict(b) for b in raw_blocks if isinstance(b, Mapping)]
+            for bd in block_devices:
+                bd_mp = bd.get("mountpoint")
+                bd_fs = bd.get("fstype")
+                bd_path = str(bd.get("path") or f"/dev/{bd.get('name', 'mmcblk0')}")
+                if isinstance(bd_mp, str) and bd_mp.strip():
+                    mount_lines.append(
+                        f"{bd_path} {bd_mp} {str(bd_fs or 'vfat')} rw,relatime 0 0"
+                    )
+                    self._mounts.add(bd_mp)
+                    self._mount_fstypes[bd_mp.rstrip("/") or "/"] = str(bd_fs or "vfat")
+                children = bd.get("children")
+                if isinstance(children, list):
+                    for ch in children:
+                        if not isinstance(ch, Mapping):
+                            continue
+                        ch_mp = ch.get("mountpoint")
+                        ch_fs = ch.get("fstype")
+                        ch_path = str(ch.get("path") or f"/dev/{ch.get('name', 'mmcblk0p1')}")
+                        if isinstance(ch_mp, str) and ch_mp.strip():
+                            mount_lines.append(
+                                f"{ch_path} {ch_mp} {str(ch_fs or 'vfat')} rw,relatime 0 0"
+                            )
+                            self._mounts.add(ch_mp)
+                            self._mount_fstypes[ch_mp.rstrip("/") or "/"] = str(ch_fs or "vfat")
+
+        # Network interfaces & ESP32-C6 wireless coprocessor
+        wifi_raw = (
+            telemetry.get("wireless_coprocessor")
+            or telemetry.get("c6_sdio")
+            or telemetry.get("wifi")
+        )
+        wifi_map: Mapping[str, Any] = wifi_raw if isinstance(wifi_raw, Mapping) else {}
+        c6_disabled = bool(telemetry.get("c6_sdio_disabled")) or bool(
+            wifi_map.get("disabled_by_quirk")
+        )
+
+        ip_ifaces: list[dict[str, Any]] = []
+        raw_ifaces = (
+            telemetry.get("interfaces")
+            if isinstance(telemetry.get("interfaces"), list)
+            else net_map.get("interfaces")
+        )
+        if isinstance(raw_ifaces, list):
+            for entry in raw_ifaces:
+                if isinstance(entry, Mapping):
+                    norm = _normalize_iface_entry(entry)
+                    if norm["ifname"]:
+                        ip_ifaces.append(norm)
+        else:
+            flat_nic = telemetry.get("nic_name") or net_map.get("nic_name")
+            flat_ip = telemetry.get("ipv4") or net_map.get("ipv4") or net_map.get("ip")
+            if flat_nic or flat_ip:
+                ip_ifaces.append(
+                    _normalize_iface_entry(
+                        {
+                            "ifname": str(flat_nic or "wlan0"),
+                            "operstate": str(
+                                telemetry.get("nic_operstate")
+                                or net_map.get("operstate")
+                                or "UP"
+                            ),
+                            "ipv4": flat_ip,
+                        }
+                    )
+                )
+
+        if c6_disabled:
+            self._files["/etc/rvdk/c6-sdio.env"] = (
+                'RVDK_C6_SDIO_ENABLED="false"\n'
+                'RVDK_C6_SDIO_TRANSPORT="disabled"\n'
+                'RVDK_C6_SDIO_SLAVE_TARGET="none"\n'
+            )
+        elif wifi_map:
+            w_present = (
+                bool(wifi_map["present"]) if wifi_map.get("present") is not None else False
+            )
+            w_chip = str(wifi_map.get("chip") or "esp32-c6")
+            w_transport = str(wifi_map.get("transport") or "sdio")
+            w_slave = "esp32c6" if w_chip.lower() == "esp32-c6" else w_chip
+            w_iface = (
+                str(wifi_map["interface"])
+                if wifi_map.get("interface")
+                else ("wlan0" if w_present else None)
+            )
+            w_state = str(wifi_map.get("operstate") or "UP").upper()
+            if w_present:
+                self._existing_paths.add("/sys/bus/sdio/devices/mmc1:0001:1")
+                self._files["/sys/bus/sdio/devices/mmc1:0001:1/uevent"] = (
+                    "SDIO_CLASS=07\nDRIVER=esp_hosted\n"
+                )
+                self._files["/etc/rvdk/c6-sdio.env"] = (
+                    'RVDK_C6_SDIO_ENABLED="true"\n'
+                    f'RVDK_C6_SDIO_TRANSPORT="{w_transport}"\n'
+                    f'RVDK_C6_SDIO_SLAVE_TARGET="{w_slave}"\n'
+                )
+                if w_iface:
+                    self._existing_paths.add(f"/sys/class/net/{w_iface}/wireless")
+                    if not any(item["ifname"] == w_iface for item in ip_ifaces):
+                        ip_ifaces.append(
+                            _normalize_iface_entry(
+                                {
+                                    "ifname": w_iface,
+                                    "operstate": w_state,
+                                    "ipv4": wifi_map.get("ipv4"),
+                                }
+                            )
+                        )
+
+        ip_routes: list[dict[str, Any]] = []
+        raw_routes = (
+            telemetry.get("routes")
+            if isinstance(telemetry.get("routes"), list)
+            else net_map.get("routes")
+        )
+        if isinstance(raw_routes, list):
+            ip_routes = [dict(r) for r in raw_routes if isinstance(r, Mapping)]
+        else:
+            default_dev = net_map.get("default_dev") or telemetry.get("default_dev")
+            if isinstance(default_dev, str) and default_dev.strip():
+                ip_routes.append({"dst": "default", "dev": default_dev.strip()})
+            elif ip_ifaces:
+                preferred = next(
+                    (
+                        i
+                        for i in ip_ifaces
+                        if i["operstate"] == "UP" and has_global_ipv4(i)
+                    ),
+                    next((i for i in ip_ifaces if i["operstate"] == "UP"), ip_ifaces[0]),
+                )
+                ip_routes.append({"dst": "default", "dev": preferred["ifname"]})
+
+        # Virtual files & baseline sysctls (nommu / RTOS defaults)
+        uptime_sec = _coerce_float(telemetry.get("uptime_seconds"), 0.0)
+        dns_list = net_map.get("dns") or telemetry.get("dns")
+        if isinstance(dns_list, list):
+            resolv_text = "\n".join(f"nameserver {d}" for d in dns_list if d) + "\n"
+        else:
+            resolv_text = str(telemetry.get("resolv_conf") or "")
+
+        self._files.update(
+            {
+                "/proc/device-tree/model": dt_model + "\x00",
+                "/proc/cpuinfo": cpuinfo_text,
+                "/proc/meminfo": (
+                    f"MemTotal:       {self._total_ram_kb} kB\n"
+                    f"MemAvailable:   {avail_kb} kB\n"
+                ),
+                "/proc/uptime": f"{uptime_sec:.2f} 0.00\n",
+                "/proc/cmdline": str(
+                    telemetry.get("proc_cmdline") or f"console=usb_serial_jtag arch={self._arch}"
+                ),
+                "/proc/mounts": ("\n".join(mount_lines) + "\n") if mount_lines else "",
+                "/etc/os-release": os_release,
+                "/etc/resolv.conf": resolv_text,
+            }
+        )
+        self._existing_paths.update(self._files.keys())
+
+        raw_load = telemetry.get("loadavg")
+        if "loadavg" in telemetry and raw_load is None:
+            self._loadavg: tuple[float, float, float] | None = None
+        elif isinstance(raw_load, Sequence) and len(raw_load) >= 3:
+            self._loadavg = (
+                _coerce_float(raw_load[0], 0.0),
+                _coerce_float(raw_load[1], 0.0),
+                _coerce_float(raw_load[2], 0.0),
+            )
+        else:
+            self._loadavg = (0.05, 0.03, 0.01)
+
+        raw_dmesg = telemetry.get("dmesg")
+        if isinstance(raw_dmesg, list):
+            dmesg_stdout = "\n".join(str(line) for line in raw_dmesg)
+        elif isinstance(raw_dmesg, str):
+            dmesg_stdout = raw_dmesg
+        else:
+            dmesg_stdout = ""
+
+        usb_topology = str(
+            telemetry.get("usb_topology")
+            or "/:  Bus 01.Port 1: Dev 1, Class=root_hub, Driver=usb-serial-jtag, 12M\n"
+        )
+
+        self._commands = {
+            ("lsblk", "-J"): CommandResult(stdout=json.dumps({"blockdevices": block_devices})),
+            ("lsusb", "-t"): CommandResult(stdout=usb_topology.strip()),
+            ("lspci", "-nn"): CommandResult(stdout=""),
+            ("ip", "-j", "addr", "show"): CommandResult(stdout=json.dumps(ip_ifaces)),
+            ("ip", "-j", "route", "show"): CommandResult(stdout=json.dumps(ip_routes)),
+            ("dmesg",): CommandResult(stdout=dmesg_stdout),
+        }
+
+    def read_text(self, path: str) -> str | None:
+        val = self._files.get(path)
+        return val.strip() if val is not None else None
+
+    def path_exists(self, path: str) -> bool:
+        return path in self._existing_paths or path in self._files
+
+    def is_mount(self, path: str) -> bool:
+        return path in self._mounts
+
+    def glob_paths(self, pattern: str) -> list[str]:
+        candidates = self._existing_paths | set(self._files.keys())
+        return sorted(p for p in candidates if fnmatch.fnmatch(p, pattern))
+
+    def run_cmd(
+        self,
+        cmd: Sequence[str],
+        *,
+        use_sudo: bool = False,
+        timeout: float = 15.0,
+    ) -> CommandResult:
+        del use_sudo, timeout
+        key = tuple(cmd)
+        if len(key) == 5 and key[:4] == ("findmnt", "-n", "-o", "FSTYPE"):
+            target = key[4].rstrip("/") or "/"
+            fstype = self._mount_fstypes.get(target)
+            if fstype:
+                return CommandResult(stdout=fstype)
+            return CommandResult(stdout="", stderr="", returncode=1)
+        if key in self._commands:
+            return self._commands[key]
+        for registered, result in self._commands.items():
+            if len(key) >= len(registered) and key[: len(registered)] == registered:
+                return result
+        return CommandResult(stdout="", stderr="", returncode=1)
+
+    def get_loadavg(self) -> tuple[float, float, float] | None:
+        return self._loadavg
+
+    def get_total_ram_kb(self) -> int:
+        return self._total_ram_kb
+
+    def get_hostname(self) -> str:
+        return self._hostname
+
+    def get_fqdn(self) -> str:
+        return self._fqdn
+
+    def get_architecture(self) -> str:
+        return self._arch
+
+    def get_kernel_release(self) -> str:
+        return self._kernel_release
+
+    def get_uname(self) -> dict[str, str]:
+        return {
+            "system": "RTOS" if "esp-idf" in self._kernel_release.lower() else "Linux",
+            "node": self._hostname,
+            "release": self._kernel_release,
+            "version": "#1 ESP32-P4 Host-Proxied CTD",
+            "machine": self._arch,
+        }
+
+    def sleep(self, seconds: float) -> None:
+        del seconds
+
+
+def load_esp32p4_telemetry_probe(path: Path | str) -> HostProxiedTelemetryProbe:
+    """Load an ESP32-P4 telemetry JSON file into a HostProxiedTelemetryProbe."""
+    file_path = Path(path)
+    raw_text = file_path.read_text(encoding="utf-8")
+    parsed: Any = json.loads(raw_text)
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Telemetry JSON in {file_path} must be a top-level JSON object")
+    return HostProxiedTelemetryProbe(parsed)
+
+
+def _try_parse_json_object(candidate: str) -> dict[str, object] | None:
+    stripped = candidate.strip()
+    if not stripped:
+        return None
+    start = stripped.find("{")
+    if start == -1:
+        return None
+    snippet = stripped[start:]
+    try:
+        parsed: Any = json.loads(snippet)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        return {str(k): v for k, v in parsed.items()}
+    return None
+
+
+def capture_serial_telemetry_json(
+    port: str,
+    baud: int = 115200,
+    timeout_sec: float = 10.0,
+) -> dict[str, object]:
+    """Read-only capture of a single ESP32-P4 JSON telemetry object over a POSIX serial port."""
+    if sys.platform == "win32":
+        raise RuntimeError("Read-only serial capture requires POSIX termios support")
+    import termios
+
+    if baud <= 0:
+        raise ValueError(f"Invalid serial baud rate: {baud}")
+    baud_const = getattr(termios, f"B{baud}", None)
+    if not isinstance(baud_const, int):
+        raise ValueError(f"Unsupported serial baud rate: {baud}")
+
+    try:
+        fd = os.open(port, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to open serial port {port!r}: {exc}") from exc
+
+    old_attrs: list[Any] | None = None
+    try:
+        try:
+            old_attrs = list(termios.tcgetattr(fd))
+        except termios.error:
+            old_attrs = None
+
+        if old_attrs is not None:
+            new_attrs: list[Any] = list(old_attrs)
+            new_attrs[0] = 0
+            new_attrs[1] = 0
+            new_attrs[2] = termios.CS8 | termios.CLOCAL | termios.CREAD
+            new_attrs[3] = 0
+            new_attrs[4] = baud_const
+            new_attrs[5] = baud_const
+            cc = list(old_attrs[6])
+            cc[termios.VMIN] = 0
+            cc[termios.VTIME] = 0
+            new_attrs[6] = cc
+            termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+
+        deadline = time.monotonic() + max(0.05, timeout_sec)
+        buf = bytearray()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([fd], [], [], remaining)
+            if not readable:
+                break
+            try:
+                chunk = os.read(fd, 4096)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(f"Serial read failed on {port!r}: {exc}") from exc
+
+            if not chunk:
+                tail = buf.decode("utf-8", errors="replace")
+                parsed_tail = _try_parse_json_object(tail)
+                if parsed_tail is not None:
+                    return parsed_tail
+                break
+
+            buf.extend(chunk)
+            while b"\n" in buf:
+                line_bytes, _, rest = buf.partition(b"\n")
+                buf = bytearray(rest)
+                line_text = line_bytes.decode("utf-8", errors="replace")
+                parsed_line = _try_parse_json_object(line_text)
+                if parsed_line is not None:
+                    return parsed_line
+
+            # Also support a single multi-line JSON object stream before EOF
+            full_text = buf.decode("utf-8", errors="replace")
+            parsed_buf = _try_parse_json_object(full_text)
+            if parsed_buf is not None:
+                return parsed_buf
+
+        raise ValueError(
+            f"No valid JSON telemetry payload received from {port!r} within {timeout_sec:.1f}s"
+        )
+    finally:
+        if old_attrs is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, old_attrs)
+            except termios.error:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass

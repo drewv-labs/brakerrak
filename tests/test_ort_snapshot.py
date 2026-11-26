@@ -6,6 +6,7 @@ import ast
 import datetime
 import fnmatch
 import json
+import os
 import stat
 import sys
 from collections.abc import Sequence
@@ -17,19 +18,27 @@ import pytest
 from brakerrak_ort import (
     SOC_PROFILES,
     CommandResult,
+    HostProxiedTelemetryProbe,
+    PrimaryNicStatus,
+    SdStorageInfo,
     SystemProbe,
     UserIdentity,
+    WirelessCoprocessorInfo,
     build_public_snapshot,
     build_snapshot_stem,
+    capture_serial_telemetry_json,
     collect_snapshot,
     compute_canonical_sha256,
     detect_primary_nic,
     detect_soc_from_dt_model,
     evaluate_assertions,
+    get_role_defaults,
     get_soc_profile,
     inspect_databroker_services,
     inspect_postgres_state,
+    load_esp32p4_telemetry_probe,
     main,
+    normalize_role,
     parse_cpuinfo_harts,
     parse_ganesha_exports,
     parse_kv_content,
@@ -421,16 +430,22 @@ def test_soc_profile_matrix_and_dt_vendor_qualification() -> None:
         "ultrarisc-dp1000",
         "sifive-fu740",
         "tenstorrent-atlantis",
+        "espressif-esp32p4",
         "generic-riscv64",
     }
     assert set(SOC_PROFILES.keys()) == expected_slugs
 
-    # Bare K1/K3/M1 revision strings must NOT falsely match SpacemiT profiles
+    # Bare K1/K3/M1 and bare Waveshare/P4 revision strings must NOT falsely match
     assert detect_soc_from_dt_model("Generic Dev Board Rev K1-M1-K3") is None
+    assert detect_soc_from_dt_model("Waveshare Generic Sensor Rev P4") is None
     assert detect_soc_from_dt_model("Milk-V Jupiter SpacemiT K1") == "spacemit-k1"
     assert detect_soc_from_dt_model("Milk-V Jupiter 2") == "spacemit-k3"
     assert detect_soc_from_dt_model("SiFive HiFive Premier P550") == "eswin-eic7700x"
     assert detect_soc_from_dt_model("StarFive VisionFive 2 v1.3B") == "starfive-jh7110"
+    assert (
+        detect_soc_from_dt_model("Waveshare ESP32-P4-WIFI6-DEV-KIT (ESP32-P4NRW32X)")
+        == "espressif-esp32p4"
+    )
 
 
 @pytest.mark.parametrize(
@@ -1499,6 +1514,21 @@ def test_all_cli_aliases_dt_substrings_resolve_profile_and_min_widths() -> None:
             "atlantis",
             "ascalon",
         ),
+        "espressif-esp32p4": (
+            "espressif-esp32p4",
+            "espressif/esp32p4",
+            "waveshare-esp32-p4-wifi6",
+            "waveshare/esp32-p4-wifi6",
+            "waveshare-esp32-p4",
+            "waveshare/esp32-p4",
+            "waveshare-p4",
+            "waveshare/p4",
+            "esp32-p4-wifi6",
+            "esp32-p4-wifi6-dev-kit",
+            "esp32-p4",
+            "esp32p4",
+            "p4",
+        ),
         "generic-riscv64": ("generic-riscv64", "generic", "riscv64"),
     }
     for canon_slug, aliases in expected_cli_aliases.items():
@@ -1559,6 +1589,7 @@ def test_all_cli_aliases_dt_substrings_resolve_profile_and_min_widths() -> None:
         ),
         "ultrarisc-dp1000": ("Milk-V Titan", "milkv-titan", "Milkv Titan", "UltraRISC", "DP1000"),
         "tenstorrent-atlantis": ("Tenstorrent Atlantis", "Ascalon"),
+        "espressif-esp32p4": ("esp32-p4-wifi6", "Waveshare ESP32-P4", "esp32-p4", "esp32p4"),
     }
     for canon_slug, models in expected_dt_substrings.items():
         for model in models:
@@ -1573,3 +1604,650 @@ def test_all_cli_aliases_dt_substrings_resolve_profile_and_min_widths() -> None:
     assert get_soc_profile("tenstorrent-atlantis").min_width == 4
     assert get_soc_profile("spacemit-k3").min_width == 2
     assert get_soc_profile("sifive-fu740").min_width == 4
+
+    # ESP32-P4 riscv32 nommu profile invariants
+    p4_profile = get_soc_profile("espressif-esp32p4")
+    assert p4_profile.arch == "riscv32"
+    assert p4_profile.has_mmu is False
+    assert p4_profile.has_pcie is False
+    assert p4_profile.storage_bus == "sdmmc"
+    assert p4_profile.supported_tunes == ("ai", "iot")
+    assert p4_profile.expected_harts == 2
+    assert p4_profile.ram_floor_kb == 28_000
+    assert p4_profile.thermal_ceiling_c == 65.0
+
+
+def _make_esp32p4_telemetry(
+    *,
+    harts: int = 2,
+    psram_kb: int = 32_768,
+    thermal_c: float = 44.5,
+    sd_present: bool = True,
+    sd_size_bytes: int = 32 * 1024 * 1024 * 1024,
+    sd_mounted: bool = True,
+    sd_fstype: str | None = "vfat",
+    sd_mountpoint: str | None = "/sdcard",
+    c6_present: bool = True,
+    c6_disabled_by_quirk: bool = False,
+    wlan_ipv4: str | None = "198.51.100.42",
+    rmii_eth_up: bool = False,
+    rmii_ipv4: str | None = None,
+) -> dict[str, Any]:
+    interfaces: list[dict[str, Any]] = []
+    if c6_present and not c6_disabled_by_quirk:
+        interfaces.append(
+            {
+                "ifname": "wlan0",
+                "operstate": "UP",
+                "ipv4": wlan_ipv4,
+            }
+        )
+    if rmii_eth_up or rmii_ipv4:
+        interfaces.append(
+            {
+                "ifname": "eth0",
+                "operstate": "UP" if rmii_eth_up else "DOWN",
+                "ipv4": rmii_ipv4,
+            }
+        )
+    return {
+        "schema": "esp32p4-ort-telemetry/v1",
+        "dt_model": "Waveshare ESP32-P4-WIFI6-DEV-KIT (ESP32-P4NRW32X)",
+        "hostname": "snitchbench-p4",
+        "fqdn": "snitchbench-p4.local",
+        "arch": "riscv32",
+        "os": "esp-idf",
+        "firmware_version": "esp-idf-5.4.0",
+        "uptime_seconds": 128.5,
+        "cpu": {
+            "harts": harts,
+            "isa": "rv32imafc_zicsr_zifencei",
+            "mmu": "none",
+            "freq_mhz": 400,
+        },
+        "memory": {
+            "psram_kb": psram_kb,
+            "available_kb": max(0, psram_kb - 1024),
+        },
+        "thermal_c": thermal_c,
+        "sdmmc": {
+            "present": sd_present,
+            "device": "/dev/mmcblk0",
+            "bus": "sdmmc",
+            "size_bytes": sd_size_bytes,
+            "mountpoint": sd_mountpoint,
+            "fstype": sd_fstype,
+            "mounted": sd_mounted,
+            "label": "RVDK_P4_SD",
+        },
+        "wireless_coprocessor": {
+            "chip": "esp32-c6",
+            "transport": "sdio",
+            "interface": "wlan0" if c6_present and not c6_disabled_by_quirk else None,
+            "operstate": "UP" if c6_present and not c6_disabled_by_quirk else "DISABLED",
+            "present": c6_present and not c6_disabled_by_quirk,
+            "disabled_by_quirk": c6_disabled_by_quirk,
+        },
+        "network": {
+            "interfaces": interfaces,
+            "dns": ["198.51.100.1"],
+        },
+        "dmesg": [
+            "[    1.10] esp_hosted: SDIO ESP32-C6 co-processor online mac=02:42:ac:11:00:44",
+        ],
+    }
+
+
+def test_esp32p4_day0_and_day1_ort_matrices() -> None:
+    # 1. Healthy Day-0 and Day-1 matrix with ESP32-C6 Wi-Fi 6 (wlan0)
+    probe_ok = HostProxiedTelemetryProbe(_make_esp32p4_telemetry())
+    assert isinstance(probe_ok, SystemProbe)
+
+    day0_payload, primary_nic, soc_slug, node_role = collect_snapshot(
+        probe_ok,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert soc_slug == "espressif-esp32p4"
+    assert node_role == "snitchbench"
+    assert primary_nic.name == "wlan0"
+    assert primary_nic.healthy
+    hw = day0_payload["hardware_inventory"]
+    assert hw["architecture"] == "riscv32"
+    assert hw["mmu_type"] == "none"
+    assert hw["sd_storage"]["device"] == "/dev/mmcblk0"
+    assert hw["wireless_coprocessor"]["chip"] == "esp32-c6"
+    day0_checks = _assertions_by_id(day0_payload)
+    assert day0_checks["ORT-01_CPU_HARTS"]["status"] == "PASS"
+    assert day0_checks["ORT-02_PSRAM_CAPACITY"]["status"] == "PASS"
+    assert day0_checks["ORT-03_SDMMC_STORAGE"]["status"] == "PASS"
+    assert day0_checks["ORT-03B_ESP32_C6_SDIO"]["status"] == "PASS"
+    assert day0_checks["ORT-04_PRIMARY_NIC_WLAN0"]["status"] == "PASS"
+    assert day0_checks["ORT-05_THERMAL_IDLE_FLOOR"]["status"] == "PASS"
+    assert "ORT-03_PCIE_NVME_LINK" not in day0_checks
+    assert "ORT-D1_SD_MOUNT" not in day0_checks
+    assert day0_payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+    # 2. PSRAM < 28,000 kB & single hart fail
+    probe_low_mem = HostProxiedTelemetryProbe(_make_esp32p4_telemetry(harts=1, psram_kb=16_384))
+    low_payload, _, _, _ = collect_snapshot(
+        probe_low_mem,
+        soc="p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "lilsnitch"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    low_checks = _assertions_by_id(low_payload)
+    assert low_checks["ORT-01_CPU_HARTS"]["status"] == "FAIL"
+    assert low_checks["ORT-02_PSRAM_CAPACITY"]["status"] == "FAIL"
+    assert low_payload["operational_readiness_test"]["overall_status"] == "FAIL"
+
+    # 3. Missing / undersized SDMMC card fails ORT-03_SDMMC_STORAGE
+    probe_no_sd = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(sd_present=False, sd_size_bytes=0)
+    )
+    no_sd_payload, _, _, _ = collect_snapshot(
+        probe_no_sd,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(no_sd_payload)["ORT-03_SDMMC_STORAGE"]["status"] == "FAIL"
+
+    probe_small_sd = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(sd_present=True, sd_size_bytes=2 * 1024 * 1024 * 1024)
+    )
+    small_sd_payload, _, _, _ = collect_snapshot(
+        probe_small_sd,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(small_sd_payload)["ORT-03_SDMMC_STORAGE"]["status"] == "FAIL"
+
+    # 4. C6 SDIO / RMII Ethernet matrix (RMII PASS, quirk disabled+RMII up WARN, neither FAIL)
+    probe_rmii_ok = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(
+            c6_present=False,
+            c6_disabled_by_quirk=False,
+            rmii_eth_up=True,
+            rmii_ipv4="198.51.100.55",
+        )
+    )
+    rmii_ok_payload, rmii_nic, _, _ = collect_snapshot(
+        probe_rmii_ok,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert rmii_nic.name == "eth0"
+    assert _assertions_by_id(rmii_ok_payload)["ORT-03B_ESP32_C6_SDIO"]["status"] == "PASS"
+
+    probe_quirk_warn = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(
+            c6_present=False,
+            c6_disabled_by_quirk=True,
+            rmii_eth_up=True,
+            rmii_ipv4="198.51.100.55",
+        )
+    )
+    quirk_warn_payload, _, _, _ = collect_snapshot(
+        probe_quirk_warn,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    quirk_checks = _assertions_by_id(quirk_warn_payload)
+    assert quirk_checks["ORT-03B_ESP32_C6_SDIO"]["status"] == "WARN"
+    assert quirk_warn_payload["operational_readiness_test"]["overall_status"] == "WARN"
+
+    probe_no_net = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(
+            c6_present=False,
+            c6_disabled_by_quirk=False,
+            rmii_eth_up=False,
+            rmii_ipv4=None,
+        )
+    )
+    no_net_payload, _, _, _ = collect_snapshot(
+        probe_no_net,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(no_net_payload)["ORT-03B_ESP32_C6_SDIO"]["status"] == "FAIL"
+
+    # 5. Thermal ceiling at 65.0 C
+    probe_hot = HostProxiedTelemetryProbe(_make_esp32p4_telemetry(thermal_c=66.2))
+    hot_payload, _, _, _ = collect_snapshot(
+        probe_hot,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(hot_payload)["ORT-05_THERMAL_IDLE_FLOOR"]["status"] == "WARN"
+
+    # 6. Day-1 SD mount check across allowed filesystems + skipped NVMe/PG/HugePages checks
+    for fs_name in ("vfat", "fat32", "ext4", "littlefs"):
+        d1_probe = HostProxiedTelemetryProbe(
+            _make_esp32p4_telemetry(sd_mounted=True, sd_fstype=fs_name)
+        )
+        d1_payload, _, _, _ = collect_snapshot(
+            d1_probe,
+            soc="espressif-esp32p4",
+            stage="day1-post-forge",
+            node_env={"NODE_ROLE": "devbench"},
+            kit_env={},
+            window_sec=0.0,
+            env={},
+        )
+        d1_checks = _assertions_by_id(d1_payload)
+        assert d1_checks["ORT-D1_SD_MOUNT"]["status"] == "PASS"
+        assert "ORT-D1_NVME_4KN" not in d1_checks
+        assert "ORT-D1_NVME_XFS_MOUNT" not in d1_checks
+        assert "ORT-D1_POSTGRES_ACTIVE" not in d1_checks
+        assert "ORT-D1_POSTGRES_IO_URING" not in d1_checks
+        assert "ORT-D1_VM_HUGEPAGES" not in d1_checks
+        assert d1_payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+    # Unmounted SD fails Day-1
+    d1_unmounted_probe = HostProxiedTelemetryProbe(
+        _make_esp32p4_telemetry(sd_mounted=False, sd_fstype="vfat")
+    )
+    d1_unmounted, _, _, _ = collect_snapshot(
+        d1_unmounted_probe,
+        soc="espressif-esp32p4",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert _assertions_by_id(d1_unmounted)["ORT-D1_SD_MOUNT"]["status"] == "FAIL"
+
+    # 7. Erroneously forcing ENABLE_POSTGRES=true on nommu riscv32 fails explicitly
+    forced_pg_payload, _, _, _ = collect_snapshot(
+        probe_ok,
+        soc="espressif-esp32p4",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "snitchbench", "ENABLE_POSTGRES": "true"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    forced_checks = _assertions_by_id(forced_pg_payload)
+    assert forced_checks["ORT-D1_POSTGRES_ACTIVE"]["status"] == "FAIL"
+    assert "unsupported on nommu riscv32" in str(forced_checks["ORT-D1_POSTGRES_ACTIVE"]["actual"])
+    assert forced_pg_payload["operational_readiness_test"]["overall_status"] == "FAIL"
+
+
+def test_host_proxied_telemetry_json_cli_end_to_end_and_redaction(tmp_path: Path) -> None:
+    tel_path = tmp_path / "esp32p4-telemetry.json"
+    tel_doc = _make_esp32p4_telemetry(wlan_ipv4="198.51.100.77")
+    tel_path.write_text(json.dumps(tel_doc), encoding="utf-8")
+
+    loaded_probe = load_esp32p4_telemetry_probe(tel_path)
+    assert isinstance(loaded_probe, HostProxiedTelemetryProbe)
+    assert loaded_probe.get_architecture() == "riscv32"
+
+    out_dir = tmp_path / "snapshots"
+    rc = main(
+        [
+            "--soc",
+            "espressif-esp32p4",
+            "--telemetry-json",
+            str(tel_path),
+            "--stage",
+            "day1-post-forge",
+            "--out-dir",
+            str(out_dir),
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+
+    priv_files = [p for p in out_dir.glob("*.json") if not p.name.endswith(".public.json")]
+    pub_files = list(out_dir.glob("*.public.json"))
+    assert len(priv_files) == 1
+    assert len(pub_files) == 1
+    assert stat.S_IMODE(priv_files[0].stat().st_mode) == 0o600
+    assert stat.S_IMODE(pub_files[0].stat().st_mode) == 0o644
+
+    priv_doc = json.loads(priv_files[0].read_text(encoding="utf-8"))
+    pub_doc = json.loads(pub_files[0].read_text(encoding="utf-8"))
+    assert verify_snapshot_signature(priv_doc)
+    assert verify_snapshot_signature(pub_doc)
+    assert (
+        pub_doc["provenance_signature"]["unredacted_vault_sha256"]
+        == priv_doc["provenance_signature"]["canonical_payload_sha256"]
+    )
+    assert priv_doc["hardware_inventory"]["architecture"] == "riscv32"
+    assert priv_doc["hardware_inventory"]["mmu_type"] == "none"
+    sd_inv: SdStorageInfo = priv_doc["hardware_inventory"]["sd_storage"]
+    c6_inv: WirelessCoprocessorInfo = priv_doc["hardware_inventory"]["wireless_coprocessor"]
+    assert sd_inv["label"] == "RVDK_P4_SD"
+    assert c6_inv["chip"] == "esp32-c6"
+    assert pub_doc["network_topology"]["primary_nic"] == "wlan0"
+    pub_text = json.dumps(pub_doc)
+    assert "198.51.100.77" not in pub_text
+    assert "02:42:ac:11:00:44" not in pub_text
+
+    # Invalid JSON path fails gracefully with rc=1
+    bad_rc = main(["--telemetry-json", str(tmp_path / "missing.json"), "--quiet"])
+    assert bad_rc == 1
+
+
+def test_capture_serial_telemetry_json_stream_and_error_handling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import termios
+
+    with pytest.raises(RuntimeError):
+        capture_serial_telemetry_json(str(tmp_path / "nonexistent-ttyACM0"), timeout_sec=0.1)
+
+    with pytest.raises(ValueError, match="Unsupported serial baud"):
+        capture_serial_telemetry_json(str(tmp_path / "unused"), baud=12345, timeout_sec=0.1)
+
+    fifo_path = tmp_path / "esp32p4-serial.fifo"
+    os.mkfifo(fifo_path)
+    # Open O_RDWR so reader never hits premature EOF before test writes/times out
+    keepalive_fd = os.open(fifo_path, os.O_RDWR | os.O_NONBLOCK)
+    setattr_calls: list[int] = []
+    orig_attrs = [0, 0, termios.CS8, 0, termios.B115200, termios.B115200, [0] * 32]
+    monkeypatch.setattr(termios, "tcgetattr", lambda _fd: list(orig_attrs))
+    monkeypatch.setattr(
+        termios,
+        "tcsetattr",
+        lambda _fd, when, _attrs: setattr_calls.append(when),
+    )
+    try:
+        os.write(
+            keepalive_fd,
+            b"I (42) esp_boot: ESP32-P4 booting...\n"
+            b'{"hostname": "snitchbench-p4", "arch": "riscv32", "psram_kb": 32768}\n',
+        )
+        parsed = capture_serial_telemetry_json(str(fifo_path), baud=115200, timeout_sec=1.0)
+        assert parsed["hostname"] == "snitchbench-p4"
+        assert parsed["arch"] == "riscv32"
+        assert parsed["psram_kb"] == 32768
+        assert len(setattr_calls) == 2  # configure raw mode + restore
+
+        # Non-JSON output times out with ValueError
+        os.write(keepalive_fd, b"plain text log line without json\n")
+        with pytest.raises(ValueError, match="No valid JSON telemetry"):
+            capture_serial_telemetry_json(str(fifo_path), baud=115200, timeout_sec=0.15)
+    finally:
+        os.close(keepalive_fd)
+
+
+def test_snitchbench_and_lilsnitch_role_defaults_and_snapshot_stems() -> None:
+    ts = datetime.datetime(2026, 11, 25, 12, 0, 0, tzinfo=datetime.UTC)
+    for role in ("snitchbench", "lilsnitch"):
+        defaults = get_role_defaults(role)
+        assert defaults.stem == role
+        assert defaults.enable_postgres is False
+        assert defaults.enable_mqtt_broker is False
+        assert defaults.enable_nfs_server is False
+        stem = build_snapshot_stem(role, "day0-pre-forge", ts)
+        assert stem.startswith(f"{role}-snapshot-day0-pre-forge-")
+
+    # Direct evaluate_assertions check for RMII wired NIC + PrimaryNicStatus wireless detection
+    ifaces = [
+        {
+            "ifname": "wlan0",
+            "operstate": "UP",
+            "addr_info": [{"family": "inet", "local": "198.51.100.88", "scope": "global"}],
+        }
+    ]
+    routes = [{"dst": "default", "dev": "wlan0"}]
+    nic = detect_primary_nic(ifaces, routes, {})
+    assert nic == PrimaryNicStatus(name="wlan0", operstate="UP", has_global_ipv4=True)
+    checks = evaluate_assertions(
+        profile=get_soc_profile("espressif-esp32p4"),
+        stage="day0-pre-forge",
+        node_role="snitchbench",
+        node_env={},
+        harts=[{"hart": "0"}, {"hart": "1"}],
+        total_ram_kb=32_768,
+        nvme_present=False,
+        nvme_info={},
+        pcie_accelerators=[],
+        raid_ort_checks=[],
+        primary_nic=nic,
+        soc_peak_c=40.0,
+        bus_errors=[],
+        postgres_state={},
+        broker_services_state={},
+        sysctl_baseline={},
+        env={},
+        sd_storage=SdStorageInfo(
+            device="/dev/mmcblk0",
+            bus="sdmmc",
+            mountpoint="/sdcard",
+            fstype="vfat",
+            size_bytes=16 * 1024**3,
+            mounted=True,
+            label="RVDK_P4_SD",
+        ),
+        wireless_coprocessor=WirelessCoprocessorInfo(
+            chip="esp32-c6",
+            transport="sdio",
+            interface="wlan0",
+            operstate="UP",
+            present=True,
+        ),
+    )
+    assert all(c["status"] == "PASS" for c in checks)
+
+    shim_path = (
+        Path(__file__).resolve().parent.parent
+        / "soc-drawer"
+        / "espressif-esp32p4"
+        / "ort-snapshot.py"
+    )
+    assert shim_path.is_file()
+    assert os.access(shim_path, os.X_OK)
+
+
+def test_rvdk_c6_sdio_env_keys_and_sibling_config_dir_quirk_warn(tmp_path: Path) -> None:
+    # 1. FakeSystemProbe with real c6-sdio.sh disable keys in /etc/rvdk/c6-sdio.env + RMII eth0 UP
+    p4_blocks = [
+        {
+            "name": "mmcblk0",
+            "path": "/dev/mmcblk0",
+            "size": 32 * 1024**3,
+            "type": "disk",
+            "tran": "sdmmc",
+            "rota": False,
+            "children": [
+                {
+                    "name": "mmcblk0p1",
+                    "path": "/dev/mmcblk0p1",
+                    "size": 32 * 1024**3,
+                    "type": "part",
+                    "fstype": "vfat",
+                    "label": "RVDK_P4_SD",
+                    "mountpoint": "/sdcard",
+                }
+            ],
+        }
+    ]
+    probe_disabled = _make_probe(
+        dt_model="Waveshare ESP32-P4-WIFI6-DEV-KIT",
+        harts=2,
+        total_ram_kb=32_768,
+        nvme_present=False,
+        nic_name="eth0",
+        nic_up=True,
+        nic_ipv4="198.51.100.60",
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+        lsblk_devices=p4_blocks,
+    )
+    probe_disabled.files["/etc/rvdk/c6-sdio.env"] = (
+        'RVDK_C6_SDIO_ENABLED="false"\n'
+        'RVDK_C6_SDIO_TRANSPORT="disabled"\n'
+        'RVDK_C6_SDIO_SLAVE_TARGET="none"\n'
+    )
+    payload_etc_disabled, _, _, _ = collect_snapshot(
+        probe_disabled,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_etc = _assertions_by_id(payload_etc_disabled)
+    assert checks_etc["ORT-03B_ESP32_C6_SDIO"]["status"] == "WARN"
+    assert payload_etc_disabled["operational_readiness_test"]["overall_status"] == "WARN"
+    c6_inv = payload_etc_disabled["hardware_inventory"]["wireless_coprocessor"]
+    assert c6_inv["present"] is False
+    assert c6_inv["transport"] == "disabled"
+
+    # 2. RVDK_C6_SDIO_ENABLED="true" with wlan0 -> PASS
+    probe_enabled = _make_probe(
+        dt_model="Waveshare ESP32-P4-WIFI6-DEV-KIT",
+        harts=2,
+        total_ram_kb=32_768,
+        nvme_present=False,
+        nic_name="wlan0",
+        nic_up=True,
+        nic_ipv4="198.51.100.61",
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+        lsblk_devices=p4_blocks,
+    )
+    probe_enabled.files["/etc/rvdk/c6-sdio.env"] = (
+        'RVDK_C6_SDIO_ENABLED="true"\n'
+        'RVDK_C6_SDIO_TRANSPORT="sdio"\n'
+        'RVDK_C6_SDIO_SLAVE_TARGET="esp32c6"\n'
+    )
+    payload_enabled, _, _, _ = collect_snapshot(
+        probe_enabled,
+        soc="espressif-esp32p4",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "snitchbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    checks_enabled = _assertions_by_id(payload_enabled)
+    assert checks_enabled["ORT-03B_ESP32_C6_SDIO"]["status"] == "PASS"
+    assert payload_enabled["hardware_inventory"]["wireless_coprocessor"]["chip"] == "esp32-c6"
+    assert payload_enabled["hardware_inventory"]["wireless_coprocessor"]["transport"] == "sdio"
+
+    # 3. Sibling <stage_dir>/config/c6-sdio.env overrides via --config <stage_dir>/config/node.env
+    stage_cfg_dir = tmp_path / "stage" / "config"
+    stage_cfg_dir.mkdir(parents=True)
+    node_cfg = stage_cfg_dir / "node.env"
+    node_cfg.write_text('NODE_ROLE="devbench"\nENABLE_POSTGRES="false"\n', encoding="utf-8")
+    (stage_cfg_dir / "c6-sdio.env").write_text(
+        'RVDK_C6_SDIO_ENABLED="false"\n'
+        'RVDK_C6_SDIO_TRANSPORT="disabled"\n'
+        'RVDK_C6_SDIO_SLAVE_TARGET="none"\n',
+        encoding="utf-8",
+    )
+    tel_path = tmp_path / "p4-rmii.json"
+    tel_path.write_text(
+        json.dumps(
+            _make_esp32p4_telemetry(
+                c6_present=False,
+                c6_disabled_by_quirk=False,
+                rmii_eth_up=True,
+                rmii_ipv4="198.51.100.62",
+            )
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "snaps"
+    rc = main(
+        [
+            "--soc",
+            "espressif-esp32p4",
+            "--telemetry-json",
+            str(tel_path),
+            "--config",
+            str(node_cfg),
+            "--out-dir",
+            str(out_dir),
+            "--quiet",
+        ]
+    )
+    assert rc == 0
+    priv_file = next(p for p in out_dir.glob("*.json") if not p.name.endswith(".public.json"))
+    staged_doc = json.loads(priv_file.read_text(encoding="utf-8"))
+    assert _assertions_by_id(staged_doc)["ORT-03B_ESP32_C6_SDIO"]["status"] == "WARN"
+
+
+def test_cli_role_override_and_normalization_on_host_proxied_runs(tmp_path: Path) -> None:
+    assert normalize_role("devbench") == "devbench"
+    assert normalize_role("DEV") == "devbench"
+    assert normalize_role("snitchbnch") == "snitchbench"
+    assert normalize_role("sb") == "snitchbench"
+    assert normalize_role("lsp4") == "lilsnitch"
+    assert normalize_role("snitch") == "lilsnitch"
+    assert normalize_role("unknown-role") is None
+
+    tel_path = tmp_path / "p4-tel.json"
+    tel_path.write_text(json.dumps(_make_esp32p4_telemetry()), encoding="utf-8")
+
+    for requested_role, expected_canon, expected_stem in (
+        ("devbench", "devbench", "devbench"),
+        ("snitchbench", "snitchbench", "snitchbench"),
+        ("sb", "snitchbench", "snitchbench"),
+        ("lsp4", "lilsnitch", "lilsnitch"),
+    ):
+        out_dir = tmp_path / f"out-{requested_role}"
+        rc = main(
+            [
+                "--soc",
+                "espressif-esp32p4",
+                "--role",
+                requested_role,
+                "--telemetry-json",
+                str(tel_path),
+                "--stage",
+                "day1-post-forge",
+                "--out-dir",
+                str(out_dir),
+                "--quiet",
+            ]
+        )
+        assert rc == 0
+        priv_files = [p for p in out_dir.glob("*.json") if not p.name.endswith(".public.json")]
+        assert len(priv_files) == 1
+        assert priv_files[0].name.startswith(f"{expected_stem}-snapshot-")
+        doc = json.loads(priv_files[0].read_text(encoding="utf-8"))
+        assert doc["artifact"]["target_designation"] == f"espressif-esp32p4 ({expected_canon})"
+
+    with pytest.raises(SystemExit) as exc_info:
+        main(["--role", "invalid-persona", "--telemetry-json", str(tel_path), "--quiet"])
+    assert exc_info.value.code == 2

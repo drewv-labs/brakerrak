@@ -99,6 +99,28 @@ class BtrfsDeviceStatsInfo(TypedDict):
     error: str | None
 
 
+class SdStorageInfo(TypedDict):
+    """Detected SD/SDMMC removable media inventory entry."""
+
+    device: str | None
+    bus: str
+    mountpoint: str | None
+    fstype: str | None
+    size_bytes: int
+    mounted: bool
+    label: str | None
+
+
+class WirelessCoprocessorInfo(TypedDict):
+    """Detected onboard wireless co-processor state (e.g., ESP32-C6 over SDIO)."""
+
+    chip: str
+    transport: str
+    interface: str | None
+    operstate: str
+    present: bool
+
+
 @dataclass(frozen=True)
 class SnapshotOutputs:
     """Paths, digests, and payloads produced by a single ORT run."""

@@ -378,3 +378,46 @@ printf '%s\\n%s\\n%s\\n' "$parent_direct" "$parent_sub" "$legacy_tf"
     for p in parent_paths:
         assert not p.exists(), f"Expected parent tempfile {p} to be cleaned up on parent exit"
     assert not list((tmp_path / "xdg").glob(".brak-tmp-*"))
+
+
+@pytest.mark.parametrize(
+    ("role", "expected_tune"),
+    [
+        ("snitchbench", "iot"),
+        ("lilsnitch", "iot"),
+        ("devbench", "ai"),
+        ("databroker", "data"),
+        ("databench", "data"),
+        ("visionbench", "ai"),
+        ("babbagebox", "ai"),
+    ],
+)
+def test_brak_role_to_rvdk_tune_mappings(role: str, expected_tune: str) -> None:
+    script = (
+        f"source {shlex.quote(str(LIB_COMMON_SH))}\n"
+        f"brak_role_to_rvdk_tune {shlex.quote(role)}\n"
+    )
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected_tune
+
+
+def test_brak_resolve_silicon_p4_resolves_espressif_esp32p4_and_tag() -> None:
+    script = (
+        f"source {shlex.quote(str(LIB_COMMON_SH))}\n"
+        "brak_resolve_silicon p4\n"
+        'printf "%s|%s|devbench-%s\\n" "$TARGET_BOARD" "$TARGET_TAG" "$TARGET_TAG"\n'
+    )
+    proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "espressif-esp32p4|p4|devbench-p4"

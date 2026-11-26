@@ -4,8 +4,9 @@
 # Path: brakerrak/scripts/ort-snapshot.sh
 #
 # Usage:
-#   ./scripts/ort-snapshot.sh [--target <soc>] [--stage day0-pre-forge|day1-post-forge] [--out-dir ~/.brakerrak/snapshots]
-#   sudo brakerrak ort [--stage day0-pre-forge|day1-post-forge] [--no-public] [--no-fail-exit]
+#   ./scripts/ort-snapshot.sh [--target <soc>] [--role <persona>] [--stage day0-pre-forge|day1-post-forge] [--out-dir ~/.brakerrak/snapshots]
+#   sudo brakerrak ort [--role <persona>] [--stage day0-pre-forge|day1-post-forge] [--no-public] [--no-fail-exit]
+#   brakerrak ort --target espressif-esp32p4 --role devbench --telemetry-json /Volumes/RVDK_P4_SD/telemetry/ort.json
 # ==============================================================================
 set -Eeuo pipefail
 
@@ -21,18 +22,28 @@ usage() {
 Usage: brakerrak ort [options]
 
 Options:
-  --target, --soc <slug>   Override silicon target (e.g. eswin-eic7700x, starfive-jh7110, generic-riscv64)
+  --target, --soc <slug>   Override silicon target (e.g. eswin-eic7700x, starfive-jh7110, espressif-esp32p4, generic-riscv64)
+  --role <persona>         Override node role (databroker | databench | babbagebox | babbagebench |
+                           visionbox | visionbench | devbench | snitchbench | lilsnitch)
   --stage <tag>            ORT stage tag (default: day0-pre-forge | day1-post-forge)
   --out-dir <dir>          Snapshot output directory (default: ~/.brakerrak/snapshots)
   --config <path>          Explicit node.env config path (default: /etc/brakerrak/node.env)
   --window <seconds>       Quiescent baseline profiling window (default: 5.0)
+  --telemetry-json <path>  Host-proxied telemetry JSON (e.g. from ESP32-P4 SD or serial dump)
+  --serial-port <dev>      Read-only USB-Serial-JTAG device path (e.g. /dev/ttyACM0, /dev/cu.usbmodem*)
   --no-public              Skip generating redacted .public.json artifact
   --no-fail-exit           Exit 0 even if overall_status == "FAIL"
+  --quiet                  Suppress human-readable stdout summary banner
   -h, --help               Show this help message and exit
+
+Examples:
+  brakerrak ort --target espressif-esp32p4 --role devbench --telemetry-json /Volumes/RVDK_P4_SD/telemetry/ort.json
+  brakerrak ort --target p4 --role snitchbench --serial-port /dev/ttyACM0 --stage day1-post-forge
 EOF
 }
 
 TARGET_BOARD="${BRAKERRAK_TARGET:-}"
+ROLE_OVERRIDE=""
 FORWARD_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -47,19 +58,29 @@ while [[ $# -gt 0 ]]; do
             brak_require_arg "${1%%=*}" "$TARGET_BOARD"
             shift
             ;;
-        --stage|--out-dir|--config|--window)
+        --role)
+            brak_require_arg "$1" "${2:-}"
+            ROLE_OVERRIDE="$2"
+            shift 2
+            ;;
+        --role=*)
+            ROLE_OVERRIDE="${1#*=}"
+            brak_require_arg "--role" "$ROLE_OVERRIDE"
+            shift
+            ;;
+        --stage|--out-dir|--config|--window|--telemetry-json|--serial-port)
             brak_require_arg "$1" "${2:-}"
             FORWARD_ARGS+=("$1" "$2")
             shift 2
             ;;
-        --stage=*|--out-dir=*|--config=*|--window=*)
+        --stage=*|--out-dir=*|--config=*|--window=*|--telemetry-json=*|--serial-port=*)
             _flag="${1%%=*}"
             _val="${1#*=}"
             brak_require_arg "$_flag" "$_val"
             FORWARD_ARGS+=("$_flag" "$_val")
             shift
             ;;
-        --no-public|--no-fail-exit)
+        --no-public|--no-fail-exit|--quiet)
             FORWARD_ARGS+=("$1")
             shift
             ;;
@@ -72,6 +93,15 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ -n "$ROLE_OVERRIDE" ]]; then
+    _raw_role="$ROLE_OVERRIDE"
+    ROLE_OVERRIDE="$(brak_normalize_role "$_raw_role")"
+    if [[ -z "$ROLE_OVERRIDE" ]]; then
+        log_fatal "Unknown role '${_raw_role}' (expected: databroker | databench | babbagebox | babbagebench | visionbox | visionbench | devbench | snitchbench | lilsnitch)"
+    fi
+    FORWARD_ARGS+=("--role" "$ROLE_OVERRIDE")
+fi
 
 # Auto-detect silicon target via unified vendor-qualified resolver
 if ! brak_resolve_silicon "$TARGET_BOARD"; then
