@@ -6,6 +6,7 @@ import json
 import os
 import pwd
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -1332,6 +1333,7 @@ def test_shell_probes_hwmon_cpufreq_and_seed_help(tmp_path: Path) -> None:
     assert showdown_help.returncode == 0
     assert "--allow-fixed-clock" in showdown_help.stdout
     assert "--allow-warm-spill" in showdown_help.stdout
+    assert "--work-mem" in showdown_help.stdout
 
     # Test hwmon SoC temp priority (pvt & sfctemp before thermal_zone) and multi-cluster cpufreq
     sys_root = tmp_path / "sys"
@@ -1513,6 +1515,7 @@ def test_shell_probes_hwmon_cpufreq_and_seed_help(tmp_path: Path) -> None:
         check=False,
     )
     assert fit_ok.returncode == 0, fit_ok.stderr
+    assert "50.0%" in fit_ok.stdout
     assert fit_ok.stdout.strip().endswith("true")
 
     # Cold-only run (enforce_fail=false) must emit null even if relation exceeds shared_buffers
@@ -1858,3 +1861,397 @@ def test_mixed_cold_and_warm_spill_metadata_inheritance(tmp_path: Path) -> None:
     assert "2 pass(es)" in spill_line
     assert "warm/seq_scan/" in spill_line
     assert "cold/" not in spill_line
+
+
+def test_lifo_exit_hooks_preserve_auto_conf_backup_on_exit_and_sigterm(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    showdown_sh = repo_root / "benchmarks" / "run-iouring-showdown.sh"
+    cur_user = pwd.getpwuid(os.getuid()).pw_name
+
+    xdg_dir = tmp_path / "xdg"
+    xdg_dir.mkdir()
+    tmp_dir = tmp_path / "tmp"
+    tmp_dir.mkdir()
+
+    env = os.environ.copy()
+    env["BRAKERRAK_SHOWDOWN_PROBES_ONLY"] = "true"
+    env["TMPDIR"] = str(tmp_dir)
+    env["XDG_RUNTIME_DIR"] = str(xdg_dir)
+    env["PG_USER"] = cur_user
+
+    # 1. Normal EXIT: restore_pg_gucs registered after brak_mktemp runs before tmpfile cleanup
+    pgdata_exit = tmp_path / "pgdata_exit"
+    pgdata_exit.mkdir()
+    auto_conf_exit = pgdata_exit / "postgresql.auto.conf"
+    auto_conf_exit.write_text("io_method = 'io_uring'\n", encoding="utf-8")
+    backup_path_record = tmp_path / "backup_exit_path.txt"
+
+    exit_script = f"""
+set -euo pipefail
+source {shlex.quote(str(showdown_sh))}
+systemctl() {{ return 1; }}
+wait_for_postgres_ready() {{ return 1; }}
+
+AUTO_CONF_PATH={shlex.quote(str(auto_conf_exit))}
+AUTO_CONF_EXISTED="true"
+brak_mktemp -v AUTO_CONF_BACKUP "${{TMPDIR}}/brak-pg-auto-conf.XXXXXX"
+printf "io_method = 'worker'\\n" > "$AUTO_CONF_BACKUP"
+printf '%s\\n' "$AUTO_CONF_BACKUP" > {shlex.quote(str(backup_path_record))}
+GUC_MUTATED="true"
+GUC_RESTORED="false"
+brak_register_exit_hook restore_pg_gucs
+"""
+    proc_exit = subprocess.run(
+        ["bash", "-c", exit_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc_exit.returncode == 0, proc_exit.stderr
+    recorded_backup_exit = Path(backup_path_record.read_text(encoding="utf-8").strip())
+    assert auto_conf_exit.read_text(encoding="utf-8") == "io_method = 'worker'\n"
+    assert not recorded_backup_exit.exists()
+
+    # 2. SIGTERM: restore_pg_gucs runs while AUTO_CONF_BACKUP is intact, then tmpfile is deleted
+    pgdata_term = tmp_path / "pgdata_term"
+    pgdata_term.mkdir()
+    auto_conf_term = pgdata_term / "postgresql.auto.conf"
+    auto_conf_term.write_text("io_method = 'io_uring'\n", encoding="utf-8")
+    backup_term_record = tmp_path / "backup_term_path.txt"
+
+    term_script = f"""
+set -euo pipefail
+source {shlex.quote(str(showdown_sh))}
+systemctl() {{ return 1; }}
+wait_for_postgres_ready() {{ return 1; }}
+
+AUTO_CONF_PATH={shlex.quote(str(auto_conf_term))}
+AUTO_CONF_EXISTED="true"
+brak_mktemp -v AUTO_CONF_BACKUP "${{TMPDIR}}/brak-pg-auto-conf.XXXXXX"
+printf "io_method = 'sync'\\n" > "$AUTO_CONF_BACKUP"
+printf '%s\\n' "$AUTO_CONF_BACKUP" > {shlex.quote(str(backup_term_record))}
+GUC_MUTATED="true"
+GUC_RESTORED="false"
+brak_register_exit_hook restore_pg_gucs
+
+printf 'READY\\n'
+sleep 30 &
+wait "$!"
+"""
+    proc_term = subprocess.Popen(
+        ["bash", "-c", term_script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert proc_term.stdout is not None
+        ready = proc_term.stdout.readline().strip()
+        assert ready == "READY"
+        recorded_backup_term = Path(backup_term_record.read_text(encoding="utf-8").strip())
+        assert recorded_backup_term.is_file()
+
+        proc_term.send_signal(signal.SIGTERM)
+        rc_term = proc_term.wait(timeout=5)
+        assert rc_term == -signal.SIGTERM
+    finally:
+        if proc_term.poll() is None:
+            proc_term.kill()
+            proc_term.wait(timeout=5)
+
+    assert auto_conf_term.read_text(encoding="utf-8") == "io_method = 'sync'\n"
+    assert not recorded_backup_term.exists()
+
+    # 3. Missing backup file emits explicit log_warn when AUTO_CONF_EXISTED == "true"
+    missing_backup = tmp_path / "does-not-exist.conf"
+    missing_proc = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            (
+                f"source {shlex.quote(str(showdown_sh))} && "
+                f"AUTO_CONF_EXISTED=true AUTO_CONF_PATH={shlex.quote(str(auto_conf_exit))} "
+                f"AUTO_CONF_BACKUP={shlex.quote(str(missing_backup))} "
+                "restore_auto_conf_from_backup"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert missing_proc.returncode != 0
+    assert "[WARN]" in missing_proc.stderr
+    assert "missing" in missing_proc.stderr
+
+
+def test_warm_cache_fit_rejects_95pct_ratio_unless_allow_warm_spill(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    showdown_sh = repo_root / "benchmarks" / "run-iouring-showdown.sh"
+
+    env = os.environ.copy()
+    env["BRAKERRAK_SHOWDOWN_PROBES_ONLY"] = "true"
+    env["TMPDIR"] = str(tmp_path)
+
+    # 95% occupied (exceeds 90% / 10% headroom threshold) -> fails without --allow-warm-spill
+    reject_95 = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            (
+                f"source {shlex.quote(str(showdown_sh))} && "
+                "TOTAL_REL_BYTES=950 PG_SHARED_BUFFERS_BYTES=1000 ALLOW_WARM_SPILL=false "
+                "check_warm_cache_fit true"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert reject_95.returncode != 0
+    assert "95.0%" in reject_95.stderr
+    assert "--allow-warm-spill" in reject_95.stderr
+
+    # 95% occupied with --allow-warm-spill -> warns and records PREWARM_FIT_SHARED_BUFFERS=false
+    allow_95 = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            (
+                f"source {shlex.quote(str(showdown_sh))} && "
+                "TOTAL_REL_BYTES=950 PG_SHARED_BUFFERS_BYTES=1000 ALLOW_WARM_SPILL=true "
+                "check_warm_cache_fit true && printf '%s\\n' \"$PREWARM_FIT_SHARED_BUFFERS\""
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert allow_95.returncode == 0, allow_95.stderr
+    assert "95.0%" in allow_95.stderr
+    assert "[WARN]" in allow_95.stderr
+    assert allow_95.stdout.strip().endswith("false")
+
+    # Exact 90% boundary (10% headroom) -> passes and logs 90.0%
+    fit_90 = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            (
+                f"source {shlex.quote(str(showdown_sh))} && "
+                "TOTAL_REL_BYTES=900 PG_SHARED_BUFFERS_BYTES=1000 ALLOW_WARM_SPILL=false "
+                "check_warm_cache_fit true && printf '%s\\n' \"$PREWARM_FIT_SHARED_BUFFERS\""
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert fit_90.returncode == 0, fit_90.stderr
+    assert "90.0%" in fit_90.stdout
+    assert fit_90.stdout.strip().endswith("true")
+
+
+def test_work_mem_cli_quiescent_and_pre_isolation_cooldown_invariants(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    showdown_sh = repo_root / "benchmarks" / "run-iouring-showdown.sh"
+    cur_user = pwd.getpwuid(os.getuid()).pw_name
+
+    # 1. --work-mem CLI validation rejects malformed literals before root check
+    for bad_wm in ("invalid", "64", "0MB", "32kB", "64mb", "64MB; SELECT 1"):
+        bad_proc = subprocess.run(
+            ["bash", str(showdown_sh), "--work-mem", bad_wm],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert bad_proc.returncode != 0, f"Expected --work-mem {bad_wm!r} to fail"
+        assert "Invalid --work-mem" in bad_proc.stderr
+
+    env = os.environ.copy()
+    env["BRAKERRAK_SHOWDOWN_PROBES_ONLY"] = "true"
+    env["TMPDIR"] = str(tmp_path)
+    env["PG_USER"] = cur_user
+
+    # 2. build_workload_b_session, check_work_mem_floor, and check_pre_quiescent helpers
+    helper_proc = subprocess.run(
+        [
+            "bash",
+            "-euo",
+            "pipefail",
+            "-c",
+            (
+                f"source {shlex.quote(str(showdown_sh))}\n"
+                'printf "b_default=%s\\n" "$(build_workload_b_session "")"\n'
+                'printf "b_64mb=%s\\n" "$(build_workload_b_session "64MB")"\n'
+                'check_work_mem_floor "32MB"\n'
+                'check_work_mem_floor "64MB"\n'
+                'check_pre_quiescent "2.00 1.00 0.50" 4\n'
+                'printf "q_busy=%s\\n" "$PRE_QUIESCENT_OK"\n'
+                'check_pre_quiescent "1.99 1.00 0.50" 4\n'
+                'printf "q_idle=%s\\n" "$PRE_QUIESCENT_OK"\n'
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert helper_proc.returncode == 0, helper_proc.stderr
+    lines = dict(
+        line.split("=", 1)
+        for line in helper_proc.stdout.splitlines()
+        if "=" in line and not line.startswith("[")
+    )
+    assert "work_mem" not in lines["b_default"]
+    assert "SET work_mem = '64MB';" in lines["b_64mb"]
+    assert lines["q_busy"] == "false"
+    assert lines["q_idle"] == "true"
+    assert "32MB" in helper_proc.stderr
+    assert "not quiescent" in helper_proc.stderr
+
+    # 3. Pre-isolation cooldown placement & post-autovacuum reset_pg_stats ordering
+    passes_dir = tmp_path / "passes"
+    passes_dir.mkdir()
+    trace_log = tmp_path / "order_trace.log"
+    q_trace = shlex.quote(str(trace_log))
+
+    order_script = f"""
+set -euo pipefail
+source {shlex.quote(str(showdown_sh))}
+
+# Verify execute_workload_pass itself contains zero sleep / COOLDOWN_SEC logic
+fn_body="$(declare -f execute_workload_pass)"
+if grep -qE '(COOLDOWN_SEC|sleep )' <<< "$fn_body"; then
+    echo "UNEXPECTED_COOLDOWN_IN_EXECUTE_PASS" >&2
+    exit 1
+fi
+
+PASSES_DIR={shlex.quote(str(passes_dir))}
+RUN_ID="showdown-order-test"
+NODE_HOST="test-node"
+PG_SHARED_BUFFERS="8GB"
+PG_WORK_MEM="64MB"
+PG_HUGE_PAGES_STATUS="off"
+NVME_LOGICAL_BLOCK_SIZE="4096"
+PERF_AVAILABLE="false"
+COOLDOWN_SEC=5
+PASS_EXECUTED_COUNT=0
+TRACE_FILE={q_trace}
+
+sleep() {{ printf 'sleep:%s\\n' "$1" >> "$TRACE_FILE"; }}
+configure_pg_gucs() {{ printf 'configure_pg_gucs:%s:%s\\n' "$1" "$2" >> "$TRACE_FILE"; }}
+cold_cache_isolate() {{ printf 'cold_cache_isolate:%s:%s\\n' "$1" "$2" >> "$TRACE_FILE"; }}
+warm_cache_isolate() {{ printf 'warm_cache_isolate:%s:%s\\n' "$1" "$2" >> "$TRACE_FILE"; }}
+wait_for_autovacuum_clear() {{ printf 'wait_for_autovacuum_clear\\n' >> "$TRACE_FILE"; }}
+reset_pg_stats() {{ printf 'reset_pg_stats\\n' >> "$TRACE_FILE"; }}
+capture_diskstats() {{
+    printf 'capture_diskstats:%s\\n' "$(basename "$1")" >> "$TRACE_FILE"
+    : > "$1"
+}}
+run_psql() {{
+    local all_args="$*"
+    if [[ "$all_args" == *"SHOW debug_io_direct"* ]]; then
+        printf 'off\\n'
+    elif [[ "$all_args" == *"pg_stat_io"* ]]; then
+        printf '[]\\n'
+    else
+        printf 'psql_explain\\n' >> "$TRACE_FILE"
+        printf '[{{"Plan":{{"Node Type":"Seq Scan"}},"Planning Time":0.1,"Execution Time":1.0}}]\\n'
+    fi
+}}
+
+# Pass 1 (PASS_EXECUTED_COUNT == 0 -> no cooldown sleep)
+run_inter_pass_cooldown
+configure_pg_gucs "sync" "16"
+cold_cache_isolate "sync" "16"
+execute_workload_pass 1 0 "cold" "sync" "16" "seq_scan" \\
+    "WL-A" "SET x=1;" "EXPLAIN SELECT 1;"
+
+# Pass 2 (PASS_EXECUTED_COUNT == 1 -> sleep before configure_pg_gucs & cold_cache_isolate)
+run_inter_pass_cooldown
+configure_pg_gucs "io_uring" "16"
+cold_cache_isolate "io_uring" "16"
+execute_workload_pass 1 1 "cold" "io_uring" "16" "bitmap_heap_scan" \\
+    "WL-B" "SET x=2;" "EXPLAIN SELECT 2;"
+
+# Pass 3 Warm (PASS_EXECUTED_COUNT == 2 -> sleep before configure_pg_gucs & warm_cache_isolate)
+run_inter_pass_cooldown
+configure_pg_gucs "io_uring" "16"
+warm_cache_isolate "io_uring" "16"
+execute_workload_pass 1 0 "warm" "io_uring" "16" "seq_scan" \\
+    "WL-A-Warm" "SET x=1;" "EXPLAIN SELECT 1;"
+"""
+    order_proc = subprocess.run(
+        ["bash", "-c", order_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert order_proc.returncode == 0, order_proc.stderr
+    events = trace_log.read_text(encoding="utf-8").splitlines()
+    assert events == [
+        # Pass 1: no sleep, autovacuum -> reset_pg_stats -> disk_before -> explain -> disk_after
+        "configure_pg_gucs:sync:16",
+        "cold_cache_isolate:sync:16",
+        "wait_for_autovacuum_clear",
+        "reset_pg_stats",
+        "capture_diskstats:diskstats_before.txt",
+        "psql_explain",
+        "capture_diskstats:diskstats_after.txt",
+        # Pass 2: sleep:5 runs BEFORE configure_pg_gucs & cold_cache_isolate
+        "sleep:5",
+        "configure_pg_gucs:io_uring:16",
+        "cold_cache_isolate:io_uring:16",
+        "wait_for_autovacuum_clear",
+        "reset_pg_stats",
+        "capture_diskstats:diskstats_before.txt",
+        "psql_explain",
+        "capture_diskstats:diskstats_after.txt",
+        # Pass 3 (warm): sleep:5 runs BEFORE configure_pg_gucs & warm_cache_isolate
+        "sleep:5",
+        "configure_pg_gucs:io_uring:16",
+        "warm_cache_isolate:io_uring:16",
+        "wait_for_autovacuum_clear",
+        "reset_pg_stats",
+        "capture_diskstats:diskstats_before.txt",
+        "psql_explain",
+        "capture_diskstats:diskstats_after.txt",
+    ]
+
+    # Verify pass_meta.json records active PG_WORK_MEM and loops invoke run_inter_pass_cooldown
+    pmeta_path = (
+        passes_dir / "iter_01" / "cold__io_uring__eic16__bitmap_heap_scan" / "pass_meta.json"
+    )
+    pmeta_doc = json.loads(pmeta_path.read_text(encoding="utf-8"))
+    assert pmeta_doc["work_mem"] == "64MB"
+
+    script_src = showdown_sh.read_text(encoding="utf-8")
+    assert '"pre_quiescent_ok": ${PRE_QUIESCENT_OK}' in script_src
+    assert '"work_mem": "$(json_escape "$PG_WORK_MEM")"' in script_src
+    cold_loop_seq = (
+        'run_inter_pass_cooldown\n'
+        '        configure_pg_gucs "$METHOD" "$CONC"\n'
+        '        cold_cache_isolate'
+    )
+    warm_loop_seq = (
+        'run_inter_pass_cooldown\n'
+        '            configure_pg_gucs "$METHOD" "$CONC"\n'
+        '            warm_cache_isolate'
+    )
+    assert cold_loop_seq in script_src
+    assert warm_loop_seq in script_src

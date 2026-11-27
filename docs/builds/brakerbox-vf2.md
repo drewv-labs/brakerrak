@@ -1,10 +1,10 @@
 <div align="center">
 
-# DREW-V Labs BrakerBench-VF2
+# DREW-V Labs BrakerBox-VF2 / BrakerBench-VF2
 
-*Optimized StarFive VisionFive 2 (JH7110) Data Bench Build*
+*Optimized StarFive VisionFive 2 (JH7110) Data Broker & Data Bench Build*
 
- <img src="../assets/starfive-visionfive2-jh7110-server-layout.png" alt="BrakerBench-VF2" width="600"> 
+ <img src="../assets/starfive-visionfive2-jh7110-server-layout.png" alt="BrakerBox-VF2 / BrakerBench-VF2" width="600"> 
 
 </div>
 

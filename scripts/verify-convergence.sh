@@ -344,7 +344,7 @@ _verify_refresh_node_vars() {
                 ;;
             devbench)
                 ENABLE_POSTGRES="true"
-                ENABLE_MQTT_BROKER="true"
+                ENABLE_MQTT_BROKER="false"
                 ;;
             babbagebox|babbagebench|visionbox|visionbench|snitchbench|lilsnitch)
                 ENABLE_POSTGRES="false"
@@ -398,9 +398,14 @@ _verify_refresh_node_vars() {
         ENABLE_NFS_SERVER="false"
         WITH_RAID="false"
     fi
-    IS_SD_TARGET="false"
-    if [[ "$STORAGE_MEDIA" == "sd" || "$TARGET_ARCH" == "riscv32" || "${TARGET_BOARD:-}" == "espressif-esp32p4" || "$NODE_ROLE" == "snitchbench" || "$NODE_ROLE" == "lilsnitch" || -n "$CLI_STAGE_DIR" ]]; then
-        IS_SD_TARGET="true"
+    IS_MCU_STAGED_TARGET="false"
+    if brak_is_riscv32_mcu_target "${TARGET_BOARD:-}" "${TARGET_ARCH:-}" "${CLI_STAGE_DIR:-}" \
+       || [[ "${NODE_ROLE:-}" == "snitchbench" || "${NODE_ROLE:-}" == "lilsnitch" ]]; then
+        IS_MCU_STAGED_TARGET="true"
+    fi
+    IS_SD_MEDIA="false"
+    if [[ "$STORAGE_MEDIA" == "sd" || "$IS_MCU_STAGED_TARGET" == "true" ]]; then
+        IS_SD_MEDIA="true"
     fi
 }
 
@@ -597,7 +602,7 @@ PY
 }
 
 _verify_should_skip_host_ort() {
-    if [[ "$IS_SD_TARGET" == "true" && -z "$CLI_TELEMETRY_JSON" && -z "$CLI_SERIAL_PORT" ]]; then
+    if [[ "$IS_MCU_STAGED_TARGET" == "true" && -z "$CLI_TELEMETRY_JSON" && -z "$CLI_SERIAL_PORT" ]]; then
         if [[ "$(uname -m)" != riscv32* ]]; then
             return 0
         fi
@@ -624,10 +629,46 @@ _verify_run_ort_stage() {
     _verify_assert_ort_status "$stage" "$SNAP_DIR"
 }
 
+_verify_capture_pass1_invariants() {
+    PASS1_DATA_FS_UUID=""
+    PASS1_CONFIG_DIGEST=""
+    PASS1_SD_MOUNT_INFO=""
+    PASS1_PG_SYSID=""
+    ACCEL_NVME_SKIP="false"
+
+    if [[ "$IS_MCU_STAGED_TARGET" == "true" || "$IS_SD_MEDIA" == "true" ]]; then
+        log_skip "SD media target (${TARGET_BOARD:-espressif-esp32p4}, media=${STORAGE_MEDIA}); skipped NVMe data filesystem UUID assertion"
+        PASS1_CONFIG_DIGEST="$(_verify_staged_config_digest)"
+        if [[ -z "$PASS1_CONFIG_DIGEST" ]]; then
+            log_fatal "Stage 1 assertion FAILED: unable to resolve staged config digest for ${NODE_ENV}."
+        fi
+        if [[ -z "$CLI_STAGE_DIR" ]] && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+            PASS1_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
+        fi
+    elif _verify_is_accel_nvme_skip; then
+        ACCEL_NVME_SKIP="true"
+        log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped NVMe data filesystem UUID assertion"
+    else
+        if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+            PASS1_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
+        fi
+        if [[ -z "$PASS1_DATA_FS_UUID" ]]; then
+            log_fatal "Stage 1 assertion FAILED: unable to resolve data filesystem UUID on ${MOUNT_POINT}."
+        fi
+    fi
+
+    if [[ "$IS_MCU_STAGED_TARGET" != "true" && "$ENABLE_POSTGRES" == "true" ]]; then
+        PASS1_PG_SYSID="$(_verify_get_pg_sysid)"
+        if [[ -z "$PASS1_PG_SYSID" ]]; then
+            log_fatal "Stage 1 assertion FAILED: unable to resolve PostgreSQL system_identifier."
+        fi
+    fi
+}
+
 echo ">>> [STAGE 0] Checking Day-0 Pre-Forge Clean-Room ORT Snapshot..."
 if _verify_should_skip_host_ort; then
-    log_skip "Stage 0 (day0-pre-forge): host $(uname -m) staging SD target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
-elif [[ "$IS_SD_TARGET" != "true" ]] && mountpoint -q "$MOUNT_POINT" 2>/dev/null && compgen -G "${SNAP_DIR}/*day0-pre-forge*.json" >/dev/null 2>&1; then
+    log_skip "Stage 0 (day0-pre-forge): host $(uname -m) staging MCU target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
+elif [[ "$IS_MCU_STAGED_TARGET" != "true" ]] && mountpoint -q "$MOUNT_POINT" 2>/dev/null && compgen -G "${SNAP_DIR}/*day0-pre-forge*.json" >/dev/null 2>&1; then
     log_skip "Resuming interrupted build; preserving existing Clean-Room Day-0 snapshot in ${SNAP_DIR}"
     _verify_assert_ort_status "day0-pre-forge" "$SNAP_DIR"
 else
@@ -639,39 +680,7 @@ echo ">>> [STAGE 1] Executing Convergence Pass 1..."
 bash "${BRAKERRAK_ROOT}/forge.sh" ${PASS1_ARGS[@]+"${PASS1_ARGS[@]}"}
 
 _verify_refresh_node_vars
-
-PASS1_DATA_FS_UUID=""
-PASS1_CONFIG_DIGEST=""
-PASS1_SD_MOUNT_INFO=""
-ACCEL_NVME_SKIP="false"
-if [[ "$IS_SD_TARGET" == "true" ]]; then
-    log_skip "SD media target (${TARGET_BOARD:-espressif-esp32p4}, media=${STORAGE_MEDIA}); skipped NVMe data filesystem UUID assertion"
-    PASS1_CONFIG_DIGEST="$(_verify_staged_config_digest)"
-    if [[ -z "$PASS1_CONFIG_DIGEST" ]]; then
-        log_fatal "Stage 1 assertion FAILED: unable to resolve staged config digest for ${NODE_ENV}."
-    fi
-    if [[ -z "$CLI_STAGE_DIR" ]] && command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        PASS1_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
-    fi
-elif _verify_is_accel_nvme_skip; then
-    ACCEL_NVME_SKIP="true"
-    log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped NVMe data filesystem UUID assertion"
-else
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        PASS1_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
-    fi
-    if [[ -z "$PASS1_DATA_FS_UUID" ]]; then
-        log_fatal "Stage 1 assertion FAILED: unable to resolve data filesystem UUID on ${MOUNT_POINT}."
-    fi
-fi
-
-PASS1_PG_SYSID=""
-if [[ "$IS_SD_TARGET" != "true" && "$ENABLE_POSTGRES" == "true" ]]; then
-    PASS1_PG_SYSID="$(_verify_get_pg_sysid)"
-    if [[ -z "$PASS1_PG_SYSID" ]]; then
-        log_fatal "Stage 1 assertion FAILED: unable to resolve PostgreSQL system_identifier."
-    fi
-fi
+_verify_capture_pass1_invariants
 
 DESTRUCTIVE_RE='nvme[[:space:]]+format|mkfs\.[a-z0-9]+|pg_createcluster|(^|[^[:alnum:]_])initdb([^[:alnum:]_]|$)'
 
@@ -696,7 +705,7 @@ _verify_check_destructive_pass2_log() {
 
 _verify_assert_stage_skip_coverage() {
     local log_file="$1"
-    local is_sd="${2:-${IS_SD_TARGET:-false}}"
+    local is_sd="${2:-${IS_MCU_STAGED_TARGET:-false}}"
     local enable_mqtt="${3:-${ENABLE_MQTT_BROKER:-false}}"
     local enable_nfs="${4:-${ENABLE_NFS_SERVER:-false}}"
     local with_raid="${5:-${WITH_RAID:-false}}"
@@ -831,48 +840,72 @@ fi
 _verify_check_destructive_pass2_log "$PASS2_LOG"
 SKIP_MARKER_COUNT=0
 STAGE_SKIP_SUMMARY=""
-_verify_assert_stage_skip_coverage "$PASS2_LOG" "$IS_SD_TARGET" "$ENABLE_MQTT_BROKER" "$ENABLE_NFS_SERVER" "$WITH_RAID"
-
-if [[ "$IS_SD_TARGET" == "true" ]]; then
-    PASS2_CONFIG_DIGEST="$(_verify_staged_config_digest)"
-    if [[ -z "$PASS2_CONFIG_DIGEST" || "$PASS2_CONFIG_DIGEST" != "$PASS1_CONFIG_DIGEST" ]]; then
-        log_fatal "Stage 2 idempotency assertion FAILED: staged config digest changed (Pass 1='${PASS1_CONFIG_DIGEST}', Pass 2='${PASS2_CONFIG_DIGEST:-missing}')."
-    fi
-    if [[ -n "$PASS1_SD_MOUNT_INFO" ]]; then
-        PASS2_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
-        if [[ "$PASS2_SD_MOUNT_INFO" != "$PASS1_SD_MOUNT_INFO" ]]; then
-            log_fatal "Stage 2 idempotency assertion FAILED: SD mountpoint changed on ${MOUNT_POINT} (Pass 1='${PASS1_SD_MOUNT_INFO}', Pass 2='${PASS2_SD_MOUNT_INFO:-missing}')."
+_verify_assert_pass2_invariants() {
+    if [[ "$IS_MCU_STAGED_TARGET" == "true" ]]; then
+        PASS2_CONFIG_DIGEST="$(_verify_staged_config_digest)"
+        if [[ -z "$PASS2_CONFIG_DIGEST" || "$PASS2_CONFIG_DIGEST" != "$PASS1_CONFIG_DIGEST" ]]; then
+            log_fatal "Stage 2 idempotency assertion FAILED: staged config digest changed (Pass 1='${PASS1_CONFIG_DIGEST}', Pass 2='${PASS2_CONFIG_DIGEST:-missing}')."
         fi
-    fi
-    log_ok "Stage 2 idempotency assertion passed (SD/riscv32): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged staged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
-elif [[ "$ACCEL_NVME_SKIP" == "true" ]]; then
-    log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped Pass-2 NVMe data filesystem UUID comparison."
-    log_ok "Stage 2 idempotency assertion passed (accelerator-only, no NVMe): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY})."
-else
-    PASS2_DATA_FS_UUID=""
-    if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
-        PASS2_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
-    fi
-    if [[ -z "$PASS2_DATA_FS_UUID" || "$PASS2_DATA_FS_UUID" != "$PASS1_DATA_FS_UUID" ]]; then
-        log_fatal "Stage 2 idempotency assertion FAILED: data filesystem UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_DATA_FS_UUID}', Pass 2='${PASS2_DATA_FS_UUID:-missing}')."
-    fi
-
-    if [[ "$ENABLE_POSTGRES" == "true" ]]; then
-        PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
-        if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
-            log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+        if [[ -n "$PASS1_SD_MOUNT_INFO" ]]; then
+            PASS2_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
+            if [[ "$PASS2_SD_MOUNT_INFO" != "$PASS1_SD_MOUNT_INFO" ]]; then
+                log_fatal "Stage 2 idempotency assertion FAILED: SD mountpoint changed on ${MOUNT_POINT} (Pass 1='${PASS1_SD_MOUNT_INFO}', Pass 2='${PASS2_SD_MOUNT_INFO:-missing}')."
+            fi
         fi
-        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+        log_ok "Stage 2 idempotency assertion passed (MCU/riscv32): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged staged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
+    elif [[ "$IS_SD_MEDIA" == "true" ]]; then
+        PASS2_CONFIG_DIGEST="$(_verify_staged_config_digest)"
+        if [[ -z "$PASS2_CONFIG_DIGEST" || "$PASS2_CONFIG_DIGEST" != "$PASS1_CONFIG_DIGEST" ]]; then
+            log_fatal "Stage 2 idempotency assertion FAILED: staged config digest changed (Pass 1='${PASS1_CONFIG_DIGEST}', Pass 2='${PASS2_CONFIG_DIGEST:-missing}')."
+        fi
+        if [[ -n "$PASS1_SD_MOUNT_INFO" ]]; then
+            PASS2_SD_MOUNT_INFO="$(_verify_get_sd_mount_info "$MOUNT_POINT")"
+            if [[ "$PASS2_SD_MOUNT_INFO" != "$PASS1_SD_MOUNT_INFO" ]]; then
+                log_fatal "Stage 2 idempotency assertion FAILED: SD mountpoint changed on ${MOUNT_POINT} (Pass 1='${PASS1_SD_MOUNT_INFO}', Pass 2='${PASS2_SD_MOUNT_INFO:-missing}')."
+            fi
+        fi
+        if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+            PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
+            if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
+                log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+            fi
+            log_ok "Stage 2 idempotency assertion passed (SD media): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged config digest (${PASS2_CONFIG_DIGEST:0:16}...), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+        else
+            log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
+            log_ok "Stage 2 idempotency assertion passed (SD media): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged config digest (${PASS2_CONFIG_DIGEST:0:16}...)."
+        fi
+    elif [[ "$ACCEL_NVME_SKIP" == "true" ]]; then
+        log_skip "Accelerator-only persona (${NODE_ROLE}) without ${NVME_DEV} (ENABLE_POSTGRES=${ENABLE_POSTGRES}, ENABLE_NFS_SERVER=${ENABLE_NFS_SERVER}); skipped Pass-2 NVMe data filesystem UUID comparison."
+        log_ok "Stage 2 idempotency assertion passed (accelerator-only, no NVMe): ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY})."
     else
-        log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
-        log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID})."
+        PASS2_DATA_FS_UUID=""
+        if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+            PASS2_DATA_FS_UUID="$(_verify_get_data_fs_uuid "$MOUNT_POINT")"
+        fi
+        if [[ -z "$PASS2_DATA_FS_UUID" || "$PASS2_DATA_FS_UUID" != "$PASS1_DATA_FS_UUID" ]]; then
+            log_fatal "Stage 2 idempotency assertion FAILED: data filesystem UUID changed on ${MOUNT_POINT} (Pass 1='${PASS1_DATA_FS_UUID}', Pass 2='${PASS2_DATA_FS_UUID:-missing}')."
+        fi
+
+        if [[ "$ENABLE_POSTGRES" == "true" ]]; then
+            PASS2_PG_SYSID="$(_verify_get_pg_sysid)"
+            if [[ -z "$PASS2_PG_SYSID" || "$PASS2_PG_SYSID" != "$PASS1_PG_SYSID" ]]; then
+                log_fatal "Stage 2 idempotency assertion FAILED: PostgreSQL system_identifier changed (Pass 1='${PASS1_PG_SYSID}', Pass 2='${PASS2_PG_SYSID:-missing}')."
+            fi
+            log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID}), unchanged PG system_identifier (${PASS2_PG_SYSID})."
+        else
+            log_skip "PostgreSQL disabled (ENABLE_POSTGRES=${ENABLE_POSTGRES}); skipped system_identifier comparison."
+            log_ok "Stage 2 idempotency assertion passed: ${SKIP_MARKER_COUNT} [SKIP] marker(s) (${STAGE_SKIP_SUMMARY}), unchanged data FS UUID (${PASS2_DATA_FS_UUID})."
+        fi
     fi
-fi
+}
+
+_verify_assert_stage_skip_coverage "$PASS2_LOG" "$IS_MCU_STAGED_TARGET" "$ENABLE_MQTT_BROKER" "$ENABLE_NFS_SERVER" "$WITH_RAID"
+_verify_assert_pass2_invariants
 
 echo ""
 echo ">>> [STAGE 3] Capturing Day-1 Post-Forge CTD Provenance Snapshot..."
 if _verify_should_skip_host_ort; then
-    log_skip "Stage 3 (day1-post-forge): host $(uname -m) staging SD target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
+    log_skip "Stage 3 (day1-post-forge): host $(uname -m) staging MCU target (${TARGET_BOARD:-espressif-esp32p4}) without --telemetry-json/--serial-port; skipped live host ORT probe"
 else
     _verify_run_ort_stage "day1-post-forge"
 fi

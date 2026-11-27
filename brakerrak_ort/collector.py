@@ -953,18 +953,24 @@ def evaluate_assertions(
             hailo_rt = rt_map.get("hailo")
             devs = list(hailo_rt.get("device_nodes", [])) if hailo_rt else []
             kmod = bool(hailo_rt.get("kmod_loaded")) if hailo_rt else False
+            kmod_label = (
+                str(hailo_rt.get("kmod_name") or "hailo_pci/hailo1x_pci")
+                if hailo_rt
+                else "hailo_pci/hailo1x_pci"
+            )
             cli_ok = bool(hailo_rt.get("cli_ok")) if hailo_rt else False
             hailo_ok = bool(devs) and kmod and cli_ok
             checks.append(
                 {
                     "id": "ORT-D1_HAILO_RUNTIME",
                     "description": (
-                        "Hailo NPU Runtime (/dev/hailo*, hailo_pci kmod, hailortcli) Operational"
+                        "Hailo NPU Runtime (/dev/hailo*|/dev/h1x-*, "
+                        "hailo_pci|hailo1x_pci kmod, hailortcli) Operational"
                     ),
-                    "expected": "/dev/hailo* + hailo_pci + hailortcli ok",
+                    "expected": "/dev/hailo*|/dev/h1x-* + hailo_pci|hailo1x_pci + hailortcli ok",
                     "actual": (
                         f"devs={','.join(devs) if devs else 'none'} | "
-                        f"kmod={'loaded' if kmod else 'missing'} | "
+                        f"kmod={f'{kmod_label} (loaded)' if kmod else 'missing'} | "
                         f"hailortcli={'ok' if cli_ok else 'failed'}"
                     ),
                     "status": "PASS" if hailo_ok else "FAIL",
@@ -1099,7 +1105,9 @@ def collect_snapshot(
             }
         )
 
-    nvme_dev = resolved_node_env.get("NVME_DEV", "/dev/nvme0n1")
+    nvme_dev = (
+        active_env.get("NVME_DEV") or resolved_node_env.get("NVME_DEV") or "/dev/nvme0n1"
+    ).strip() or "/dev/nvme0n1"
     nvme_short = os.path.basename(nvme_dev)
     nvme_ctrl = re.sub(r"n[0-9]+$", "", nvme_short)
     nvme_present = profile.has_pcie and probe.path_exists(f"/sys/block/{nvme_short}")

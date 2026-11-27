@@ -278,6 +278,10 @@ case "$APT_UPDATED" in
     *)                   APT_UPDATED="false" ;;
 esac
 
+# Delegation-first invariant: RVDK CLI subcommands are canonical for all low-level OS/service
+# mutations. BRAKERRAK_LEGACY_RVDK_COMPAT=true is a temporary quarantined compatibility shim
+# scheduled for removal in an upcoming release; set BRAKERRAK_LEGACY_RVDK_COMPAT=false to
+# enforce strict delegation-only execution.
 BRAKERRAK_LEGACY_RVDK_COMPAT="${BRAKERRAK_LEGACY_RVDK_COMPAT:-true}"
 case "$BRAKERRAK_LEGACY_RVDK_COMPAT" in
     1|true|TRUE|yes|YES) BRAKERRAK_LEGACY_RVDK_COMPAT="true" ;;
@@ -287,15 +291,14 @@ esac
 _BRAK_RVDK_BIN_EXPLICIT="false"
 if [[ -n "${RVDK_BIN:-}" ]]; then
     _BRAK_RVDK_BIN_EXPLICIT="true"
+elif command -v rvdk >/dev/null 2>&1; then
+    RVDK_BIN="$(command -v rvdk)"
+elif [[ -x /usr/local/bin/rvdk ]]; then
+    RVDK_BIN="/usr/local/bin/rvdk"
+elif [[ -x /usr/bin/rvdk ]]; then
+    RVDK_BIN="/usr/bin/rvdk"
 else
     RVDK_BIN="/usr/local/bin/rvdk"
-fi
-if [[ "$_BRAK_RVDK_BIN_EXPLICIT" != "true" && ! -x "$RVDK_BIN" ]]; then
-    if [[ -x /usr/bin/rvdk ]]; then
-        RVDK_BIN="/usr/bin/rvdk"
-    elif command -v rvdk >/dev/null 2>&1; then
-        RVDK_BIN="$(command -v rvdk)"
-    fi
 fi
 
 _brak_resolve_rvdk_cmd() {
@@ -304,14 +307,10 @@ _brak_resolve_rvdk_cmd() {
         printf '%s\n' "$RVDK_BIN"
         return 0
     fi
-    if [[ -n "${RVDK_BIN:-}" ]]; then
-        if [[ -x "${RVDK_BIN}" ]]; then
-            printf '%s\n' "$RVDK_BIN"
-            return 0
-        fi
-        if [[ "$RVDK_BIN" != "/usr/local/bin/rvdk" && "$RVDK_BIN" != "/usr/bin/rvdk" ]]; then
-            return 1
-        fi
+    if [[ -n "${RVDK_BIN:-}" && "$RVDK_BIN" != "/usr/local/bin/rvdk" && "$RVDK_BIN" != "/usr/bin/rvdk" ]]; then
+        [[ -x "${RVDK_BIN}" ]] || return 1
+        printf '%s\n' "$RVDK_BIN"
+        return 0
     fi
     if command -v rvdk >/dev/null 2>&1; then
         command -v rvdk
@@ -645,7 +644,7 @@ _brak_legacy_pgdg_migration_compat() {
     if ! _brak_legacy_compat_allowed; then
         log_fatal "Legacy /opt/drewv-pgdg-riscv64 cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks a migration hook."
     fi
-    log_warn "DEPRECATED: Falling back to legacy compat removal of /etc/apt/sources.list.d/drewv-local-pgdg.list (upgrade RVDK to support utils/migrate-pgdg.sh, migrate-pgdg, or postgresql --migrate-legacy)."
+    log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — removing /etc/apt/sources.list.d/drewv-local-pgdg.list directly (upgrade RVDK for utils/migrate-pgdg.sh, migrate-pgdg, or postgresql --migrate-legacy)."
     rm -f /etc/apt/sources.list.d/drewv-local-pgdg.list /var/lib/apt/lists/_opt_drewv-pgdg-riscv64* 2>/dev/null || true
 }
 
@@ -690,7 +689,7 @@ _brak_reclaim_hugepages_compat() {
     if ! _brak_legacy_compat_allowed; then
         log_fatal "HugePages reclamation required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks a HugePages reclaim subcommand."
     fi
-    log_warn "DEPRECATED: RVDK lacks HugePages reclaim subcommand; falling back to legacy compat removal of /etc/sysctl.d/90-rvdk-pg18-hugepages.conf and vm.nr_hugepages=0."
+    log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — RVDK lacks HugePages reclaim subcommand; removing /etc/sysctl.d/90-rvdk-pg18-hugepages.conf and setting vm.nr_hugepages=0 directly."
 
     if [[ "$_has_conf" == "true" ]]; then
         rm -f /etc/sysctl.d/90-rvdk-pg18-hugepages.conf
@@ -763,7 +762,7 @@ _brak_disable_postgresql() {
         if ! _brak_legacy_compat_allowed; then
             log_fatal "PostgreSQL disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'postgresql --disable'."
         fi
-        log_warn "DEPRECATED: RVDK lacks 'postgresql --disable'; falling back to legacy direct systemctl disablement for postgresql."
+        log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — RVDK lacks 'postgresql --disable'; disabling postgresql via systemctl directly."
         systemctl disable --now postgresql 2>/dev/null || systemctl disable --now postgresql.service 2>/dev/null || true
         log_ok "Stopped & disabled postgresql to free RAM/HugePages for ${NODE_ROLE:-node} workloads"
     fi
@@ -793,7 +792,7 @@ _brak_cleanup_legacy_mosquitto() {
     if ! _brak_legacy_compat_allowed; then
         log_fatal "Legacy Mosquitto config cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks migration hook."
     fi
-    log_warn "DEPRECATED: Removing legacy pre-RVDK Mosquitto drop-in(s) directly (upgrade RVDK to support utils/migrate-mosquitto.sh or mods/mosquitto --cleanup-legacy)."
+    log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — removing legacy pre-RVDK Mosquitto drop-in(s) directly (upgrade RVDK for utils/migrate-mosquitto.sh or mods/mosquitto --cleanup-legacy)."
     rm -f /etc/mosquitto/conf.d/brakerrak.conf /etc/mosquitto/conf.d/99-brakerrak.conf 2>/dev/null || true
 }
 
@@ -820,7 +819,7 @@ _brak_disable_mosquitto() {
         if ! _brak_legacy_compat_allowed; then
             log_fatal "Mosquitto disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'mods/mosquitto --disable'."
         fi
-        log_warn "DEPRECATED: RVDK lacks 'mods/mosquitto --disable'; falling back to legacy direct systemctl disablement for mosquitto.service."
+        log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — RVDK lacks 'mods/mosquitto --disable'; disabling mosquitto.service via systemctl directly."
         systemctl disable --now mosquitto.service 2>/dev/null || true
         log_ok "Disabled mosquitto.service for ${NODE_ROLE:-node} isolation"
     fi
@@ -849,7 +848,7 @@ _brak_cleanup_legacy_nfs() {
     if ! _brak_legacy_compat_allowed; then
         log_fatal "Legacy NFS export cleanup required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks migration hook."
     fi
-    log_warn "DEPRECATED: Removing legacy pre-RVDK /etc/exports.d/brakerrak-vaults.exports directly (upgrade RVDK to support utils/migrate-nfs.sh or mods/nfs-vault --cleanup-legacy)."
+    log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — removing legacy pre-RVDK /etc/exports.d/brakerrak-vaults.exports directly (upgrade RVDK for utils/migrate-nfs.sh or mods/nfs-vault --cleanup-legacy)."
     rm -f /etc/exports.d/brakerrak-vaults.exports 2>/dev/null || true
 }
 
@@ -883,7 +882,7 @@ _brak_disable_nfs_server() {
         if ! _brak_legacy_compat_allowed; then
             log_fatal "NFSv4 disablement required, but BRAKERRAK_LEGACY_RVDK_COMPAT=false and RVDK lacks 'mods/nfs-vault --disable'."
         fi
-        log_warn "DEPRECATED: RVDK lacks 'mods/nfs-vault --disable'; falling back to legacy direct systemctl disablement for NFSv4 services."
+        log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; delegation-first via RVDK is canonical) — RVDK lacks 'mods/nfs-vault --disable'; disabling NFSv4 services via systemctl directly."
         if [[ "$_nfs_kernel_active" == "true" ]]; then
             systemctl disable --now nfs-kernel-server 2>/dev/null || systemctl disable --now nfs-server.service 2>/dev/null || true
             log_ok "Disabled nfs-kernel-server for ${NODE_ROLE:-node} isolation"
@@ -1580,7 +1579,7 @@ if [[ ! -x "$RVDK_BIN" ]]; then
         brak_prog 5 "Stage 0A: Installing RVDK CLI..." 0 "Cloning RVDK engine..."
         log_step "0A. Installing RVDK Package Manager CLI (${RVDK_BASE_URL}/install-cli.sh)"
         _brak_fetch_and_exec_script "${RVDK_BASE_URL}/install-cli.sh" "${RVDK_INSTALL_SHA256:-}" --quiet
-        [[ -x /usr/bin/rvdk ]] && RVDK_BIN="/usr/bin/rvdk" || RVDK_BIN="/usr/local/bin/rvdk"
+        RVDK_BIN="$(_brak_resolve_rvdk_cmd || echo "/usr/local/bin/rvdk")"
     else
         log_fatal "RVDK CLI not found at '${RVDK_BIN}' or PATH (install RVDK or set RVDK_BIN)."
     fi
@@ -1747,7 +1746,7 @@ fi
 # 8. STAGE 6: POST-FLIGHT CONVERGENCE SUMMARY
 # ==============================================================================
 brak_prog 95 "Stage 6/7: Collecting Post-Flight Convergence Summary..." 100 "RVDK pipeline converged"
-if [[ "$TARGET_BOARD" == "espressif-esp32p4" || "$STORAGE_MEDIA" == "sd" || -n "$CLI_STAGE_DIR" ]]; then
+if brak_is_riscv32_mcu_target "$TARGET_BOARD" "$TARGET_ARCH" "$CLI_STAGE_DIR"; then
     if [[ -n "$CLI_STAGE_DIR" ]]; then
         SD_MNT_INFO="staged (${CLI_STAGE_DIR})"
     elif command -v findmnt >/dev/null 2>&1 && mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
@@ -1797,7 +1796,10 @@ else
         CPU_CLOCK_INFO="${CPU_GOV} (${CPU_HARTS} Harts)"
     fi
 
-    if _brak_should_skip_accel_nvme "$NODE_ROLE" "$ENABLE_POSTGRES" "$ENABLE_NFS_SERVER" "$NVME_DEV"; then
+    if [[ "$STORAGE_MEDIA" == "sd" ]]; then
+        LBA_SZ="n/a (sd media)"
+        NVME_MNT_INFO="$(findmnt -n -o SOURCE,TARGET,FSTYPE,OPTIONS "$MOUNT_POINT" 2>/dev/null || echo "n/a (sd media)")"
+    elif _brak_should_skip_accel_nvme "$NODE_ROLE" "$ENABLE_POSTGRES" "$ENABLE_NFS_SERVER" "$NVME_DEV"; then
         LBA_SZ="n/a (accelerator-only, no NVMe)"
         NVME_MNT_INFO="n/a (accelerator-only)"
     else

@@ -735,14 +735,20 @@ def inspect_accelerator_runtime(
     runtime: dict[str, AcceleratorRuntimeInfo] = {}
 
     if "1e60" in vendors:
-        hailo_devs = probe.glob_paths("/dev/hailo*")
-        hailo_kmod = _is_kmod_loaded(probe, "hailo_pci")
+        hailo_devs = sorted(
+            set(probe.glob_paths("/dev/hailo*")) | set(probe.glob_paths("/dev/h1x-*"))
+        )
+        detected_hailo_kmod: str | None = None
+        for candidate_kmod in ("hailo1x_pci", "hailo_pci"):
+            if _is_kmod_loaded(probe, candidate_kmod):
+                detected_hailo_kmod = candidate_kmod
+                break
         hailo_cli = probe.run_cmd(["hailortcli", "fw-control", "identify"])
         runtime["hailo"] = AcceleratorRuntimeInfo(
             vendor_id="1e60",
             device_nodes=hailo_devs,
-            kmod_name="hailo_pci",
-            kmod_loaded=hailo_kmod,
+            kmod_name=detected_hailo_kmod or "hailo_pci/hailo1x_pci",
+            kmod_loaded=detected_hailo_kmod is not None,
             cli_tool="hailortcli",
             cli_ok=hailo_cli.ok,
         )

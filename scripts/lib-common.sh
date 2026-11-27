@@ -16,6 +16,7 @@
 #   • Safe, expansion-free node.env serializer (brak_write_node_env)
 #   • Unified Device-Tree & --target silicon resolver (brak_resolve_silicon)
 #   • Canonical role & RVDK tune profile mappers (brak_normalize_role, brak_role_to_rvdk_tune, brak_normalize_tune)
+#   • Canonical riscv32/staged MCU target predicate (brak_is_riscv32_mcu_target)
 # ==============================================================================
 
 if [[ "${_BRAKERRAK_COMMON_SOURCED:-0}" == "1" ]]; then
@@ -244,7 +245,9 @@ _brak_run_exit_hooks() {
     _BRAK_EXIT_RAN="1"
 
     local hook
-    for hook in ${_BRAK_EXIT_HOOKS[@]+"${_BRAK_EXIT_HOOKS[@]}"}; do
+    local i
+    for (( i=${#_BRAK_EXIT_HOOKS[@]}-1; i>=0; i-- )); do
+        hook="${_BRAK_EXIT_HOOKS[i]}"
         [[ -n "$hook" ]] || continue
         if declare -F "$hook" >/dev/null 2>&1; then
             "$hook" "$rc" || true
@@ -263,8 +266,8 @@ _brak_on_signal() {
     kill -"$sig" "${BASHPID:-$$}"
 }
 
-# Register a cleanup callback to run in order on EXIT/INT/TERM without
-# double-running or clobbering prior EXIT traps.
+# Register a cleanup callback to run in LIFO (reverse registration) order on
+# EXIT/INT/TERM without double-running or clobbering prior EXIT traps.
 # Usage: brak_register_exit_hook <function_name>
 brak_register_exit_hook() {
     local fn="${1:-}"
@@ -274,8 +277,9 @@ brak_register_exit_hook() {
     if [[ "${_BRAK_TRAP_PID:-}" != "$cur_pid" ]]; then
         _BRAK_EXIT_RAN="0"
         _BRAK_TRAP_PID="$cur_pid"
-        # Do not inherit parent shell callbacks into forked subshells/pipelines
-        _BRAK_EXIT_HOOKS=()
+        # Do not inherit parent shell callbacks into forked subshells/pipelines;
+        # keep _brak_cleanup_tmpfiles at the bottom of the LIFO stack so tmpfiles are removed last.
+        _BRAK_EXIT_HOOKS=(_brak_cleanup_tmpfiles)
     fi
 
     local cur_exit_trap=""
@@ -732,6 +736,19 @@ brak_normalize_tune() {
         data)                    printf 'data\n' ;;
         *)                       printf '\n' ;;
     esac
+}
+
+# Return 0 iff target is a staged or riscv32 MCU Sensor Node (e.g. espressif-esp32p4),
+# explicitly excluding riscv64 Linux SBCs running on SD media (--media sd).
+# Usage: brak_is_riscv32_mcu_target <target_board> <target_arch> <stage_dir>
+brak_is_riscv32_mcu_target() {
+    local target_board="${1:-}"
+    local target_arch="${2:-}"
+    local stage_dir="${3:-}"
+    if [[ "$target_board" == "espressif-esp32p4" || "$target_arch" == "riscv32" || -n "$stage_dir" ]]; then
+        return 0
+    fi
+    return 1
 }
 
 # Unify Device-Tree (/proc/device-tree/model), /etc/rvdk/kit.env, and --target

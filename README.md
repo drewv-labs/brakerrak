@@ -52,7 +52,7 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 | **babbagebench** | --tune ai | Disabled by Default (--with-pg opt-in; pure GPU/Blackhole isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated GPU / Blackhole Bench |
 | **visionbox** | --tune ai | Disabled by Default (--with-pg opt-in; full Edge NPU memory headroom) | Disabled | Disabled | Prod Edge NPU Inference Node |
 | **visionbench** | --tune ai | Disabled by Default (--with-pg opt-in; pure Edge NPU isolation) | Disabled for Benchmark Isolation | Disabled for Benchmark Isolation | Dev Isolated Edge NPU Bench |
-| **devbench** | --tune ai / --tune iot | Active on riscv64 (Clamped false on riscv32/sd) | Enabled on riscv64 (Clamped false on riscv32/sd) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
+| **devbench** | --tune ai / --tune iot | Active on riscv64 (Clamped false on riscv32/sd) | Disabled by Default (--with-mqtt opt-in) | Disabled by Default | Dev Hybrid Bench (Hot-Swappable Roles & Tunes) |
 | **snitchbench** | --tune iot | Disabled (riscv32/sd target) | Disabled | Disabled | Dev Isolated Edge Sensor Bench (SnitchBench-P4) |
 | **lilsnitch** | --tune iot | Disabled (riscv32/sd target) | Disabled | Disabled | Prod Per-Unit Edge Sensor Kit (LilSnitch-P4) |
 
@@ -89,7 +89,6 @@ Flip any supported RISC-V node statelessly between production data brokering, di
 Provides the foundational RISC-V idempotent day-0 media flashers, bare-metal bootstrappers, multi-layer kernel tuners, & prebuilt package catalog. BrakerRak leverages **RVDK** to deterministically provide controlled test environments, hot-swappable system tuning (data brokering vs ML use cases), and exposes performance metric interfaces, e.g., `perf` counters, for CarrierPigeons to tap into.   
 
 [CarrierPigeons](https://github.com/drewv-labs/carrierpigeons)
-<!-- TODO: Swap the CTD link below to the dedicated CTD architecture writeup URL once published -->
 
 Provides a configurable Go-driven **Continuous Telemetric Documentation (CTD)** mesh, distributed systems orchestration plane, **Runner** dispatch, analytics layer, AI powered diagnostics & support, and an MCP service that can be plugged into modern agent harnesses. 
 

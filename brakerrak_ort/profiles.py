@@ -26,6 +26,8 @@ class SocProfile:
     has_pcie: bool = True
     storage_bus: str = "nvme"
     supported_tunes: tuple[str, ...] = ("data", "ai", "iot")
+    accel_max_gt_s: float | None = None
+    accel_max_width: int | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +119,8 @@ SOC_PROFILES: dict[str, SocProfile] = {
         min_gt_s=8.0,
         min_width=4,
         thermal_ceiling_c=60.0,
+        accel_max_gt_s=16.0,
+        accel_max_width=16,
     ),
     "sifive-fu740": SocProfile(
         slug="sifive-fu740",
@@ -143,6 +147,8 @@ SOC_PROFILES: dict[str, SocProfile] = {
         min_gt_s=8.0,
         min_width=4,
         thermal_ceiling_c=60.0,
+        accel_max_gt_s=32.0,
+        accel_max_width=16,
     ),
     "espressif-esp32p4": SocProfile(
         slug="espressif-esp32p4",
@@ -328,7 +334,7 @@ ROLE_DEFAULTS: dict[str, RoleDefaults] = {
     "devbench": RoleDefaults(
         stem="devbench",
         enable_postgres=True,
-        enable_mqtt_broker=True,
+        enable_mqtt_broker=False,
         enable_nfs_server=False,
     ),
     "snitchbench": RoleDefaults(
@@ -421,9 +427,15 @@ def get_accelerator_link_floor(vendor_id: str, profile: SocProfile) -> tuple[flo
     spec = ACCELERATOR_LINK_SPECS.get(vendor_id.strip().lower())
     if spec is None:
         return (profile.min_gt_s, profile.min_width)
+    cap_gt_s = (
+        profile.accel_max_gt_s if profile.accel_max_gt_s is not None else profile.min_gt_s
+    )
+    cap_width = (
+        profile.accel_max_width if profile.accel_max_width is not None else profile.min_width
+    )
     return (
-        min(spec.min_gt_s, profile.min_gt_s),
-        min(spec.min_width, profile.min_width),
+        min(spec.min_gt_s, cap_gt_s),
+        min(spec.min_width, cap_width),
     )
 
 

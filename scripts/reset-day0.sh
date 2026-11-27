@@ -506,16 +506,36 @@ _reset_strict_umount() {
     local target="${1:-}"
     [[ -n "$target" ]] || return 0
 
+    local max_attempts=5
+    local retry_sleep="${BRAKERRAK_UMOUNT_RETRY_SLEEP:-0.5}"
+    local attempt=1
+    local umount_err=""
+
     if command -v fuser >/dev/null 2>&1; then
         fuser -km "$target" 2>/dev/null || true
     fi
 
-    local umount_err=""
-    if ! umount_err="$(umount "$target" 2>&1)"; then
-        [[ -n "$umount_err" ]] && log_warn "umount(${target}): ${umount_err}"
-        _reset_report_active_holders "$target"
-        log_fatal "Safety Interlock: failed to unmount '${target}'; aborting before destructive cleanup."
-    fi
+    while (( attempt <= max_attempts )); do
+        if umount_err="$(umount "$target" 2>&1)"; then
+            return 0
+        fi
+        if (( attempt < max_attempts )); then
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm settle 2>/dev/null || true
+            fi
+            if command -v sleep >/dev/null 2>&1; then
+                sleep "$retry_sleep" 2>/dev/null || true
+            fi
+            if command -v fuser >/dev/null 2>&1; then
+                fuser -km "$target" 2>/dev/null || true
+            fi
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+
+    [[ -n "$umount_err" ]] && log_warn "umount(${target}): ${umount_err}"
+    _reset_report_active_holders "$target"
+    log_fatal "Safety Interlock: failed to unmount '${target}' after ${max_attempts} attempts; aborting before destructive cleanup."
 }
 
 _reset_unmount_vg_devices() {
@@ -734,8 +754,122 @@ _reset_clean_fstab() {
     mv -f "$tmp_fstab" "$fstab_path"
 }
 
-# Quarantined legacy RVDK cleanup used only when `rvdk reset` is unavailable.
+# Parse `nvme id-ns` output (from device $1 or stdin) and select the 512-byte LBA format
+# index (`lbads:9`) with zero metadata (`ms:0`) and the lowest `rp:` (best relative performance).
+_reset_select_512_lbaf() {
+    local id_ns_out=""
+    if (( $# > 0 )) && [[ -n "${1:-}" ]]; then
+        id_ns_out="$(nvme id-ns "$1" 2>/dev/null || true)"
+    else
+        id_ns_out="$(cat)"
+    fi
+    [[ -n "$id_ns_out" ]] || return 0
+
+    awk '
+        function parse_num(raw,    s, val, i, ch, d) {
+            s = tolower(raw)
+            if (s ~ /^0x[0-9a-f]+$/) {
+                sub(/^0x/, "", s)
+                val = 0
+                for (i = 1; i <= length(s); i++) {
+                    ch = substr(s, i, 1)
+                    d = index("0123456789abcdef", ch) - 1
+                    if (d < 0) return 999999
+                    val = val * 16 + d
+                }
+                return val
+            }
+            if (s ~ /^[0-9]+$/) {
+                return s + 0
+            }
+            return 999999
+        }
+        BEGIN { best_idx = ""; best_rp = 999999 }
+        /^[[:space:]]*lbaf[[:space:]]+[0-9]+[[:space:]]*:/ {
+            line = $0
+            sub(/^[[:space:]]*lbaf[[:space:]]+/, "", line)
+            idx = line
+            sub(/[^0-9].*$/, "", idx)
+
+            has_ms0 = 0
+            has_lbads9 = 0
+            rp_val = 999999
+            n = split($0, toks, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                t = toks[i]
+                if (t ~ /^ms:/) {
+                    if (parse_num(substr(t, 4)) == 0) has_ms0 = 1
+                } else if (t == "lbads:9") {
+                    has_lbads9 = 1
+                } else if (t ~ /^rp:/) {
+                    rp_val = parse_num(substr(t, 4))
+                }
+            }
+            if (has_ms0 && has_lbads9) {
+                if (best_idx == "" || rp_val < best_rp) {
+                    best_idx = idx
+                    best_rp = rp_val
+                }
+            }
+        }
+        END {
+            if (best_idx != "") print best_idx
+        }
+    ' <<< "$id_ns_out"
+}
+
+_reset_is_mcu_target() {
+    local dt_model="${1:-${DT_MODEL:-}}"
+    local target_arch="${2:-${TARGET_ARCH:-riscv64}}"
+    local node_role="${3:-${NODE_ROLE:-}}"
+    local target_board="${4:-${TARGET_BOARD:-}}"
+    local stage_dir="${5:-${CLI_STAGE_DIR:-}}"
+
+    if brak_is_riscv32_mcu_target "$target_board" "$target_arch" "$stage_dir"; then
+        return 0
+    fi
+    if [[ "$node_role" == "snitchbench" || "$node_role" == "lilsnitch" ]]; then
+        return 0
+    fi
+    local dt_lc=""
+    dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "$dt_model")"
+    if [[ "$dt_lc" == *"esp32-p4"* || "$dt_lc" == *"esp32p4"* ]]; then
+        return 0
+    fi
+    if [[ -z "$target_board" ]] && brak_resolve_silicon "${BRAKERRAK_TARGET:-}" "$dt_model" >/dev/null 2>&1; then
+        if brak_is_riscv32_mcu_target "${TARGET_BOARD:-}" "$target_arch" "$stage_dir"; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+_reset_stop_databroker_services() {
+    local is_mcu="${1:-false}"
+    if [[ "$is_mcu" == "true" ]]; then
+        log_skip "MCU/riscv32 target; skipped DataBroker service teardown"
+    elif command -v systemctl >/dev/null 2>&1; then
+        systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
+        systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
+        systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service mosquitto.service 2>/dev/null || true
+        pkill -9 -u postgres 2>/dev/null || true
+    fi
+}
+
+_reset_legacy_compat_enabled() {
+    local raw="${BRAKERRAK_LEGACY_RVDK_COMPAT:-true}"
+    case "$raw" in
+        1|true|TRUE|yes|YES) return 0 ;;
+        *)                   return 1 ;;
+    esac
+}
+
+# Quarantined legacy RVDK cleanup used only when `rvdk reset` is unavailable and
+# BRAKERRAK_LEGACY_RVDK_COMPAT=true (scheduled for removal).
 _reset_legacy_rvdk_compat() {
+    if ! _reset_legacy_compat_enabled; then
+        log_fatal "Refusing _reset_legacy_rvdk_compat execution while BRAKERRAK_LEGACY_RVDK_COMPAT=false."
+    fi
     if command -v apt-get >/dev/null 2>&1; then
         apt-get -o DPkg::Lock::Timeout=120 purge -y "postgresql-18*" "postgresql-client-18*" "postgresql-common*" 2>/dev/null || true
         apt-get -o DPkg::Lock::Timeout=120 autoremove -y --purge >/dev/null 2>&1 || true
@@ -774,8 +908,10 @@ _reset_legacy_rvdk_compat() {
 
 _reset_rvdk_teardown() {
     local rvdk_cmd=""
-    if [[ -n "${RVDK_BIN:-}" && -x "${RVDK_BIN}" ]]; then
-        rvdk_cmd="${RVDK_BIN}"
+    if [[ -n "${RVDK_BIN+x}" ]]; then
+        if [[ -n "${RVDK_BIN}" && -x "${RVDK_BIN}" ]]; then
+            rvdk_cmd="${RVDK_BIN}"
+        fi
     elif command -v rvdk >/dev/null 2>&1; then
         rvdk_cmd="$(command -v rvdk)"
     fi
@@ -786,9 +922,15 @@ _reset_rvdk_teardown() {
             log_ok "Completed RVDK teardown via 'rvdk reset'"
             return 0
         fi
-        log_warn "'rvdk reset' failed or unsupported; falling back to _reset_legacy_rvdk_compat."
+        if ! _reset_legacy_compat_enabled; then
+            log_fatal "RVDK teardown failed: '${rvdk_cmd} reset' is unavailable or returned non-zero and BRAKERRAK_LEGACY_RVDK_COMPAT=false."
+        fi
+        log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; 'rvdk reset' delegation is canonical) — 'rvdk reset' failed or unsupported; running _reset_legacy_rvdk_compat."
     else
-        log_warn "'rvdk' CLI not found; running _reset_legacy_rvdk_compat."
+        if ! _reset_legacy_compat_enabled; then
+            log_fatal "RVDK teardown failed: 'rvdk' CLI is unavailable and BRAKERRAK_LEGACY_RVDK_COMPAT=false (refusing direct mutation of RVDK internal paths)."
+        fi
+        log_warn "DEPRECATED: BRAKERRAK_LEGACY_RVDK_COMPAT fallback active (scheduled for removal; 'rvdk reset' delegation is canonical) — 'rvdk' CLI not found; running _reset_legacy_rvdk_compat."
     fi
 
     _reset_legacy_rvdk_compat
@@ -846,7 +988,7 @@ _reset_main() {
 
     if [[ $EUID -ne 0 ]]; then
         if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]] && command -v sudo >/dev/null 2>&1; then
-            local _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,RVDK_BIN,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
+            local _sudo_preserve_env="BRAKERRAK_NODE_ENV,BRAKERRAK_RUNTIME_DIR,BRAKERRAK_NO_PROGBAR,BRAKERRAK_TARGET,BRAKERRAK_ENGINE_DIR,BRAKERRAK_REPO_URL,BRAKERRAK_BRANCH,BRAKERRAK_BASE_URL,BRAKERRAK_LEGACY_RVDK_COMPAT,BRAKERRAK_PGDG_BACKUP_DIR,BRAKERRAK_UMOUNT_RETRY_SLEEP,RVDK_BIN,RVDK_ENV_FILE,RVDK_BASE_URL,RVDK_NO_PROGBAR,NO_PROGBAR,APT_UPDATED,TERM,COLORTERM,LINES,COLUMNS,LANG,LC_ALL"
             exec sudo --preserve-env="$_sudo_preserve_env" bash "${BASH_SOURCE[0]}" "$@"
         else
             log_fatal "Run as root or via 'sudo brakerrak reset --confirm-destroy'."
@@ -955,19 +1097,16 @@ _reset_main() {
         log_fatal "Destructive Day-0 rollback requires --confirm-destroy flag."
     fi
 
-    local _is_sd_target="false"
-    local _dt_lc=""
-    _dt_lc="$(tr '[:upper:]' '[:lower:]' <<< "$DT_MODEL")"
-    if [[ "${STORAGE_MEDIA:-nvme}" == "sd" || "${TARGET_ARCH:-riscv64}" == "riscv32" || "${NODE_ROLE:-}" == "snitchbench" || "${NODE_ROLE:-}" == "lilsnitch" ]] \
-       || [[ "$_dt_lc" == *"esp32-p4"* || "$_dt_lc" == *"esp32p4"* ]]; then
-        _is_sd_target="true"
-    elif brak_resolve_silicon "${BRAKERRAK_TARGET:-}" "$DT_MODEL" >/dev/null 2>&1; then
-        if [[ "${TARGET_BOARD:-}" == "espressif-esp32p4" || "${STORAGE_MEDIA:-nvme}" == "sd" || "${TARGET_ARCH:-riscv64}" == "riscv32" ]]; then
-            _is_sd_target="true"
-        fi
+    local _is_mcu_target="false"
+    if _reset_is_mcu_target "$DT_MODEL" "${TARGET_ARCH:-riscv64}" "${NODE_ROLE:-}" "${TARGET_BOARD:-}"; then
+        _is_mcu_target="true"
+    fi
+    local _skip_nvme_wipe="false"
+    if [[ "$_is_mcu_target" == "true" || "${STORAGE_MEDIA:-nvme}" == "sd" ]]; then
+        _skip_nvme_wipe="true"
     fi
 
-    if [[ "$_is_sd_target" != "true" ]] && _reset_is_block_device "$NVME_DEV" && _reset_device_is_protected "$NVME_DEV"; then
+    if [[ "$_skip_nvme_wipe" != "true" ]] && _reset_is_block_device "$NVME_DEV" && _reset_device_is_protected "$NVME_DEV"; then
         log_fatal "Safety Interlock: ${NVME_DEV} backs an active OS filesystem (/, /boot, /boot/efi), root LVM/mapper volume, or active swap! Aborting."
     fi
 
@@ -1009,26 +1148,34 @@ _reset_main() {
     fi
 
     RUNTIME_DIR="$(brak_runtime_dir)"
-    PGDG_BACKUP_DIR="${RUNTIME_DIR}/pgdg-deb-backup"
+    export BRAKERRAK_RUNTIME_DIR="$RUNTIME_DIR"
+    PGDG_BACKUP_DIR="${BRAKERRAK_PGDG_BACKUP_DIR:-/var/cache/brakerrak/pgdg-deb-backup}"
+    case "$PGDG_BACKUP_DIR" in
+        ""|/|/var|/var/cache|/run|/run/*|/tmp|/etc|/usr|/home|/root|/boot)
+            log_fatal "Safety Interlock: refusing unsafe or tmpfs PGDG_BACKUP_DIR '${PGDG_BACKUP_DIR}'."
+            ;;
+    esac
 
     echo "=== 1. Stopping DataBroker Services & Handling .deb Cache (keep_cache=${KEEP_CACHE}) ==="
-    if [[ "$_is_sd_target" == "true" ]]; then
-        log_skip "SD/riscv32 target; skipped DataBroker service teardown"
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl stop postgresql "postgresql@*" mosquitto nfs-kernel-server nfs-server.service nfs-ganesha.service rvdk-thp-tune.service 2>/dev/null || true
-        systemctl disable nfs-kernel-server nfs-server.service nfs-ganesha.service mosquitto rvdk-thp-tune.service 2>/dev/null || true
-        systemctl reset-failed proc-fs-nfsd.mount nfs-server.service nfs-ganesha.service nfs-ganesha-lock.service mosquitto.service 2>/dev/null || true
-        pkill -9 -u postgres 2>/dev/null || true
-    fi
+    _reset_stop_databroker_services "$_is_mcu_target"
 
     RVDK_PG_DEBS="/var/lib/rvdk/pgdg-riscv64/debs"
     if [[ "$KEEP_CACHE" == "true" ]]; then
-        install -d -m 0700 -o 0 -g 0 "$PGDG_BACKUP_DIR"
+        if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+            install -d -m 0755 -o 0 -g 0 "$(dirname "$PGDG_BACKUP_DIR")"
+            rm -rf -- "${PGDG_BACKUP_DIR:?}"
+            install -d -m 0700 -o 0 -g 0 "$PGDG_BACKUP_DIR"
+        else
+            install -d -m 0755 "$(dirname "$PGDG_BACKUP_DIR")"
+            rm -rf -- "${PGDG_BACKUP_DIR:?}"
+            install -d -m 0700 "$PGDG_BACKUP_DIR"
+        fi
         cp -a "${RVDK_PG_DEBS}/"*.deb "${PGDG_BACKUP_DIR}/" 2>/dev/null || \
         cp -a /opt/drewv-pgdg-riscv64/debs/*.deb "${PGDG_BACKUP_DIR}/" 2>/dev/null || \
         cp -a "${MOUNT_POINT}/.pkg-cache/pgdg-riscv64/"*.deb "${PGDG_BACKUP_DIR}/" 2>/dev/null || true
     else
-        rm -rf "$PGDG_BACKUP_DIR"
+        rm -rf -- "${PGDG_BACKUP_DIR:?}"
+        rmdir --ignore-fail-on-non-empty /var/cache/brakerrak 2>/dev/null || true
     fi
 
     echo "=== 2. Unmounting Storage Tiers & Handling Rotational RAID Disks ==="
@@ -1172,7 +1319,7 @@ _reset_main() {
     fi
 
     echo "=== 3. Tearing Down LVM (${VG_NAME}) & Resetting ${NVME_DEV} to Factory 512e (512B) ==="
-    if [[ "$_is_sd_target" == "true" ]]; then
+    if [[ "$_skip_nvme_wipe" == "true" ]]; then
         CUR_LBA="n/a (sd)"
         log_skip "SD media target (STORAGE_MEDIA=${STORAGE_MEDIA}, TARGET_ARCH=${TARGET_ARCH}); skipping LVM (${VG_NAME}) and NVMe 512e teardown"
     elif _reset_is_block_device "$NVME_DEV"; then
@@ -1218,12 +1365,14 @@ _reset_main() {
                 _reset_report_active_holders "$NVME_DEV"
                 log_fatal "Safety Interlock: refusing nvme format while '${NVME_DEV}' or a descendant volume is mounted."
             fi
-            LBA_512_INDEX="$(nvme id-ns "$NVME_DEV" 2>/dev/null | awk '/lbads:9/ {print $2}' | tr -dc '0-9' | head -n1 || true)"
+            LBA_512_INDEX="$(_reset_select_512_lbaf "$NVME_DEV" || true)"
             if [[ -n "$LBA_512_INDEX" ]]; then
                 nvme format "$NVME_DEV" -l "$LBA_512_INDEX" -s 1 --force 2>/dev/null || nvme format "$NVME_DEV" -l "$LBA_512_INDEX" --force
                 partprobe "$NVME_DEV" 2>/dev/null || true
                 udevadm settle 2>/dev/null || true
                 sleep 2
+            else
+                log_warn "No metadata-free 512B LBA format (ms:0 lbads:9) advertised by ${NVME_DEV}; skipping nvme format."
             fi
         else
             log_skip "nvme-cli not installed; skipping 512e LBA format on ${NVME_DEV}"
@@ -1260,12 +1409,14 @@ _reset_main() {
         chmod 0755 /var/lib/rvdk /var/lib/rvdk/pgdg-riscv64 "$RVDK_PG_DEBS"
         cp -a "${PGDG_BACKUP_DIR}/"*.deb "$RVDK_PG_DEBS/"
         chmod 0644 "${RVDK_PG_DEBS}/"*.deb 2>/dev/null || true
-        rm -rf "$PGDG_BACKUP_DIR"
+        rm -rf -- "${PGDG_BACKUP_DIR:?}"
+        rmdir --ignore-fail-on-non-empty /var/cache/brakerrak 2>/dev/null || true
         log_ok "Restored cached PostgreSQL .deb packages to ${RVDK_PG_DEBS}"
     else
-        rm -rf "$PGDG_BACKUP_DIR"
+        rm -rf -- "${PGDG_BACKUP_DIR:?}"
+        rmdir --ignore-fail-on-non-empty /var/cache/brakerrak 2>/dev/null || true
     fi
-    if [[ "$_is_sd_target" != "true" ]] && command -v apt-get >/dev/null 2>&1; then
+    if [[ "$_is_mcu_target" != "true" ]] && command -v apt-get >/dev/null 2>&1; then
         apt-get -o DPkg::Lock::Timeout=120 update -q || true
     fi
 
@@ -1283,8 +1434,8 @@ _reset_main() {
         udevadm control --reload-rules 2>/dev/null && udevadm trigger 2>/dev/null || true
     fi
 
-    if [[ "$_is_sd_target" == "true" ]]; then
-        log_skip "SD/riscv32 target; skipped host hostname mutation"
+    if [[ "$_is_mcu_target" == "true" ]]; then
+        log_skip "MCU/riscv32 target; skipped host hostname mutation"
     elif command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "$RESET_HOSTNAME"
     else
@@ -1293,7 +1444,7 @@ _reset_main() {
         printf '%s\n' "$RESET_HOSTNAME" | brak_atomic_write /etc/hostname 0644 "$_hn_owner"
         hostname "$RESET_HOSTNAME"
     fi
-    if [[ "$_is_sd_target" != "true" ]]; then
+    if [[ "$_is_mcu_target" != "true" ]]; then
         _reset_update_hosts_file "$RESET_HOSTNAME" /etc/hosts
     fi
 

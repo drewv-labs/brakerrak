@@ -6,7 +6,7 @@
 # Usage:
 #   sudo ./benchmarks/run-iouring-showdown.sh [options]
 #   sudo brakerrak bench showdown [--concurrencies 16,32,64] [--sync-zero-baseline] \
-#       [--io-workers 3] [--warm-cache] [--analyze]
+#       [--io-workers 3] [--work-mem 64MB] [--warm-cache] [--analyze]
 # ==============================================================================
 
 if [[ -n "${ZSH_VERSION:-}" ]]; then
@@ -159,10 +159,11 @@ Options:
   --sync-zero-baseline    Also run effective_io_concurrency=0 strict blocking baseline for sync
   --io-workers <N>        PostgreSQL 18 io_workers setting (default: scaled to hart count)
   --gather-workers <N>    max_parallel_workers_per_gather for Workload A (default: harts - 1)
+  --work-mem <size>       Session work_mem override for Workload B bitmap scan (e.g., 64MB)
   --iterations <N>        Number of full matrix iterations (default: 3)
   --randomize-order       Deterministically shuffle pass order per iteration
   --seed <int>            Integer PRNG seed for --randomize-order (default: UTC epoch if omitted)
-  --cooldown-sec <int>    Cooldown sleep in seconds between passes (default: 0)
+  --cooldown-sec <int>    Cooldown sleep in seconds between passes before isolation (default: 0)
   --autovacuum-timeout-sec <int>
                           Max seconds to wait for active autovacuum on target table (default: 60)
   --require-governor <g>  Require active CPU scaling governor (e.g., performance)
@@ -174,7 +175,7 @@ Options:
   --pg-user <user>        PostgreSQL superuser role (default: postgres)
   --pg-service <unit>     PostgreSQL systemd unit name (default: postgresql)
   --warm-cache            Run an isolated pg_prewarm warm-cache phase after cold-cache passes
-  --allow-warm-spill      Allow --warm-cache even when relation+indexes exceed shared_buffers
+  --allow-warm-spill      Allow --warm-cache even when relation+indexes exceed 90% of shared_buffers
   --analyze               Run analyze_showdown.py automatically upon completion
   -h, --help              Show this help message and exit
 EOF
@@ -189,6 +190,55 @@ validate_pg_ident() {
     if (( ${#ident} > 63 )); then
         log_fatal "Invalid ${label} '${ident}': exceeds PostgreSQL 63-byte identifier limit"
     fi
+}
+
+pg_size_to_bytes() {
+    local raw="${1:-}"
+    if [[ "$raw" =~ ^([1-9][0-9]*)(B|kB|MB|GB|TB)$ ]]; then
+        local num="${BASH_REMATCH[1]}"
+        local unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            B)  printf '%s' "$num" ;;
+            kB) printf '%s' "$(( num * 1024 ))" ;;
+            MB) printf '%s' "$(( num * 1024 * 1024 ))" ;;
+            GB) printf '%s' "$(( num * 1024 * 1024 * 1024 ))" ;;
+            TB) printf '%s' "$(( num * 1024 * 1024 * 1024 * 1024 ))" ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+validate_work_mem_literal() {
+    local val="${1:-}"
+    local bytes=""
+    if ! bytes="$(pg_size_to_bytes "$val")"; then
+        log_fatal "Invalid --work-mem '${val}': expected positive PostgreSQL size literal with unit (B, kB, MB, GB, TB), e.g. 64MB"
+    fi
+    if (( bytes < 65536 )); then
+        log_fatal "Invalid --work-mem '${val}': must be at least 64kB (65536 B), PostgreSQL's minimum work_mem"
+    fi
+}
+
+check_work_mem_floor() {
+    local active_wm="${1:-${PG_WORK_MEM:-}}"
+    local wm_bytes="${2:-}"
+    if [[ -z "$wm_bytes" || ! "$wm_bytes" =~ ^[0-9]+$ ]]; then
+        wm_bytes="$(pg_size_to_bytes "$active_wm" || true)"
+    fi
+    if [[ "$wm_bytes" =~ ^[0-9]+$ ]] && (( wm_bytes < 67108864 )); then
+        log_warn "Active PostgreSQL work_mem is '${active_wm}' (${wm_bytes} B < 64MB); bitmap heap scans may degrade to lossy blocks (pass --work-mem 64MB or higher)."
+    fi
+}
+
+build_workload_b_session() {
+    local wm="${1:-${WORK_MEM:-}}"
+    local sql="SET enable_seqscan = off; SET enable_indexscan = off; SET enable_indexonlyscan = off; SET max_parallel_workers_per_gather = 0;"
+    if [[ -n "$wm" ]]; then
+        validate_work_mem_literal "$wm"
+        sql+=" SET work_mem = '${wm}';"
+    fi
+    printf '%s' "$sql"
 }
 
 json_escape() {
@@ -455,6 +505,26 @@ detect_loadavg() {
     fi
 }
 
+check_pre_quiescent() {
+    local loadavg="${1:-${PRE_LOADAVG:-unavailable}}"
+    local harts="${2:-${HARTS:-1}}"
+    local load1
+    load1="$(awk '{print $1}' <<< "$loadavg")"
+    if [[ "$load1" =~ ^[0-9]+(\.[0-9]+)?$ && "$harts" =~ ^[1-9][0-9]*$ ]]; then
+        local threshold
+        threshold="$(awk -v h="$harts" 'BEGIN { printf "%.2f", 0.5 * h }')"
+        if awk -v l="$load1" -v h="$harts" 'BEGIN { exit !(l >= (0.5 * h)) }'; then
+            PRE_QUIESCENT_OK="false"
+            log_warn "Pre-run host is not quiescent: 1-minute loadavg (${load1}) >= ${threshold} (0.5 * ${harts} harts)."
+        else
+            PRE_QUIESCENT_OK="true"
+        fi
+    else
+        PRE_QUIESCENT_OK="false"
+        log_warn "Pre-run loadavg '${loadavg}' unavailable; recording pre_quiescent_ok=false."
+    fi
+}
+
 detect_nvme_logical_block_size() {
     local sys_root="${BRAKERRAK_SYSFS_ROOT:-/sys}"
     local nvme_short="${NVME_SHORT:-nvme0n1}"
@@ -504,14 +574,19 @@ check_warm_cache_fit() {
     fi
 
     if [[ "$rel_bytes" =~ ^[0-9]+$ && "$sb_bytes" =~ ^[0-9]+$ ]]; then
-        if (( rel_bytes <= sb_bytes )); then
+        local occ_pct="unavailable"
+        if (( sb_bytes > 0 )); then
+            occ_pct="$(awk -v r="$rel_bytes" -v s="$sb_bytes" 'BEGIN { printf "%.1f", (r * 100.0) / s }')"
+        fi
+        if (( sb_bytes > 0 && rel_bytes * 10 <= sb_bytes * 9 )); then
             PREWARM_FIT_SHARED_BUFFERS="true"
+            log_ok "Warm-cache relation '${table_name}' occupies ${occ_pct}% of shared_buffers (${rel_bytes} B / ${sb_bytes} B; >=10% headroom)."
         else
             PREWARM_FIT_SHARED_BUFFERS="false"
             if [[ "$allow_spill" == "true" ]]; then
-                log_warn "Relation '${table_name}' (${rel_bytes} B) exceeds shared_buffers (${sb_bytes} B); continuing due to --allow-warm-spill (prewarm_fit_shared_buffers=false)."
+                log_warn "Relation '${table_name}' (${rel_bytes} B) occupies ${occ_pct}% of shared_buffers (${sb_bytes} B), exceeding 90.0% ceiling (10% buffer-pool headroom); continuing due to --allow-warm-spill (prewarm_fit_shared_buffers=false)."
             else
-                log_fatal "Relation '${table_name}' (${rel_bytes} B) exceeds shared_buffers (${sb_bytes} B); warm-cache pass cannot fit in shared_buffers (pass --allow-warm-spill to permit partial spill)."
+                log_fatal "Relation '${table_name}' (${rel_bytes} B) occupies ${occ_pct}% of shared_buffers (${sb_bytes} B), exceeding 90.0% ceiling (requires >=10% buffer-pool headroom); pass --allow-warm-spill to permit partial spill."
             fi
         fi
     else
@@ -582,6 +657,287 @@ wait_for_autovacuum_clear() {
     log_warn "Autovacuum worker(s) (${active_av}) still active on '${db_name}.${tbl}' after ${timeout_sec}s; proceeding with benchmark pass."
 }
 
+wait_for_postgres_ready() {
+    local attempts="${1:-60}"
+    local pg_user="${PG_USER:-postgres}"
+    local i
+    for (( i=1; i<=attempts; i++ )); do
+        if command -v pg_isready >/dev/null 2>&1; then
+            if sudo -u "$pg_user" pg_isready -q 2>/dev/null; then
+                return 0
+            fi
+        else
+            if run_psql postgres -tAc "SELECT 1;" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+wait_for_postgres() {
+    if ! wait_for_postgres_ready 60; then
+        log_fatal "PostgreSQL did not become ready within 30s after start/restart."
+    fi
+}
+
+restore_one_guc() {
+    local guc_name="$1"
+    local auto_val="$2"
+    if [[ -n "$auto_val" ]]; then
+        local escaped_val="${auto_val//\'/\'\'}"
+        run_psql postgres -q -c "ALTER SYSTEM SET ${guc_name} = '${escaped_val}';" || true
+    else
+        run_psql postgres -q -c "ALTER SYSTEM RESET ${guc_name};" || true
+    fi
+}
+
+restore_auto_conf_from_backup() {
+    local auto_existed="${AUTO_CONF_EXISTED:-false}"
+    local auto_backup="${AUTO_CONF_BACKUP:-}"
+    local auto_path="${AUTO_CONF_PATH:-}"
+    local pg_user="${PG_USER:-postgres}"
+
+    if [[ "$auto_existed" == "true" ]]; then
+        if [[ -n "$auto_backup" && -f "$auto_backup" ]]; then
+            local tmp_restore="${auto_path}.brakerrak.restore.$$"
+            cp "$auto_backup" "$tmp_restore"
+            chown "${pg_user}:${pg_user}" "$tmp_restore" 2>/dev/null || chown "$pg_user" "$tmp_restore" 2>/dev/null || true
+            chmod 0600 "$tmp_restore"
+            mv -f "$tmp_restore" "$auto_path"
+            return 0
+        fi
+        log_warn "Pre-run postgresql.auto.conf backup '${auto_backup:-<unset>}' is missing; cannot restore ${auto_path} from snapshot."
+        return 1
+    elif [[ "$auto_existed" == "false" && -n "$auto_path" && -f "$auto_path" ]]; then
+        rm -f "$auto_path"
+    fi
+    return 0
+}
+
+restore_pg_gucs() {
+    local orig_rc="${1:-$?}"
+    local pg_service="${PG_SERVICE:-postgresql}"
+    if [[ "${GUC_MUTATED:-false}" != "true" || "${GUC_RESTORED:-false}" == "true" ]]; then
+        if ! declare -F _brak_cleanup_tmpfiles >/dev/null 2>&1; then
+            if [[ -n "${AUTO_CONF_BACKUP:-}" && -f "${AUTO_CONF_BACKUP:-}" ]]; then
+                rm -f "$AUTO_CONF_BACKUP" || true
+            fi
+        fi
+        return "$orig_rc"
+    fi
+    GUC_RESTORED="true"
+    set +e
+
+    log_step "Restoring initial PostgreSQL GUCs in postgresql.auto.conf"
+    if ! systemctl is-active --quiet "$pg_service"; then
+        systemctl start "$pg_service" || true
+    fi
+
+    local restored_via_backup="false"
+    local backup_failed="false"
+    if wait_for_postgres_ready 30; then
+        restore_one_guc "io_method" "${AUTO_IO_METHOD:-}"
+        restore_one_guc "io_workers" "${AUTO_IO_WORKERS:-}"
+        restore_one_guc "effective_io_concurrency" "${AUTO_EIC:-}"
+        restore_one_guc "track_io_timing" "${AUTO_TRACK_IO_TIMING:-}"
+        if [[ "${WITH_DIRECT_IO:-false}" == "true" ]]; then
+            restore_one_guc "debug_io_direct" "${AUTO_DEBUG_IO_DIRECT:-}"
+        fi
+        systemctl restart "$pg_service" || true
+        if ! wait_for_postgres_ready 30; then
+            log_warn "PostgreSQL restart failed after ALTER SYSTEM restore; falling back to postgresql.auto.conf backup."
+            systemctl stop "$pg_service" || true
+            if restore_auto_conf_from_backup; then
+                restored_via_backup="true"
+            else
+                backup_failed="true"
+            fi
+            systemctl start "$pg_service" || true
+            wait_for_postgres_ready 30 || true
+        fi
+    else
+        log_warn "PostgreSQL unreachable; restoring ${AUTO_CONF_PATH:-postgresql.auto.conf} directly from pre-run backup."
+        systemctl stop "$pg_service" || true
+        if restore_auto_conf_from_backup; then
+            restored_via_backup="true"
+        else
+            backup_failed="true"
+        fi
+        systemctl start "$pg_service" || true
+        wait_for_postgres_ready 30 || true
+    fi
+
+    if ! declare -F _brak_cleanup_tmpfiles >/dev/null 2>&1; then
+        if [[ -n "${AUTO_CONF_BACKUP:-}" && -f "${AUTO_CONF_BACKUP:-}" ]]; then
+            rm -f "$AUTO_CONF_BACKUP" || true
+        fi
+    fi
+
+    if [[ "$backup_failed" == "true" ]]; then
+        log_warn "Failed to restore PostgreSQL configuration from pre-run postgresql.auto.conf snapshot."
+    elif [[ "$restored_via_backup" == "true" ]]; then
+        log_ok "Restored PostgreSQL configuration from pre-run postgresql.auto.conf snapshot"
+    else
+        log_ok "Restored PostgreSQL GUCs (io_method=${INIT_IO_METHOD:-}, io_workers=${INIT_IO_WORKERS:-}, effective_io_concurrency=${INIT_EIC:-}, track_io_timing=${INIT_TRACK_IO_TIMING:-}, debug_io_direct=${INIT_DEBUG_IO_DIRECT:-off})"
+    fi
+    return "$orig_rc"
+}
+
+capture_diskstats() {
+    local out_file="$1"
+    local nvme_short="${NVME_SHORT:-nvme0n1}"
+    if [[ -r /proc/diskstats ]]; then
+        awk -v dev="$nvme_short" '$3 == dev { print; exit }' /proc/diskstats > "$out_file" || true
+    else
+        : > "$out_file"
+    fi
+}
+
+run_inter_pass_cooldown() {
+    if (( ${PASS_EXECUTED_COUNT:-0} > 0 && ${COOLDOWN_SEC:-0} > 0 )); then
+        log_brak "Cooldown sleep ${COOLDOWN_SEC}s before next pass isolation..."
+        sleep "$COOLDOWN_SEC"
+    fi
+}
+
+execute_workload_pass() {
+    local iteration="$1"
+    local pass_order_idx="$2"
+    local cache_mode="$3"
+    local method="$4"
+    local concurrency="$5"
+    local workload="$6"
+    local workload_label="$7"
+    local session_sql="$8"
+    local explain_sql="$9"
+
+    local db_name="${DB_NAME:-brakerrak}"
+    local pg_user="${PG_USER:-postgres}"
+    local iter_tag
+    iter_tag="$(printf 'iter_%02d' "$iteration")"
+    local pass_slug="${cache_mode}__${method}__eic${concurrency}__${workload}"
+    local pass_dir="${PASSES_DIR}/${iter_tag}/${pass_slug}"
+    install -d -m 0750 "$pass_dir"
+
+    local explain_file="${pass_dir}/explain.json"
+    local pg_stat_io_file="${pass_dir}/pg_stat_io.json"
+    local perf_file="${pass_dir}/perf_stat.json"
+    local disk_before="${pass_dir}/diskstats_before.txt"
+    local disk_after="${pass_dir}/diskstats_after.txt"
+    local meta_file="${pass_dir}/pass_meta.json"
+
+    local pass_io_direct
+    pass_io_direct="$(run_psql "$db_name" -tAc "SHOW debug_io_direct;" 2>/dev/null || echo "")"
+    [[ -z "$pass_io_direct" ]] && pass_io_direct="off"
+
+    local pass_governor
+    pass_governor="$(detect_scaling_governor)"
+    [[ -z "$pass_governor" ]] && pass_governor="${SCALING_GOVERNOR:-unavailable}"
+
+    log_brak "[${iter_tag}][${cache_mode}] io_method=${method} | eic=${concurrency} | io_direct=${pass_io_direct} | ${workload_label}"
+
+    wait_for_autovacuum_clear
+    reset_pg_stats
+
+    local pre_soc_temp pre_nvme_temp pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max
+    pre_soc_temp="$(detect_soc_temp_c)"
+    pre_nvme_temp="$(detect_nvme_temp_c)"
+    read -r pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
+
+    local started_utc finished_utc start_ns end_ns wall_ms
+    started_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    start_ns="$(date +%s%N 2>/dev/null || echo $(( $(date +%s) * 1000000000 )))"
+
+    capture_diskstats "$disk_before"
+
+    if [[ "${PERF_AVAILABLE:-false}" == "true" ]]; then
+        perf stat -a -j -o "$perf_file" -e "${PERF_EVENTS_CSV:-}" -- \
+            sudo -u "$pg_user" psql -X -U "$pg_user" -d "$db_name" -v ON_ERROR_STOP=1 -q -t -A \
+            -c "$session_sql" \
+            -c "$explain_sql" \
+            > "$explain_file"
+    else
+        : > "$perf_file"
+        run_psql "$db_name" -q -t -A \
+            -c "$session_sql" \
+            -c "$explain_sql" \
+            > "$explain_file"
+    fi
+
+    capture_diskstats "$disk_after"
+
+    end_ns="$(date +%s%N 2>/dev/null || echo $(( $(date +%s) * 1000000000 )))"
+    finished_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "$start_ns" =~ ^[0-9]+$ && "$end_ns" =~ ^[0-9]+$ ]]; then
+        wall_ms="$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { d = (e - s) / 1000000.0; if (d < 0) d = 0; printf "%.3f", d }')"
+    else
+        wall_ms="0"
+    fi
+
+    local post_soc_temp post_nvme_temp post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max
+    post_soc_temp="$(detect_soc_temp_c)"
+    post_nvme_temp="$(detect_nvme_temp_c)"
+    read -r post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
+
+    run_psql "$db_name" -q -t -A -c "
+        SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)
+        FROM (
+            SELECT *
+            FROM pg_stat_io
+            WHERE reads > 0 OR hits > 0 OR writes > 0 OR extends > 0 OR evictions > 0
+            ORDER BY reads DESC, hits DESC
+        ) t;
+    " > "$pg_stat_io_file"
+
+    local pass_prewarm_fit="null"
+    if [[ "$cache_mode" == "warm" ]]; then
+        pass_prewarm_fit="${PREWARM_FIT_SHARED_BUFFERS:-null}"
+    fi
+
+    atomic_write_from_stdin "$meta_file" <<EOF
+{
+  "run_id": "$(json_escape "${RUN_ID:-}")",
+  "node_id": "$(json_escape "${NODE_HOST:-}")",
+  "iteration": ${iteration},
+  "pass_order_index": ${pass_order_idx},
+  "cache_mode": "$(json_escape "$cache_mode")",
+  "io_method": "$(json_escape "$method")",
+  "io_direct": "$(json_escape "$pass_io_direct")",
+  "with_direct_io": ${WITH_DIRECT_IO:-false},
+  "effective_io_concurrency": ${concurrency},
+  "io_workers": ${IO_WORKERS:-1},
+  "gather_workers": ${GATHER_WORKERS:-0},
+  "workload": "$(json_escape "$workload")",
+  "workload_label": "$(json_escape "$workload_label")",
+  "nvme_short": "$(json_escape "${NVME_SHORT:-nvme0n1}")",
+  "scaling_governor": "$(json_escape "$pass_governor")",
+  "shared_buffers": "$(json_escape "${PG_SHARED_BUFFERS:-unknown}")",
+  "work_mem": "$(json_escape "${PG_WORK_MEM:-unknown}")",
+  "huge_pages_status": "$(json_escape "${PG_HUGE_PAGES_STATUS:-unknown}")",
+  "nvme_logical_block_size": $(json_num_or_null "${NVME_LOGICAL_BLOCK_SIZE:-}"),
+  "prewarm_fit_shared_buffers": ${pass_prewarm_fit},
+  "pre_soc_temp_c": $(json_num_or_null "$pre_soc_temp"),
+  "post_soc_temp_c": $(json_num_or_null "$post_soc_temp"),
+  "pre_nvme_temp_c": $(json_num_or_null "$pre_nvme_temp"),
+  "post_nvme_temp_c": $(json_num_or_null "$post_nvme_temp"),
+  "pre_cpu_mhz": $(json_num_or_null "$pre_cpu_mhz"),
+  "pre_cpu_mhz_min": $(json_num_or_null "$pre_cpu_mhz_min"),
+  "pre_cpu_mhz_max": $(json_num_or_null "$pre_cpu_mhz_max"),
+  "post_cpu_mhz": $(json_num_or_null "$post_cpu_mhz"),
+  "post_cpu_mhz_min": $(json_num_or_null "$post_cpu_mhz_min"),
+  "post_cpu_mhz_max": $(json_num_or_null "$post_cpu_mhz_max"),
+  "started_at_utc": "${started_utc}",
+  "finished_at_utc": "${finished_utc}",
+  "wall_duration_ms": ${wall_ms}
+}
+EOF
+
+    PASS_EXECUTED_COUNT=$(( ${PASS_EXECUTED_COUNT:-0} + 1 ))
+    log_ok "Captured ${iter_tag}/${pass_slug} (${wall_ms} ms wall)"
+}
+
 if [[ "${BASH_SOURCE[0]:-$0}" != "$0" ]] && [[ "${BRAKERRAK_SHOWDOWN_PROBES_ONLY:-false}" == "true" ]]; then
     return 0
 fi
@@ -594,6 +950,7 @@ CONCURRENCIES_CSV="${CONCURRENCIES_CSV:-16,32,64}"
 SYNC_ZERO_BASELINE="${SYNC_ZERO_BASELINE:-false}"
 IO_WORKERS="${IO_WORKERS:-$(default_io_workers_for_harts "$HARTS")}"
 GATHER_WORKERS="${GATHER_WORKERS:-$(( HARTS > 1 ? HARTS - 1 : 0 ))}"
+WORK_MEM="${WORK_MEM:-}"
 ITERATIONS="${ITERATIONS:-3}"
 RANDOMIZE_ORDER="${RANDOMIZE_ORDER:-false}"
 PRNG_SEED="${PRNG_SEED:-}"
@@ -683,6 +1040,16 @@ while [[ $# -gt 0 ]]; do
         --gather-workers=*)
             GATHER_WORKERS="${1#*=}"
             brak_require_arg "--gather-workers" "$GATHER_WORKERS"
+            shift
+            ;;
+        --work-mem)
+            brak_require_arg "$1" "${2:-}"
+            WORK_MEM="$2"
+            shift 2
+            ;;
+        --work-mem=*)
+            WORK_MEM="${1#*=}"
+            brak_require_arg "--work-mem" "$WORK_MEM"
             shift
             ;;
         --iterations)
@@ -848,6 +1215,9 @@ fi
 if [[ ! "$GATHER_WORKERS" =~ ^[0-9]+$ ]]; then
     log_fatal "Invalid --gather-workers '${GATHER_WORKERS}': must be a non-negative integer"
 fi
+if [[ -n "$WORK_MEM" ]]; then
+    validate_work_mem_literal "$WORK_MEM"
+fi
 if [[ ! "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
     log_fatal "Invalid --iterations '${ITERATIONS}': must be a positive integer"
 fi
@@ -913,30 +1283,6 @@ for req_bin in systemctl psql sudo; do
     fi
 done
 
-wait_for_postgres_ready() {
-    local attempts="${1:-60}"
-    local i
-    for (( i=1; i<=attempts; i++ )); do
-        if command -v pg_isready >/dev/null 2>&1; then
-            if sudo -u "$PG_USER" pg_isready -q 2>/dev/null; then
-                return 0
-            fi
-        else
-            if run_psql postgres -tAc "SELECT 1;" >/dev/null 2>&1; then
-                return 0
-            fi
-        fi
-        sleep 0.5
-    done
-    return 1
-}
-
-wait_for_postgres() {
-    if ! wait_for_postgres_ready 60; then
-        log_fatal "PostgreSQL did not become ready within 30s after start/restart."
-    fi
-}
-
 if ! systemctl is-active --quiet "$PG_SERVICE"; then
     log_fatal "PostgreSQL service '${PG_SERVICE}' is not active. Start PostgreSQL before running showdown."
 fi
@@ -992,6 +1338,7 @@ INIT_IO_WORKERS="$(run_psql "$DB_NAME" -tAc "SHOW io_workers;")"
 INIT_EIC="$(run_psql "$DB_NAME" -tAc "SHOW effective_io_concurrency;")"
 INIT_TRACK_IO_TIMING="$(run_psql "$DB_NAME" -tAc "SHOW track_io_timing;")"
 INIT_DEBUG_IO_DIRECT="$(run_psql "$DB_NAME" -tAc "SHOW debug_io_direct;" 2>/dev/null || echo "")"
+INIT_WORK_MEM="$(run_psql "$DB_NAME" -tAc "SHOW work_mem;" 2>/dev/null || echo "unknown")"
 
 AUTO_IO_METHOD="$(query_auto_guc "io_method")"
 AUTO_IO_WORKERS="$(query_auto_guc "io_workers")"
@@ -1014,83 +1361,6 @@ fi
 
 GUC_MUTATED="false"
 GUC_RESTORED="false"
-
-restore_one_guc() {
-    local guc_name="$1"
-    local auto_val="$2"
-    if [[ -n "$auto_val" ]]; then
-        local escaped_val="${auto_val//\'/\'\'}"
-        run_psql postgres -q -c "ALTER SYSTEM SET ${guc_name} = '${escaped_val}';" || true
-    else
-        run_psql postgres -q -c "ALTER SYSTEM RESET ${guc_name};" || true
-    fi
-}
-
-restore_auto_conf_from_backup() {
-    if [[ "$AUTO_CONF_EXISTED" == "true" && -n "$AUTO_CONF_BACKUP" && -f "$AUTO_CONF_BACKUP" ]]; then
-        local tmp_restore="${AUTO_CONF_PATH}.brakerrak.restore.$$"
-        cp "$AUTO_CONF_BACKUP" "$tmp_restore"
-        chown "${PG_USER}:${PG_USER}" "$tmp_restore" 2>/dev/null || chown "$PG_USER" "$tmp_restore" 2>/dev/null || true
-        chmod 0600 "$tmp_restore"
-        mv -f "$tmp_restore" "$AUTO_CONF_PATH"
-    elif [[ "$AUTO_CONF_EXISTED" == "false" && -f "$AUTO_CONF_PATH" ]]; then
-        rm -f "$AUTO_CONF_PATH"
-    fi
-}
-
-restore_pg_gucs() {
-    local orig_rc=$?
-    if [[ "$GUC_MUTATED" != "true" || "$GUC_RESTORED" == "true" ]]; then
-        if [[ -n "$AUTO_CONF_BACKUP" && -f "$AUTO_CONF_BACKUP" ]]; then
-            rm -f "$AUTO_CONF_BACKUP" || true
-        fi
-        return "$orig_rc"
-    fi
-    GUC_RESTORED="true"
-    set +e
-
-    log_step "Restoring initial PostgreSQL GUCs in postgresql.auto.conf"
-    if ! systemctl is-active --quiet "$PG_SERVICE"; then
-        systemctl start "$PG_SERVICE" || true
-    fi
-
-    local restored_via_backup="false"
-    if wait_for_postgres_ready 30; then
-        restore_one_guc "io_method" "$AUTO_IO_METHOD"
-        restore_one_guc "io_workers" "$AUTO_IO_WORKERS"
-        restore_one_guc "effective_io_concurrency" "$AUTO_EIC"
-        restore_one_guc "track_io_timing" "$AUTO_TRACK_IO_TIMING"
-        if [[ "$WITH_DIRECT_IO" == "true" ]]; then
-            restore_one_guc "debug_io_direct" "$AUTO_DEBUG_IO_DIRECT"
-        fi
-        systemctl restart "$PG_SERVICE" || true
-        if ! wait_for_postgres_ready 30; then
-            log_warn "PostgreSQL restart failed after ALTER SYSTEM restore; falling back to postgresql.auto.conf backup."
-            systemctl stop "$PG_SERVICE" || true
-            restore_auto_conf_from_backup
-            systemctl start "$PG_SERVICE" || true
-            wait_for_postgres_ready 30 || true
-            restored_via_backup="true"
-        fi
-    else
-        log_warn "PostgreSQL unreachable; restoring ${AUTO_CONF_PATH} directly from pre-run backup."
-        systemctl stop "$PG_SERVICE" || true
-        restore_auto_conf_from_backup
-        systemctl start "$PG_SERVICE" || true
-        wait_for_postgres_ready 30 || true
-        restored_via_backup="true"
-    fi
-
-    if [[ -n "$AUTO_CONF_BACKUP" && -f "$AUTO_CONF_BACKUP" ]]; then
-        rm -f "$AUTO_CONF_BACKUP" || true
-    fi
-    if [[ "$restored_via_backup" == "true" ]]; then
-        log_ok "Restored PostgreSQL configuration from pre-run postgresql.auto.conf snapshot"
-    else
-        log_ok "Restored PostgreSQL GUCs (io_method=${INIT_IO_METHOD}, io_workers=${INIT_IO_WORKERS}, effective_io_concurrency=${INIT_EIC}, track_io_timing=${INIT_TRACK_IO_TIMING}, debug_io_direct=${INIT_DEBUG_IO_DIRECT:-off})"
-    fi
-    return "$orig_rc"
-}
 
 handle_signal() {
     local sig="$1"
@@ -1125,6 +1395,8 @@ read -r PRE_CPU_MHZ PRE_CPU_MHZ_MIN PRE_CPU_MHZ_MAX <<< "$(detect_cpu_mhz_stats)
 PRE_SOC_TEMP_C="$(detect_soc_temp_c)"
 PRE_NVME_TEMP_C="$(detect_nvme_temp_c)"
 PRE_LOADAVG="$(detect_loadavg)"
+PRE_QUIESCENT_OK="true"
+check_pre_quiescent "$PRE_LOADAVG" "$HARTS"
 NVME_LOGICAL_BLOCK_SIZE="$(detect_nvme_logical_block_size)"
 PG_DATA_FSTYPE="$(detect_pg_mount_field FSTYPE)"
 PG_DATA_FSTYPE="${PG_DATA_FSTYPE:-unknown}"
@@ -1133,6 +1405,17 @@ XFS_MOUNT_OPTIONS="${XFS_MOUNT_OPTIONS:-unknown}"
 
 PG_SHARED_BUFFERS="$(run_psql "$DB_NAME" -tAc "SHOW shared_buffers;" 2>/dev/null || echo "unknown")"
 PG_SHARED_BUFFERS_BYTES="$(run_psql "$DB_NAME" -tAc "SELECT pg_size_bytes(current_setting('shared_buffers'));" 2>/dev/null || echo "")"
+if [[ -n "$WORK_MEM" ]]; then
+    PG_WORK_MEM="$(run_psql "$DB_NAME" -q -tA -c "SET work_mem = '${WORK_MEM}';" -c "SHOW work_mem;" 2>/dev/null | tail -n1 || echo "$WORK_MEM")"
+    [[ -z "$PG_WORK_MEM" ]] && PG_WORK_MEM="$WORK_MEM"
+    PG_WORK_MEM_BYTES="$(run_psql "$DB_NAME" -q -tA -c "SET work_mem = '${WORK_MEM}';" -c "SELECT pg_size_bytes(current_setting('work_mem'));" 2>/dev/null | tail -n1 || pg_size_to_bytes "$PG_WORK_MEM" || echo "")"
+else
+    PG_WORK_MEM="$INIT_WORK_MEM"
+    [[ -z "$PG_WORK_MEM" ]] && PG_WORK_MEM="unknown"
+    PG_WORK_MEM_BYTES="$(run_psql "$DB_NAME" -tAc "SELECT pg_size_bytes(current_setting('work_mem'));" 2>/dev/null || pg_size_to_bytes "$PG_WORK_MEM" || echo "")"
+fi
+check_work_mem_floor "$PG_WORK_MEM" "$PG_WORK_MEM_BYTES"
+
 PG_HUGE_PAGES_STATUS="$(run_psql "$DB_NAME" -tAc "SHOW huge_pages_status;" 2>/dev/null || run_psql "$DB_NAME" -tAc "SHOW huge_pages;" 2>/dev/null || echo "unknown")"
 PG_IO_COMBINE_LIMIT="$(run_psql "$DB_NAME" -tAc "SHOW io_combine_limit;" 2>/dev/null || echo "unknown")"
 PG_IO_MAX_CONCURRENCY="$(run_psql "$DB_NAME" -tAc "SHOW io_max_concurrency;" 2>/dev/null || echo "unknown")"
@@ -1350,8 +1633,10 @@ atomic_write_from_stdin "${RUN_DIR}/metadata.json" <<EOF
   "soc_temp_c": $(json_num_or_null "$PRE_SOC_TEMP_C"),
   "nvme_temp_c": $(json_num_or_null "$PRE_NVME_TEMP_C"),
   "loadavg": "$(json_escape "$PRE_LOADAVG")",
+  "pre_quiescent_ok": ${PRE_QUIESCENT_OK},
   "shared_buffers": "$(json_escape "$PG_SHARED_BUFFERS")",
   "shared_buffers_bytes": $(json_num_or_null "$PG_SHARED_BUFFERS_BYTES"),
+  "work_mem": "$(json_escape "$PG_WORK_MEM")",
   "total_relation_bytes": $(json_num_or_null "$TOTAL_REL_BYTES"),
   "prewarm_fit_shared_buffers": ${PREWARM_FIT_SHARED_BUFFERS},
   "huge_pages_status": "$(json_escape "$PG_HUGE_PAGES_STATUS")",
@@ -1371,7 +1656,8 @@ atomic_write_from_stdin "${RUN_DIR}/metadata.json" <<EOF
     "io_workers": "$(json_escape "$INIT_IO_WORKERS")",
     "effective_io_concurrency": "$(json_escape "$INIT_EIC")",
     "track_io_timing": "$(json_escape "$INIT_TRACK_IO_TIMING")",
-    "debug_io_direct": "$(json_escape "$INIT_DEBUG_IO_DIRECT")"
+    "debug_io_direct": "$(json_escape "$INIT_DEBUG_IO_DIRECT")",
+    "work_mem": "$(json_escape "$INIT_WORK_MEM")"
   }
 }
 EOF
@@ -1454,153 +1740,7 @@ cold_cache_isolate() {
     reset_pg_stats
 }
 
-capture_diskstats() {
-    local out_file="$1"
-    if [[ -r /proc/diskstats ]]; then
-        awk -v dev="$NVME_SHORT" '$3 == dev { print; exit }' /proc/diskstats > "$out_file" || true
-    else
-        : > "$out_file"
-    fi
-}
-
 PASS_EXECUTED_COUNT=0
-
-execute_workload_pass() {
-    local iteration="$1"
-    local pass_order_idx="$2"
-    local cache_mode="$3"
-    local method="$4"
-    local concurrency="$5"
-    local workload="$6"
-    local workload_label="$7"
-    local session_sql="$8"
-    local explain_sql="$9"
-
-    if (( PASS_EXECUTED_COUNT > 0 && COOLDOWN_SEC > 0 )); then
-        log_brak "Cooldown sleep ${COOLDOWN_SEC}s before next pass..."
-        sleep "$COOLDOWN_SEC"
-    fi
-
-    wait_for_autovacuum_clear
-
-    local iter_tag
-    iter_tag="$(printf 'iter_%02d' "$iteration")"
-    local pass_slug="${cache_mode}__${method}__eic${concurrency}__${workload}"
-    local pass_dir="${PASSES_DIR}/${iter_tag}/${pass_slug}"
-    install -d -m 0750 "$pass_dir"
-
-    local explain_file="${pass_dir}/explain.json"
-    local pg_stat_io_file="${pass_dir}/pg_stat_io.json"
-    local perf_file="${pass_dir}/perf_stat.json"
-    local disk_before="${pass_dir}/diskstats_before.txt"
-    local disk_after="${pass_dir}/diskstats_after.txt"
-    local meta_file="${pass_dir}/pass_meta.json"
-
-    local pass_io_direct
-    pass_io_direct="$(run_psql "$DB_NAME" -tAc "SHOW debug_io_direct;" 2>/dev/null || echo "")"
-    [[ -z "$pass_io_direct" ]] && pass_io_direct="off"
-
-    local pass_governor
-    pass_governor="$(detect_scaling_governor)"
-    [[ -z "$pass_governor" ]] && pass_governor="$SCALING_GOVERNOR"
-
-    log_brak "[${iter_tag}][${cache_mode}] io_method=${method} | eic=${concurrency} | io_direct=${pass_io_direct} | ${workload_label}"
-
-    local pre_soc_temp pre_nvme_temp pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max
-    pre_soc_temp="$(detect_soc_temp_c)"
-    pre_nvme_temp="$(detect_nvme_temp_c)"
-    read -r pre_cpu_mhz pre_cpu_mhz_min pre_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
-
-    local started_utc finished_utc start_ns end_ns wall_ms
-    started_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    start_ns="$(date +%s%N 2>/dev/null || echo $(( $(date +%s) * 1000000000 )))"
-
-    capture_diskstats "$disk_before"
-
-    if [[ "$PERF_AVAILABLE" == "true" ]]; then
-        perf stat -a -j -o "$perf_file" -e "$PERF_EVENTS_CSV" -- \
-            sudo -u "$PG_USER" psql -X -U "$PG_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -q -t -A \
-            -c "$session_sql" \
-            -c "$explain_sql" \
-            > "$explain_file"
-    else
-        : > "$perf_file"
-        run_psql "$DB_NAME" -q -t -A \
-            -c "$session_sql" \
-            -c "$explain_sql" \
-            > "$explain_file"
-    fi
-
-    capture_diskstats "$disk_after"
-
-    end_ns="$(date +%s%N 2>/dev/null || echo $(( $(date +%s) * 1000000000 )))"
-    finished_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    if [[ "$start_ns" =~ ^[0-9]+$ && "$end_ns" =~ ^[0-9]+$ ]]; then
-        wall_ms="$(awk -v s="$start_ns" -v e="$end_ns" 'BEGIN { d = (e - s) / 1000000.0; if (d < 0) d = 0; printf "%.3f", d }')"
-    else
-        wall_ms="0"
-    fi
-
-    local post_soc_temp post_nvme_temp post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max
-    post_soc_temp="$(detect_soc_temp_c)"
-    post_nvme_temp="$(detect_nvme_temp_c)"
-    read -r post_cpu_mhz post_cpu_mhz_min post_cpu_mhz_max <<< "$(detect_cpu_mhz_stats)"
-
-    run_psql "$DB_NAME" -q -t -A -c "
-        SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json)
-        FROM (
-            SELECT *
-            FROM pg_stat_io
-            WHERE reads > 0 OR hits > 0 OR writes > 0 OR extends > 0 OR evictions > 0
-            ORDER BY reads DESC, hits DESC
-        ) t;
-    " > "$pg_stat_io_file"
-
-    local pass_prewarm_fit="null"
-    if [[ "$cache_mode" == "warm" ]]; then
-        pass_prewarm_fit="${PREWARM_FIT_SHARED_BUFFERS:-null}"
-    fi
-
-    atomic_write_from_stdin "$meta_file" <<EOF
-{
-  "run_id": "$(json_escape "$RUN_ID")",
-  "node_id": "$(json_escape "$NODE_HOST")",
-  "iteration": ${iteration},
-  "pass_order_index": ${pass_order_idx},
-  "cache_mode": "$(json_escape "$cache_mode")",
-  "io_method": "$(json_escape "$method")",
-  "io_direct": "$(json_escape "$pass_io_direct")",
-  "with_direct_io": ${WITH_DIRECT_IO},
-  "effective_io_concurrency": ${concurrency},
-  "io_workers": ${IO_WORKERS},
-  "gather_workers": ${GATHER_WORKERS},
-  "workload": "$(json_escape "$workload")",
-  "workload_label": "$(json_escape "$workload_label")",
-  "nvme_short": "$(json_escape "$NVME_SHORT")",
-  "scaling_governor": "$(json_escape "$pass_governor")",
-  "shared_buffers": "$(json_escape "$PG_SHARED_BUFFERS")",
-  "huge_pages_status": "$(json_escape "$PG_HUGE_PAGES_STATUS")",
-  "nvme_logical_block_size": $(json_num_or_null "$NVME_LOGICAL_BLOCK_SIZE"),
-  "prewarm_fit_shared_buffers": ${pass_prewarm_fit},
-  "pre_soc_temp_c": $(json_num_or_null "$pre_soc_temp"),
-  "post_soc_temp_c": $(json_num_or_null "$post_soc_temp"),
-  "pre_nvme_temp_c": $(json_num_or_null "$pre_nvme_temp"),
-  "post_nvme_temp_c": $(json_num_or_null "$post_nvme_temp"),
-  "pre_cpu_mhz": $(json_num_or_null "$pre_cpu_mhz"),
-  "pre_cpu_mhz_min": $(json_num_or_null "$pre_cpu_mhz_min"),
-  "pre_cpu_mhz_max": $(json_num_or_null "$pre_cpu_mhz_max"),
-  "post_cpu_mhz": $(json_num_or_null "$post_cpu_mhz"),
-  "post_cpu_mhz_min": $(json_num_or_null "$post_cpu_mhz_min"),
-  "post_cpu_mhz_max": $(json_num_or_null "$post_cpu_mhz_max"),
-  "started_at_utc": "${started_utc}",
-  "finished_at_utc": "${finished_utc}",
-  "wall_duration_ms": ${wall_ms}
-}
-EOF
-
-    PASS_EXECUTED_COUNT=$(( PASS_EXECUTED_COUNT + 1 ))
-    log_ok "Captured ${iter_tag}/${pass_slug} (${wall_ms} ms wall)"
-}
 
 WORKLOAD_A_SESSION="SET max_parallel_workers_per_gather = ${GATHER_WORKERS};"
 WORKLOAD_A_EXPLAIN="EXPLAIN (ANALYZE, BUFFERS, TIMING, WAL, FORMAT JSON)
@@ -1608,7 +1748,7 @@ SELECT sensor_code, count(*), avg(reading)
 FROM \"${TABLE_NAME}\"
 GROUP BY sensor_code;"
 
-WORKLOAD_B_SESSION="SET enable_seqscan = off; SET enable_indexscan = off; SET enable_indexonlyscan = off; SET max_parallel_workers_per_gather = 0;"
+WORKLOAD_B_SESSION="$(build_workload_b_session "$WORK_MEM")"
 WORKLOAD_B_EXPLAIN="EXPLAIN (ANALYZE, BUFFERS, TIMING, WAL, FORMAT JSON)
 SELECT avg(reading), sum(id)
 FROM \"${TABLE_NAME}\"
@@ -1619,7 +1759,7 @@ echo " BrakerRak // PostgreSQL ${PG_SERVER_VERSION} Async I/O Ablation Showdown"
 echo " Node    : ${NODE_HOST} | Silicon: ${DT_MODEL} (${HARTS} Harts)"
 echo " Clock   : governor=${SCALING_GOVERNOR} | cpu_mhz=${PRE_CPU_MHZ} (min=${PRE_CPU_MHZ_MIN}, max=${PRE_CPU_MHZ_MAX})"
 echo " Target  : ${DB_NAME}.${TABLE_NAME} | NVMe: ${NVME_DEV} (${NVME_SHORT}, lbs=${NVME_LOGICAL_BLOCK_SIZE}B)"
-echo " PG Mem  : shared_buffers=${PG_SHARED_BUFFERS} | hugepages=${PG_HUGE_PAGES_STATUS} | fit_sb=${PREWARM_FIT_SHARED_BUFFERS}"
+echo " PG Mem  : shared_buffers=${PG_SHARED_BUFFERS} | work_mem=${PG_WORK_MEM} | hugepages=${PG_HUGE_PAGES_STATUS} | fit_sb=${PREWARM_FIT_SHARED_BUFFERS}"
 echo " Matrix  : methods=[${METHODS_CSV}] x eic=[${CONCURRENCIES_CSV}] | io_workers=${IO_WORKERS}"
 echo " Rigor   : iterations=${ITERATIONS} | randomize=${RANDOMIZE_ORDER} (seed=${PRNG_SEED:-none}) | cooldown=${COOLDOWN_SEC}s | direct_io=${WITH_DIRECT_IO}"
 echo " Output  : ${RUN_DIR}"
@@ -1644,6 +1784,7 @@ for (( ITER=1; ITER<=ITERATIONS; ITER++ )); do
     for ENTRY in "${COLD_ITER_ITEMS[@]}"; do
         IFS='|' read -r METHOD CONC WORKLOAD <<< "$ENTRY"
         log_step "Pass [${ITER}/${ITERATIONS} #${PASS_IDX}]: io_method=${METHOD} | eic=${CONC} | workload=${WORKLOAD} | io_workers=${IO_WORKERS}"
+        run_inter_pass_cooldown
         configure_pg_gucs "$METHOD" "$CONC"
         cold_cache_isolate "$METHOD" "$CONC"
 
@@ -1732,6 +1873,7 @@ if [[ "$WARM_CACHE" == "true" ]]; then
         PASS_IDX=0
         for ENTRY in "${WARM_ITER_ITEMS[@]}"; do
             IFS='|' read -r METHOD CONC WORKLOAD <<< "$ENTRY"
+            run_inter_pass_cooldown
             configure_pg_gucs "$METHOD" "$CONC"
             warm_cache_isolate "$METHOD" "$CONC"
 

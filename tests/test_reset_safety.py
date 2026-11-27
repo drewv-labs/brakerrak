@@ -25,6 +25,7 @@ def _isolated_env(tmp_path: Path, extra_path: Path | None = None) -> dict[str, s
     env["TMPDIR"] = str(tmp_dir)
     env["XDG_RUNTIME_DIR"] = str(xdg_dir)
     env["BRAKERRAK_NO_PROGBAR"] = "1"
+    env["BRAKERRAK_UMOUNT_RETRY_SLEEP"] = "0.01"
     env["TERM"] = "dumb"
     if extra_path is not None:
         env["PATH"] = f"{extra_path}:{env.get('PATH', '/usr/bin:/bin')}"
@@ -243,7 +244,7 @@ echo "SHOULD_NOT_REACH_DESTRUCTIVE_STEP"
     assert "Safety Interlock: failed to unmount '/mnt/nvme_pgdata'" in proc.stderr
 
     calls = umount_log.read_text(encoding="utf-8").splitlines()
-    assert calls == ["/mnt/nvme_pgdata"]
+    assert calls == ["/mnt/nvme_pgdata"] * 5
     assert all("-l" not in c and "--lazy" not in c for c in calls)
 
 
@@ -814,3 +815,209 @@ _reset_update_hosts_file "starfive" {shlex.quote(str(hosts_file))}
     proc = _run_bash(script, _isolated_env(tmp_path))
     assert proc.returncode == 0, proc.stderr
     assert hosts_file.read_text(encoding="utf-8") == expected_hosts
+
+
+def test_select_512_lbaf_requires_ms0_and_prefers_lowest_rp(tmp_path: Path) -> None:
+    # 1. Ignores ms:8 lbads:9 (even with rp:0) and selects ms:0 lbads:9 with lowest rp:
+    mixed_id_ns = """\
+NVME Identify Namespace 1:
+nlbaf   : 3
+lbaf  0 : ms:8   lbads:9  rp:0 (in use)
+lbaf  1 : ms:0   lbads:9  rp:0x2
+lbaf  2 : ms:0   lbads:9  rp:0x1
+lbaf  3 : ms:0   lbads:12 rp:0
+"""
+    id_file = tmp_path / "id_ns_mixed.txt"
+    id_file.write_text(mixed_id_ns, encoding="utf-8")
+
+    bin_dir = tmp_path / "bin"
+    _write_exec(
+        bin_dir / "nvme",
+        f'#!/usr/bin/env bash\ncat {shlex.quote(str(id_file))}\n',
+    )
+    env = _isolated_env(tmp_path, extra_path=bin_dir)
+
+    script_dev = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+_reset_select_512_lbaf "/dev/nvme0n1"
+"""
+    proc_dev = _run_bash(script_dev, env)
+    assert proc_dev.returncode == 0, proc_dev.stderr
+    assert proc_dev.stdout.strip() == "2"
+
+    # 2. Returns empty when only metadata-bearing 512B (ms:8 / ms:16) or 4Kn (lbads:12) exist
+    no_ms0_512 = """\
+lbaf  0 : ms:8   lbads:9  rp:0x1
+lbaf  1 : ms:16  lbads:9  rp:0
+lbaf  2 : ms:0   lbads:12 rp:0 (in use)
+"""
+    no_ms0_file = tmp_path / "id_ns_noms0.txt"
+    no_ms0_file.write_text(no_ms0_512, encoding="utf-8")
+    script_empty = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+_reset_select_512_lbaf < {shlex.quote(str(no_ms0_file))}
+"""
+    proc_empty = _run_bash(script_empty, env)
+    assert proc_empty.returncode == 0, proc_empty.stderr
+    assert proc_empty.stdout.strip() == ""
+
+
+def test_strict_umount_retries_and_succeeds_after_initial_target_is_busy(
+    tmp_path: Path,
+) -> None:
+    text = RESET_DAY0_SH.read_text(encoding="utf-8")
+    assert 'BRAKERRAK_UMOUNT_RETRY_SLEEP:-0.5' in text
+
+    bin_dir = tmp_path / "bin"
+    count_file = tmp_path / "umount_count.txt"
+    events_log = tmp_path / "events.log"
+    _write_exec(
+        bin_dir / "umount",
+        f"""#!/usr/bin/env bash
+cnt=0
+[[ -f {shlex.quote(str(count_file))} ]] && cnt="$(cat {shlex.quote(str(count_file))})"
+cnt=$(( cnt + 1 ))
+printf '%d\n' "$cnt" > {shlex.quote(str(count_file))}
+printf 'umount:%d:%s\n' "$cnt" "$*" >> {shlex.quote(str(events_log))}
+if (( cnt < 3 )); then
+    echo "umount: $1: target is busy." >&2
+    exit 32
+fi
+exit 0
+""",
+    )
+    _write_exec(
+        bin_dir / "udevadm",
+        f'#!/usr/bin/env bash\nprintf "udevadm:%s\\n" "$*" >> {shlex.quote(str(events_log))}\n',
+    )
+    _write_exec(
+        bin_dir / "fuser",
+        f'#!/usr/bin/env bash\nprintf "fuser:%s\\n" "$*" >> {shlex.quote(str(events_log))}\n',
+    )
+
+    script = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+brak_log_init "RESET"
+_reset_strict_umount "/mnt/nvme_pgdata"
+printf "UNMOUNT_OK\n"
+"""
+    proc = _run_bash(script, _isolated_env(tmp_path, extra_path=bin_dir))
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "UNMOUNT_OK"
+
+    events = events_log.read_text(encoding="utf-8").splitlines()
+    umount_events = [e for e in events if e.startswith("umount:")]
+    assert umount_events == [
+        "umount:1:/mnt/nvme_pgdata",
+        "umount:2:/mnt/nvme_pgdata",
+        "umount:3:/mnt/nvme_pgdata",
+    ]
+    assert events.count("udevadm:settle") == 2
+
+
+def test_pgdg_backup_dir_relocated_off_run_tmpfs() -> None:
+    text = RESET_DAY0_SH.read_text(encoding="utf-8")
+    assert '${RUNTIME_DIR}/pgdg-deb-backup' not in text
+    expected_dir = (
+        'PGDG_BACKUP_DIR="${BRAKERRAK_PGDG_BACKUP_DIR:-/var/cache/brakerrak/pgdg-deb-backup}"'
+    )
+    assert expected_dir in text
+    assert "install -d -m 0700" in text
+
+    # Static check: no PGDG_BACKUP_DIR assignment references /run
+    for line in text.splitlines():
+        if "PGDG_BACKUP_DIR=" in line:
+            assert "/run" not in line
+
+
+def test_riscv64_sd_media_executes_databroker_service_teardown_unlike_mcu(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    sys_log = tmp_path / "systemctl.log"
+    _write_exec(
+        bin_dir / "systemctl",
+        f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {shlex.quote(str(sys_log))}\n',
+    )
+    _write_exec(bin_dir / "pkill", "#!/usr/bin/env bash\nexit 0\n")
+
+    env = _isolated_env(tmp_path, extra_path=bin_dir)
+
+    # 1. riscv64 + STORAGE_MEDIA="sd": NOT an MCU target -> stops postgresql/mosquitto/nfs-ganesha
+    rv64_script = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+brak_log_init "RESET"
+DT_MODEL="StarFive VisionFive 2 v1.3B"
+TARGET_ARCH="riscv64"
+STORAGE_MEDIA="sd"
+NODE_ROLE="databroker"
+TARGET_BOARD="starfive-jh7110"
+is_mcu="false"
+if _reset_is_mcu_target "$DT_MODEL" "$TARGET_ARCH" "$NODE_ROLE" "$TARGET_BOARD"; then
+    is_mcu="true"
+fi
+_reset_stop_databroker_services "$is_mcu"
+printf "IS_MCU=%s\n" "$is_mcu"
+"""
+    rv64_proc = _run_bash(rv64_script, env)
+    assert rv64_proc.returncode == 0, rv64_proc.stderr
+    assert rv64_proc.stdout.strip() == "IS_MCU=false"
+    calls = sys_log.read_text(encoding="utf-8")
+    assert "stop postgresql" in calls
+    assert "mosquitto" in calls
+    assert "nfs-ganesha.service" in calls
+
+    # 2. espressif-esp32p4 / riscv32 MCU target: skips host systemctl service teardown
+    sys_log.unlink()
+    mcu_script = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+brak_log_init "RESET"
+is_mcu="false"
+if _reset_is_mcu_target "Espressif ESP32-P4" "riscv32" "snitchbench" "espressif-esp32p4"; then
+    is_mcu="true"
+fi
+_reset_stop_databroker_services "$is_mcu"
+printf "IS_MCU=%s\n" "$is_mcu"
+"""
+    mcu_proc = _run_bash(mcu_script, env)
+    assert mcu_proc.returncode == 0, mcu_proc.stderr
+    assert "IS_MCU=true" in mcu_proc.stdout
+    assert not sys_log.exists()
+
+
+def test_reset_rvdk_teardown_compat_false_fails_fast_when_rvdk_reset_absent(
+    tmp_path: Path,
+) -> None:
+    bin_dir = tmp_path / "bin"
+    apt_marker = tmp_path / "apt_called"
+    _write_exec(
+        bin_dir / "apt-get",
+        f'#!/usr/bin/env bash\ntouch {shlex.quote(str(apt_marker))}\nexit 0\n',
+    )
+
+    # Case 1: rvdk binary absent + BRAKERRAK_LEGACY_RVDK_COMPAT=false -> fails fast
+    env_absent = _isolated_env(tmp_path, extra_path=bin_dir)
+    env_absent["BRAKERRAK_LEGACY_RVDK_COMPAT"] = "false"
+    env_absent["RVDK_BIN"] = str(tmp_path / "nonexistent-rvdk")
+    script = f"""
+source {shlex.quote(str(RESET_DAY0_SH))}
+brak_log_init "RESET"
+_reset_rvdk_teardown
+"""
+    proc_absent = _run_bash(script, env_absent)
+    assert proc_absent.returncode != 0
+    assert "BRAKERRAK_LEGACY_RVDK_COMPAT=false" in proc_absent.stderr
+    assert not apt_marker.exists()
+
+    # Case 2: rvdk binary present but `rvdk reset` unsupported + COMPAT=false -> fails fast
+    failing_rvdk = _write_exec(
+        tmp_path / "rvdk-no-reset",
+        '#!/usr/bin/env bash\necho "unknown subcommand: reset" >&2\nexit 2\n',
+    )
+    env_unsupported = _isolated_env(tmp_path, extra_path=bin_dir)
+    env_unsupported["BRAKERRAK_LEGACY_RVDK_COMPAT"] = "false"
+    env_unsupported["RVDK_BIN"] = str(failing_rvdk)
+    proc_unsup = _run_bash(script, env_unsupported)
+    assert proc_unsup.returncode != 0
+    assert "BRAKERRAK_LEGACY_RVDK_COMPAT=false" in proc_unsup.stderr
+    assert not apt_marker.exists()

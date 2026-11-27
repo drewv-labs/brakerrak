@@ -49,7 +49,11 @@ from brakerrak_ort import (
     verify_snapshot_signature,
     write_snapshot_pair,
 )
-from brakerrak_ort.probes import MAX_SERIAL_BUFFER_BYTES, format_sd_partition_name
+from brakerrak_ort.probes import (
+    MAX_SERIAL_BUFFER_BYTES,
+    format_sd_partition_name,
+    inspect_accelerator_runtime,
+)
 from brakerrak_ort.profiles import (
     ACCELERATOR_PERSONAS,
     SOC_ALIASES,
@@ -2821,3 +2825,244 @@ def test_serial_telemetry_buffer_cap_and_non_json_noise_efficiency(
     )
     assert _run_with_chunks(closing_flood_log) == {"hostname": "p4", "ok": 2}
     assert parse_calls == 1
+
+
+def test_hailo_10h_hailo1x_pci_and_h1x_device_runtime_detection() -> None:
+    lspci_h10 = (
+        "0000:01:00.0 Co-processor [0b40]: Hailo Technologies Ltd. Hailo-10H [1e60:45c4]\n"
+    )
+    acc_list = [
+        {
+            "address": "0000:01:00.0",
+            "vendor_id": "1e60",
+            "device_id": "45c4",
+            "vendor_name": "Hailo NPU",
+            "description": lspci_h10.strip(),
+            "pcie_link_speed": "8.0 GT/s PCIe",
+            "pcie_link_width": "4",
+        }
+    ]
+
+    # 1. hailo1x_pci + /dev/hailo0 -> PASS and kmod_name == "hailo1x_pci"
+    probe_h10_hailo0 = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=False,
+        lspci_output=lspci_h10,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+        },
+        hailo_runtime_ok=False,
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    probe_h10_hailo0.existing_paths.update({"/dev/hailo0", "/sys/module/hailo1x_pci"})
+    probe_h10_hailo0.commands[("hailortcli", "fw-control", "identify")] = CommandResult(
+        stdout="Board Name: Hailo-10H\n"
+    )
+    rt_h10 = inspect_accelerator_runtime(acc_list, probe_h10_hailo0)  # type: ignore[arg-type]
+    assert rt_h10["hailo"]["kmod_name"] == "hailo1x_pci"
+    assert rt_h10["hailo"]["kmod_loaded"] is True
+    assert rt_h10["hailo"]["device_nodes"] == ["/dev/hailo0"]
+
+    payload_h10, _, _, _ = collect_snapshot(
+        probe_h10_hailo0,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "visionbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    chk_h10 = _assertions_by_id(payload_h10)["ORT-D1_HAILO_RUNTIME"]
+    assert chk_h10["status"] == "PASS"
+    assert "hailo_pci|hailo1x_pci" in str(chk_h10["description"])
+    assert "hailo_pci|hailo1x_pci" in str(chk_h10["expected"])
+
+    # 2. hailo1x_pci via /proc/modules + /dev/h1x-0 -> PASS
+    probe_h1x_dev = _make_probe(
+        dt_model="SiFive HiFive Premier P550",
+        nvme_present=False,
+        lspci_output=lspci_h10,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:01:00.0/current_link_width": "4",
+        },
+        hailo_runtime_ok=False,
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    probe_h1x_dev.existing_paths.add("/dev/h1x-0")
+    probe_h1x_dev.files["/proc/modules"] = "hailo1x_pci 122880 0 - Live 0x0000000000000000\n"
+    probe_h1x_dev.commands[("hailortcli", "fw-control", "identify")] = CommandResult(
+        stdout="Board Name: Hailo-10H\n"
+    )
+    payload_h1x, _, _, _ = collect_snapshot(
+        probe_h1x_dev,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "visionbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    chk_h1x = _assertions_by_id(payload_h1x)["ORT-D1_HAILO_RUNTIME"]
+    assert chk_h1x["status"] == "PASS"
+    assert "/dev/h1x-0" in str(chk_h1x["actual"])
+
+    # 3. Fallback when neither kmod is loaded -> kmod_name == "hailo_pci/hailo1x_pci"
+    probe_unloaded = _make_probe(
+        nvme_present=False,
+        lspci_output=lspci_h10,
+        hailo_runtime_ok=False,
+    )
+    rt_unloaded = inspect_accelerator_runtime(acc_list, probe_unloaded)  # type: ignore[arg-type]
+    assert rt_unloaded["hailo"]["kmod_name"] == "hailo_pci/hailo1x_pci"
+    assert rt_unloaded["hailo"]["kmod_loaded"] is False
+
+
+def test_blackhole_p150a_slot_floor_on_titan_atlantis_and_board_caps() -> None:
+    assert get_accelerator_link_floor("1e52", get_soc_profile("ultrarisc-dp1000")) == (16.0, 8)
+    assert get_accelerator_link_floor("1e52", get_soc_profile("tenstorrent-atlantis")) == (
+        16.0,
+        8,
+    )
+    assert get_accelerator_link_floor("1e52", get_soc_profile("starfive-jh7110")) == (5.0, 1)
+    assert get_accelerator_link_floor("1e52", get_soc_profile("eswin-eic7700x")) == (8.0, 4)
+
+    lspci_p150a = (
+        "0000:02:00.0 Processing accelerators [1200]: "
+        "Tenstorrent Inc Blackhole p150a [1e52:401e]\n"
+    )
+
+    # Down-trained to 8.0 GT/s x4 on ultrarisc-dp1000 -> WARN (not PASS)
+    probe_titan_downtrained = _make_probe(
+        dt_model="Milk-V Titan UltraRISC DP1000",
+        harts=8,
+        total_ram_kb=32_000_000,
+        nvme_present=True,
+        nvme_speed="16.0 GT/s PCIe",
+        nvme_width="4",
+        lspci_output=lspci_p150a,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_width": "4",
+        },
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    titan_warn_payload, _, _, _ = collect_snapshot(
+        probe_titan_downtrained,
+        soc="ultrarisc-dp1000",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "babbagebench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    titan_warn_checks = _assertions_by_id(titan_warn_payload)
+    assert titan_warn_checks["ORT-03B_PCIE_ACCELERATOR_LINK"]["status"] == "WARN"
+    assert ">= 16.0 GT/s PCIe | >= x8" in str(
+        titan_warn_checks["ORT-03B_PCIE_ACCELERATOR_LINK"]["expected"]
+    )
+    assert titan_warn_payload["operational_readiness_test"]["overall_status"] == "WARN"
+
+    # Full 16.0 GT/s x8 on ultrarisc-dp1000 -> PASS
+    probe_titan_full = _make_probe(
+        dt_model="Milk-V Titan UltraRISC DP1000",
+        harts=8,
+        total_ram_kb=32_000_000,
+        nvme_present=True,
+        nvme_speed="16.0 GT/s PCIe",
+        nvme_width="4",
+        lspci_output=lspci_p150a,
+        pci_sysfs={
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_speed": "16.0 GT/s PCIe",
+            "/sys/bus/pci/devices/0000:02:00.0/current_link_width": "8",
+        },
+        pg_active=False,
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    titan_pass_payload, _, _, _ = collect_snapshot(
+        probe_titan_full,
+        soc="ultrarisc-dp1000",
+        stage="day0-pre-forge",
+        node_env={"NODE_ROLE": "babbagebench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    titan_pass_checks = _assertions_by_id(titan_pass_payload)
+    assert titan_pass_checks["ORT-03B_PCIE_ACCELERATOR_LINK"]["status"] == "PASS"
+    assert titan_pass_payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+
+def test_devbench_defaults_mqtt_broker_disabled() -> None:
+    defaults = get_role_defaults("devbench")
+    assert defaults.enable_postgres is True
+    assert defaults.enable_mqtt_broker is False
+    assert defaults.enable_nfs_server is False
+    assert get_role_defaults("dev").enable_mqtt_broker is False
+
+    probe = _make_probe(mqtt_active=False, nfs_ganesha_active=False)
+    payload, _, _, node_role = collect_snapshot(
+        probe,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "devbench"},
+        kit_env={},
+        window_sec=0.0,
+        env={},
+    )
+    assert node_role == "devbench"
+    checks = _assertions_by_id(payload)
+    assert "ORT-D1_MQTT_ACTIVE" not in checks
+    assert checks["ORT-D1_POSTGRES_ACTIVE"]["status"] == "PASS"
+    assert payload["operational_readiness_test"]["overall_status"] == "PASS"
+
+
+def test_nvme_dev_process_env_overrides_node_env() -> None:
+    # Configure nvme0n1 as unconverged (512B, Gen1 x1) and nvme1n1 as healthy (4Kn, Gen3 x4)
+    probe = _make_probe(
+        nvme_speed="2.5 GT/s PCIe",
+        nvme_width="1",
+        nvme_logical_bs="512",
+        mqtt_active=False,
+        nfs_ganesha_active=False,
+    )
+    probe.existing_paths.add("/sys/block/nvme1n1")
+    probe.files.update(
+        {
+            "/sys/block/nvme1n1/size": "7814037168",
+            "/sys/block/nvme1n1/device/model": "SECONDARY NVMe 4TB",
+            "/sys/block/nvme1n1/device/serial": "SN-NVME1-TEST-0002",
+            "/sys/block/nvme1n1/device/firmware_rev": "2.0.0",
+            "/sys/block/nvme1n1/queue/logical_block_size": "4096",
+            "/sys/block/nvme1n1/queue/physical_block_size": "4096",
+            "/sys/class/nvme/nvme1/device/current_link_speed": "8.0 GT/s PCIe",
+            "/sys/class/nvme/nvme1/device/current_link_width": "4",
+            "/sys/class/nvme/nvme1/device/max_link_speed": "8.0 GT/s PCIe",
+            "/sys/class/nvme/nvme1/device/max_link_width": "4",
+        }
+    )
+
+    payload, _, _, _ = collect_snapshot(
+        probe,
+        soc="eswin-eic7700x",
+        stage="day1-post-forge",
+        node_env={"NODE_ROLE": "databench", "NVME_DEV": "/dev/nvme0n1"},
+        kit_env={},
+        window_sec=0.0,
+        env={"NVME_DEV": "/dev/nvme1n1"},
+    )
+    nvme_primary = payload["hardware_inventory"]["nvme_primary"]
+    assert nvme_primary["device"] == "/dev/nvme1n1"
+    assert nvme_primary["model"] == "SECONDARY NVMe 4TB"
+    checks = _assertions_by_id(payload)
+    assert checks["ORT-03_PCIE_NVME_LINK"]["status"] == "PASS"
+    assert checks["ORT-D1_NVME_4KN"]["status"] == "PASS"
+    assert payload["operational_readiness_test"]["overall_status"] == "PASS"

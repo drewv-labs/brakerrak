@@ -768,20 +768,23 @@ def test_forge_storage_missing_rvdk_bin_guard_and_dispatch(tmp_path: Path) -> No
     assert "RVDK CLI not found at '/nonexistent/rvdk'" in fail_proc.stderr
     assert not path_rvdk_calls.exists()
 
-    # Case 2: Unset RVDK_BIN falls back cleanly to `rvdk` on PATH when system bins are absent
+    # Case 2: Unset RVDK_BIN resolves `rvdk` from PATH first without invoking host /usr/local/bin
     env_path_fallback = _isolated_shell_env(tmp_path)
     env_path_fallback.pop("RVDK_BIN", None)
     env_path_fallback["PATH"] = f"{path_bin}:{env_path_fallback.get('PATH', '/usr/bin:/bin')}"
     path_ok_proc = subprocess.run(
         ["bash", "-euo", "pipefail", "-c", fail_script],
         env=env_path_fallback,
+        stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
         check=False,
     )
-    if not Path("/usr/local/bin/rvdk").exists() and not Path("/usr/bin/rvdk").exists():
-        assert path_ok_proc.returncode == 0, path_ok_proc.stderr
-        assert path_ok_proc.stdout.strip() == "PATH_DISPATCH:storage status"
+    assert path_ok_proc.returncode == 0, path_ok_proc.stderr
+    assert path_ok_proc.stdout.strip() == "PATH_DISPATCH:storage status"
+    assert path_rvdk_calls.read_text(encoding="utf-8").splitlines() == [
+        "PATH_DISPATCH:storage status"
+    ]
 
     # Case 3: Valid explicit RVDK_BIN resolves and dispatches storage subcommands cleanly
     mock_rvdk = _write_executable(
@@ -1219,6 +1222,8 @@ def test_forge_rvdk_delegation_deprecation_and_compat_gating(tmp_path: Path) -> 
     )
     assert compat_on_proc.returncode == 0, compat_on_proc.stderr
     assert "DEPRECATED:" in compat_on_proc.stderr
+    assert "delegation-first" in compat_on_proc.stderr
+    assert "scheduled for removal" in compat_on_proc.stderr
     assert sys_calls_legacy.read_text(encoding="utf-8").splitlines() == [
         "disable --now mosquitto.service",
     ]
@@ -1245,3 +1250,321 @@ def test_forge_rvdk_delegation_deprecation_and_compat_gating(tmp_path: Path) -> 
     assert compat_off_proc.returncode != 0
     assert "BRAKERRAK_LEGACY_RVDK_COMPAT=false" in compat_off_proc.stderr
     assert not sys_calls_legacy.exists()
+
+
+def _extract_forge_summary_block() -> str:
+    text = FORGE_SH.read_text(encoding="utf-8")
+    stage6_idx = text.index("# 8. STAGE 6: POST-FLIGHT CONVERGENCE SUMMARY")
+    marker = 'if brak_is_riscv32_mcu_target "$TARGET_BOARD" "$TARGET_ARCH" "$CLI_STAGE_DIR"; then'
+    start = text.index(marker, stage6_idx)
+    end = text.index("\n# " + ("=" * 78) + "\n# 9. STAGE 7:", start)
+    return text[start:end]
+
+
+def test_forge_riscv64_sd_media_summary_distinct_from_esp32p4(tmp_path: Path) -> None:
+    forge_helpers = _extract_shell_functions(
+        FORGE_SH, ("_brak_is_accel_persona", "_brak_should_skip_accel_nvme")
+    )
+    summary_block = _extract_forge_summary_block()
+
+    mock_bin = tmp_path / "bin"
+    _write_executable(mock_bin / "nproc", "#!/usr/bin/env bash\nprintf '4\\n'\n")
+    _write_executable(mock_bin / "hostname", "#!/usr/bin/env bash\nprintf 'brakerbench-vf2\\n'\n")
+    _write_executable(
+        mock_bin / "sudo",
+        '#!/usr/bin/env bash\nshift 2\nexec "$@"\n',
+    )
+    _write_executable(
+        mock_bin / "psql",
+        (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *data_directory*) printf "/var/lib/postgresql/18/main\\n" ;;\n'
+            '  *io_method*)      printf "io_uring\\n" ;;\n'
+            '  *shared_buffers*) printf "1GB\\n" ;;\n'
+            "esac\n"
+        ),
+    )
+    _write_executable(
+        mock_bin / "systemctl",
+        (
+            "#!/usr/bin/env bash\n"
+            'if [[ "$1" == "is-active" && "${2:-}" != "--quiet" ]]; then\n'
+            '  printf "inactive\\n"\n'
+            "  exit 3\n"
+            "fi\n"
+            "exit 3\n"
+        ),
+    )
+    _write_executable(
+        mock_bin / "findmnt",
+        '#!/usr/bin/env bash\nprintf "/dev/mmcblk1p4 / ext4 rw,relatime\\n"\n',
+    )
+
+    env = _isolated_shell_env(tmp_path)
+    env["PATH"] = f"{mock_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+
+    rv64_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            forge_helpers,
+            'TARGET_BOARD="starfive-jh7110" TARGET_ARCH="riscv64" STORAGE_MEDIA="sd"',
+            'CLI_STAGE_DIR="" FORGE_PASS="1" TARGET_HOSTNAME="brakerbench-vf2"',
+            'NODE_ROLE="databench" RVDK_TUNE_PROFILE="data" PIGEON_ROLE="pigeoneer"',
+            'ENABLE_POSTGRES="true" ENABLE_NFS_SERVER="false" CLI_WITH_TAILSCALE="false"',
+            'NVME_DEV="/dev/nvme0n1" MOUNT_POINT="/mnt/nvme_pgdata"',
+            'NFS_MOUNT_POINT="/mnt/nfs_vault" VG_NAME="vg_braker" MQTT_PORT="1883"',
+            'LAB_SUBNET="10.0.0.0/24"',
+            summary_block,
+        ]
+    )
+    rv64_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", rv64_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rv64_proc.returncode == 0, rv64_proc.stderr
+    assert "4 Harts" in rv64_proc.stdout
+    assert "NVMe LBA Block Sz  : n/a (sd media)" in rv64_proc.stdout
+    assert "PG 18 Async I/O    : io_method = io_uring" in rv64_proc.stdout
+    assert "2x ESP32-P4 HP Harts" not in rv64_proc.stdout
+    assert "n/a (riscv32/sd)" not in rv64_proc.stdout
+
+    p4_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            forge_helpers,
+            'TARGET_BOARD="espressif-esp32p4" TARGET_ARCH="riscv32" STORAGE_MEDIA="sd"',
+            'CLI_STAGE_DIR="" FORGE_PASS="1" TARGET_HOSTNAME="snitchbench-p4"',
+            'NODE_ROLE="snitchbench" RVDK_TUNE_PROFILE="iot" PIGEON_ROLE="pigeoneer"',
+            'ENABLE_POSTGRES="false" ENABLE_NFS_SERVER="false" CLI_WITH_TAILSCALE="false"',
+            'MOUNT_POINT="/mnt/sd"',
+            summary_block,
+        ]
+    )
+    p4_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", p4_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p4_proc.returncode == 0, p4_proc.stderr
+    assert "2x ESP32-P4 HP Harts" in p4_proc.stdout
+    assert "NVMe LBA Block Sz  : n/a (riscv32/sd)" in p4_proc.stdout
+
+
+def test_verify_convergence_riscv64_sd_media_enforces_pg_sysid_and_ort(tmp_path: Path) -> None:
+    verify_helpers = _extract_shell_functions(
+        VERIFY_CONVERGENCE_SH,
+        (
+            "_verify_is_accel_persona",
+            "_verify_is_accel_nvme_skip",
+            "_verify_kernel_has_xfs",
+            "_verify_allows_ext4_data_fs",
+            "_verify_refresh_node_vars",
+            "_verify_get_pg_sysid",
+            "_verify_get_sd_mount_info",
+            "_verify_staged_config_digest",
+            "_verify_should_skip_host_ort",
+            "_verify_capture_pass1_invariants",
+            "_verify_assert_pass2_invariants",
+        ),
+    )
+
+    sysid_file = tmp_path / "pg_sysid.txt"
+    sysid_file.write_text("7400000000000000001\n", encoding="utf-8")
+
+    mock_bin = tmp_path / "bin"
+    _write_executable(
+        mock_bin / "sudo",
+        '#!/usr/bin/env bash\nshift 2\nexec "$@"\n',
+    )
+    _write_executable(
+        mock_bin / "psql",
+        f"#!/usr/bin/env bash\ncat {shlex.quote(str(sysid_file))}\n",
+    )
+    _write_executable(
+        mock_bin / "mountpoint",
+        "#!/usr/bin/env bash\nexit 1\n",
+    )
+
+    node_env = tmp_path / "node.env"
+    node_env.write_text(
+        'NODE_ROLE="devbench"\nSTORAGE_MEDIA="sd"\nTARGET_ARCH="riscv64"\n',
+        encoding="utf-8",
+    )
+
+    env = _isolated_shell_env(tmp_path)
+    env["PATH"] = f"{mock_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+
+    base_vars = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            verify_helpers,
+            f"NODE_ENV={shlex.quote(str(node_env))}",
+            'CLI_ROLE="devbench" CLI_TARGET="vf2" CLI_MOUNT_POINT="" CLI_NVME_DEV=""',
+            'CLI_ENABLE_PG="" CLI_ENABLE_NFS="" CLI_ENABLE_MQTT="" CLI_WITH_RAID=""',
+            'CLI_MEDIA="sd" CLI_STAGE_DIR="" CLI_TELEMETRY_JSON="" CLI_SERIAL_PORT=""',
+            'SKIP_MARKER_COUNT=5 STAGE_SKIP_SUMMARY="stages=1:1,2:1,3:1,4:1,5A:1,5B:1"',
+            "_verify_refresh_node_vars",
+        ]
+    )
+
+    # 1. riscv64 + --media sd + devbench: MQTT=false, host ORT runs, PG sysid enforced
+    ok_script = "\n".join(
+        [
+            base_vars,
+            'skip_ort="false"; _verify_should_skip_host_ort && skip_ort="true"',
+            "_verify_capture_pass1_invariants",
+            "_verify_assert_pass2_invariants",
+            'printf "%s|%s|%s|%s|%s\\n" "$ENABLE_MQTT_BROKER" "$IS_MCU_STAGED_TARGET" '
+            '"$IS_SD_MEDIA" "$skip_ort" "$PASS1_PG_SYSID"',
+        ]
+    )
+    ok_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", ok_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ok_proc.returncode == 0, ok_proc.stderr
+    lines = ok_proc.stdout.strip().splitlines()
+    assert lines[-1] == "false|false|true|false|7400000000000000001"
+
+    # 2. Mutated PG system_identifier on Pass 2 must fail on riscv64 --media sd
+    drift_script = "\n".join(
+        [
+            base_vars,
+            "_verify_capture_pass1_invariants",
+            f'printf "7400000000000000999\\n" > {shlex.quote(str(sysid_file))}',
+            "_verify_assert_pass2_invariants",
+        ]
+    )
+    drift_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", drift_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert drift_proc.returncode != 0
+    assert "PostgreSQL system_identifier changed" in drift_proc.stderr
+
+    # 3. espressif-esp32p4 MCU target skips host ORT and PG system_identifier
+    p4_node_env = tmp_path / "p4-node.env"
+    p4_node_env.write_text(
+        'NODE_ROLE="snitchbench"\nSTORAGE_MEDIA="sd"\nTARGET_ARCH="riscv32"\n',
+        encoding="utf-8",
+    )
+    p4_script = "\n".join(
+        [
+            f"source {shlex.quote(str(LIB_COMMON_SH))}",
+            verify_helpers,
+            f"NODE_ENV={shlex.quote(str(p4_node_env))}",
+            'CLI_ROLE="snitchbench" CLI_TARGET="p4" CLI_MOUNT_POINT="" CLI_NVME_DEV=""',
+            'CLI_ENABLE_PG="" CLI_ENABLE_NFS="" CLI_ENABLE_MQTT="" CLI_WITH_RAID=""',
+            'CLI_MEDIA="sd" CLI_STAGE_DIR="" CLI_TELEMETRY_JSON="" CLI_SERIAL_PORT=""',
+            'SKIP_MARKER_COUNT=5 STAGE_SKIP_SUMMARY="stages=1:0,2:1,3:1,4:1,5A:1,5B:1"',
+            "_verify_refresh_node_vars",
+            'skip_ort="false"; _verify_should_skip_host_ort && skip_ort="true"',
+            "_verify_capture_pass1_invariants",
+            "_verify_assert_pass2_invariants",
+            'printf "%s|%s|%s|%s\\n" "$IS_MCU_STAGED_TARGET" "$IS_SD_MEDIA" '
+            '"$skip_ort" "$PASS1_PG_SYSID"',
+        ]
+    )
+    p4_proc = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", p4_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert p4_proc.returncode == 0, p4_proc.stderr
+    assert p4_proc.stdout.strip().splitlines()[-1] == "true|true|true|"
+
+
+def test_brak_run_exit_hooks_lifo_execution_order(tmp_path: Path) -> None:
+    env = _isolated_shell_env(tmp_path)
+    order_log = tmp_path / "hook_order.log"
+    tmpfile_holder = tmp_path / "tmp_path.txt"
+
+    script_body = f"""
+set -euo pipefail
+source {shlex.quote(str(LIB_COMMON_SH))}
+brak_mktemp -v shared_tmp
+printf '%s\n' "$shared_tmp" > {shlex.quote(str(tmpfile_holder))}
+
+hook_alpha() {{
+    [[ -f "$shared_tmp" ]] && s="alive" || s="gone"
+    printf 'alpha:%s\n' "$s" >> {shlex.quote(str(order_log))}
+}}
+hook_beta() {{
+    [[ -f "$shared_tmp" ]] && s="alive" || s="gone"
+    printf 'beta:%s\n' "$s" >> {shlex.quote(str(order_log))}
+}}
+hook_gamma() {{
+    [[ -f "$shared_tmp" ]] && s="alive" || s="gone"
+    printf 'gamma:%s\n' "$s" >> {shlex.quote(str(order_log))}
+}}
+
+brak_register_exit_hook hook_alpha
+brak_register_exit_hook hook_beta
+brak_register_exit_hook hook_gamma
+"""
+    proc = subprocess.run(
+        ["bash", "-c", script_body],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    allocated_tmp = Path(tmpfile_holder.read_text(encoding="utf-8").strip())
+    assert not allocated_tmp.exists()
+    assert order_log.read_text(encoding="utf-8").splitlines() == [
+        "gamma:alive",
+        "beta:alive",
+        "alpha:alive",
+    ]
+
+    # Also verify LIFO order under SIGTERM
+    order_log.unlink()
+    sig_script = script_body + "\nprintf 'READY\\n'\nsleep 30 &\nwait \"$!\"\n"
+    sig_proc = subprocess.Popen(
+        ["bash", "-c", sig_script],
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert sig_proc.stdout is not None
+        assert sig_proc.stdout.readline().strip() == "READY"
+        sig_tmp = Path(tmpfile_holder.read_text(encoding="utf-8").strip())
+        assert sig_tmp.exists()
+        sig_proc.send_signal(signal.SIGTERM)
+        rc = sig_proc.wait(timeout=5)
+        assert rc == -signal.SIGTERM
+    finally:
+        if sig_proc.poll() is None:
+            sig_proc.kill()
+            sig_proc.wait(timeout=5)
+
+    assert not sig_tmp.exists()
+    assert order_log.read_text(encoding="utf-8").splitlines() == [
+        "gamma:alive",
+        "beta:alive",
+        "alpha:alive",
+    ]
